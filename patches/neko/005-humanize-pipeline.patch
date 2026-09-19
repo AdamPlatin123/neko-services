@@ -1,9 +1,10 @@
 From 363067c063fb9f7d0701d8152dd2f58390190b9e Mon Sep 17 00:00:00 2001
 From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
 Date: Sun, 20 Sep 2026 00:19:15 +0800
-Subject: [PATCH] =?UTF-8?q?feat(qq):=20P2-1=20=E4=BA=BA=E5=91=B3=E5=90=8E?=
- =?UTF-8?q?=E5=A4=84=E7=90=86=E6=8F=92=E4=BB=B6=EF=BC=88=E9=BB=98=E8=AE=A4?=
- =?UTF-8?q?=20off=EF=BC=89+=20QQ=20=E5=85=A8=E9=93=BE=20trace=5Fid?=
+Subject: [PATCH 1/2] =?UTF-8?q?feat(qq):=20P2-1=20=E4=BA=BA=E5=91=B3?=
+ =?UTF-8?q?=E5=90=8E=E5=A4=84=E7=90=86=E6=8F=92=E4=BB=B6=EF=BC=88=E9=BB=98?=
+ =?UTF-8?q?=E8=AE=A4=20off=EF=BC=89+=20QQ=20=E5=85=A8=E9=93=BE=20trace=5Fi?=
+ =?UTF-8?q?d?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -14522,6 +14523,129 @@ index 436ab572..acf24fa3 100644
  [[package]]
  name = "pyrect"
  version = "0.2.0"
+-- 
+2.43.0
+
+
+From 2304d1051c4f993ec293478c9c4437906a3d1e1c Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:50:02 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?fix(qq):=20=E4=BA=BA=E5=91=B3=E6=94=B9?=
+ =?UTF-8?q?=E5=86=99=E5=99=A8=E7=A9=BA=E6=AE=B5=E5=AE=88=E5=8D=AB=20+=20?=
+ =?UTF-8?q?=E9=94=99=E5=AD=97=E9=BB=98=E8=AE=A4=E5=80=BC=E5=AF=B9=E9=BD=90?=
+ =?UTF-8?q?=20official=5Fconfigs?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- rewriter：splitter 在 max_split_num<=0 时返回空表，原实现随后
+  segments[0] 触发 IndexError（MaiBot 调用点不会喂 0，本插件配置可
+  手改）——空表早退按原文单段透传
+- HumanizeConfig 错字组默认从 typo_generator 构造形参默认（30 倍
+  密度）对齐到 MaiBot official_configs.ChineseTypoConfig 运行时实际
+  生效值：error_rate 0.3→0.01 / min_freq 5→9 / tone_error_rate
+  0.2→0.1 / word_replace_rate 0.3→0.006 / correction_quote_probability
+  0.5→1.0（用户预期是麦麦级错字密度）
+- 新增 2 条测试：空段守卫（max_split_num=0 → 原文不崩）、默认值
+  对齐断言
+---
+ plugin/plugins/qq_auto_reply/humanize/config.py   | 13 ++++++++-----
+ plugin/plugins/qq_auto_reply/humanize/rewriter.py |  5 +++++
+ tests/unit/test_qq_humanize_core.py               | 11 +++++++++++
+ tests/unit/test_qq_humanize_rewriter.py           | 13 +++++++++++++
+ 4 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/plugin/plugins/qq_auto_reply/humanize/config.py b/plugin/plugins/qq_auto_reply/humanize/config.py
+index 3ef6ae96..4e4c5d1b 100644
+--- a/plugin/plugins/qq_auto_reply/humanize/config.py
++++ b/plugin/plugins/qq_auto_reply/humanize/config.py
+@@ -36,19 +36,22 @@ class HumanizeConfig:
+     splitter_overflow_return_all: bool = True
+ 
+     # ── 错字（= ChineseTypoConfig）──
++    # 数值默认对齐 MaiBot official_configs.py 的 ChineseTypoConfig 运行时
++    # 实际生效值（麦麦级错字密度），而非 typo_generator.py 构造函数的形参
++    # 默认（后者高 30 倍，仅为函数签名兜底，MaiBot 调用点从不使用）。
+     typo_enable: bool = True
+     # 纠正段以引用前一条的形式发出（映射为 QQMessageBlock.quote_previous）
+     typo_correction_quote: bool = True
+     # 产生纠正段时带引用的概率
+-    typo_correction_quote_probability: float = 0.5
++    typo_correction_quote_probability: float = 1.0
+     # 单字替换概率
+-    typo_error_rate: float = 0.3
++    typo_error_rate: float = 0.01
+     # 候选字最小字频阈值
+-    typo_min_freq: float = 5.0
++    typo_min_freq: float = 9.0
+     # 声调错误概率
+-    typo_tone_error_rate: float = 0.2
++    typo_tone_error_rate: float = 0.1
+     # 整词同音替换概率
+-    typo_word_replace_rate: float = 0.3
++    typo_word_replace_rate: float = 0.006
+ 
+     # ── 打字延迟（= ResponsePostProcessConfig.typing_speed + 本插件开关）──
+     # 块间延迟用 calculate_typing_time 替换固定 random.uniform(2.0, 5.0)；
+diff --git a/plugin/plugins/qq_auto_reply/humanize/rewriter.py b/plugin/plugins/qq_auto_reply/humanize/rewriter.py
+index 0463227a..6effa928 100644
+--- a/plugin/plugins/qq_auto_reply/humanize/rewriter.py
++++ b/plugin/plugins/qq_auto_reply/humanize/rewriter.py
+@@ -60,6 +60,11 @@ def rewrite_blocks_for_delivery(
+         segments = process_llm_response_segments(
+             str(getattr(block, "text", "") or ""), config,
+         )
++        if not segments:
++            # 压条数上限 <=0 时 splitter 返回空表（上游 MaiBot 调用点不会
++            # 喂 0，本插件配置可手改）：按原文单段透传，不崩。
++            rewritten.append(block)
++            continue
+         if len(segments) <= 1 and not getattr(segments[0], "quote_previous", False):
+             # 单段且非纠正段：保留原块对象（文本可能被动作剥离/错字改写，
+             # 用新 text 替换，仍算 changed）
+diff --git a/tests/unit/test_qq_humanize_core.py b/tests/unit/test_qq_humanize_core.py
+index fa76584b..dca66e19 100644
+--- a/tests/unit/test_qq_humanize_core.py
++++ b/tests/unit/test_qq_humanize_core.py
+@@ -161,6 +161,17 @@ def test_config_defaults_off():
+     assert HumanizeConfig().enable is False
+ 
+ 
++def test_config_typo_defaults_aligned_official_configs():
++    """错字组默认值对齐 MaiBot official_configs.ChineseTypoConfig 的运行时
++    实际生效值（麦麦级密度），而非 typo_generator 构造形参默认（30 倍密度）。"""
++    cfg = HumanizeConfig()
++    assert cfg.typo_error_rate == 0.01
++    assert cfg.typo_min_freq == 9.0
++    assert cfg.typo_tone_error_rate == 0.1
++    assert cfg.typo_word_replace_rate == 0.006
++    assert cfg.typo_correction_quote_probability == 1.0
++
++
+ def test_config_from_mapping_casts_types():
+     """from_mapping：字符串/数值强转，未知键忽略，None 保持默认。"""
+     cfg = HumanizeConfig.from_mapping({
+diff --git a/tests/unit/test_qq_humanize_rewriter.py b/tests/unit/test_qq_humanize_rewriter.py
+index 904b7862..5d07f38a 100644
+--- a/tests/unit/test_qq_humanize_rewriter.py
++++ b/tests/unit/test_qq_humanize_rewriter.py
+@@ -111,3 +111,16 @@ def test_rewrite_single_segment_keeps_block_object():
+     result = rewrite_blocks_for_delivery(blocks, _on_cfg(splitter_enable=False))
+     assert len(blocks) == 1
+     assert blocks[0] is result[0]
++
++
++def test_rewrite_empty_segments_guard():
++    """max_split_num=0（压条数上限非正）时 splitter 返回空表——改写器
++    必须按原文透传，不得 IndexError。"""
++    blocks = [QQMessageBlock(text="你好，今天天气不错，我们出去玩吧")]
++    random.seed(20260919)
++    result = rewrite_blocks_for_delivery(
++        blocks, _on_cfg(splitter_max_split_num=0),
++    )
++    assert result is blocks
++    assert len(blocks) == 1
++    assert blocks[0].text == "你好，今天天气不错，我们出去玩吧"
 -- 
 2.43.0
 

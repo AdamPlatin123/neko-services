@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | 003 | `003-persona-mount-mode.patch` | P1-2 #1 | persona_override 挂载分轨：声明式 `mount_mode`（完整人设 replace / 附加模块 append）+ `append_guidance` append-only 模块轨 + `env_context` 开关键 + 四情形断言测试 |
 | 004 | `004-desktop-env-injection.patch` | P1-2 #2 | 桌面昵称状态机数据面：主进程采集宿主环境（getpass/platform 等，无 shell）经 `utils/persona_env_context.py` 注入 `_build_initial_prompt`，未声明零注入 |
-| 005 | `005-humanize-pipeline.patch` | P2-1 | 人味后处理（默认 off）：MaiBot 三函数移植进 qq_auto_reply 插件 `humanize/`（分段/错字/打字延迟，HumanizeConfig 收敛 14 标量、char_frequency.json 绝对路径化）；block 改写器挂两条缓冲路径共用的最终投递入口（`QQReplyDeliveryNode.deliver` 前缘，缓冲取消不截断已发送段）；quote_previous 内部关系+发送回执解析+未知降级；记账分离（事实提取/fallback 补行用改写前语义正文、提及计数用送达文本）；QQ 全链 trace_id（contextvar helper + dispatcher 入口 + pipeline traces + 投递日志）。依赖 jieba/pypinyin。39 项新测试（plugin_unit） |
+| 005 | `005-humanize-pipeline.patch` | P2-1 | 人味后处理（默认 off）：MaiBot 三函数移植进 qq_auto_reply 插件 `humanize/`（分段/错字/打字延迟，HumanizeConfig 收敛 14 标量、char_frequency.json 绝对路径化）；block 改写器挂两条缓冲路径共用的最终投递入口（`QQReplyDeliveryNode.deliver` 前缘，缓冲取消不截断已发送段）；quote_previous 内部关系+发送回执解析+未知降级；记账分离（事实提取/fallback 补行用改写前语义正文、提及计数用送达文本）；QQ 全链 trace_id（contextvar helper + dispatcher 入口 + pipeline traces + 投递日志）。代审 P2 修复：空段守卫（max_split_num<=0 原文透传不崩）+ 错字默认对齐 official_configs（麦麦级密度 0.01/9/0.1/0.006/1.0）。依赖 jieba/pypinyin。41 项新测试（plugin_unit） |
 
 > ⚠️ 在 001/002 落地前，`replay-patches.sh` 会因序号不连续（003 起始）拒绝整组重放——这是校验的预期行为。单独验证 003/004 可直接 `git am` 这两个文件到基线（P1-2 已在干净基线 worktree 上做过：双补丁干净应用 + 新增测试全绿 + OOC 回归 23/23）。
 
