@@ -8,7 +8,7 @@
 
 | 组件 | 当前版本 | 数据格式版本 | 升级兼容性说明 | 备份属性 |
 | --- | --- | --- | --- | --- |
-| **N.E.K.O 上游基线**（`/mnt/shared/_Projects/N.E.K.O/N.E.K.O`） | `a3c82b5a`（tag `nightly-4-ga3c82b5a`，2026-09-17 上游线，PR #3127） | —（见「memory 数据」行） | 分叉姿态=钉死版本、被动跟进：仅 QQ 协议/NapCat 破坏性变更时拉取；每次拉取按 `patches/neko/*.patch` 重放并跑回归三绿（runbook 第 4 节）。基线变更后同步更新 BASELINE.md 与本表 | 代码可随 git 回退，无需备份 |
+| **N.E.K.O 上游基线**（`/mnt/shared/_Projects/N.E.K.O/N.E.K.O`） | `a3c82b5a`（2026-09-17 上游线，PR #3127） | —（见「memory 数据」行） | 分叉姿态=钉死版本、被动跟进：仅 QQ 协议/NapCat 破坏性变更时拉取；每次拉取按 `patches/neko/*.patch` 重放并跑回归三绿（runbook 第 4 节）。基线变更后同步更新 BASELINE.md 与本表 | 代码可随 git 回退，无需备份 |
 | **Python 运行时与依赖锁定** | N.E.K.O 上游：Python **3.11.\***（pyproject 锁定），依赖以 `$NEKO_SRC/uv.lock` 为准；a-memorix-service：Python **3.12**（uv venv，P0-1 落地时补记精确版本与 lock 文件路径）；neko-services 自有脚本：系统 bash/python3 | — | 上游升级跨 3.11→3.12 等大版本时属破坏性变更，按 runbook 第 3 节故障 3 流程处理；`uv sync` 以 lock 文件为准，不要手动改依赖 | lock 文件随各仓库 git 管理 |
 | **本地补丁序列**（`patches/neko/*.patch`） | 随本仓库 git 历史 | — | 补丁针对特定上游基线制作；上游基线前进后重放冲突=需要人工重做补丁 | 随仓库 git 管理 |
 | **NapCat**（QQ 协议端，插件托管） | pin 记录在 BASELINE.md（P0-0 #5 落盘；当前本机 `$NEKO_SRC/plugin/plugins/qq_auto_reply/NapCat.Shell/` 尚未安装，首次安装后立即在此补记版本号） | — | **协议风险主源**。自动更新可能破坏 QQ 链路；升级前必查 changelog（巡检入口在 BASELINE.md），升级后跑 runbook 第 3 节故障 3 流程 | 安装包可重下，登录态会话数据看情况备份 |
