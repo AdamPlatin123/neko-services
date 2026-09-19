@@ -1,0 +1,850 @@
+From 0981c6fae0159126611ac13561a3fe85a6cdd07c Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:45:20 +0800
+Subject: [PATCH 3/3] =?UTF-8?q?feat(memory):=20query=5Fmemory=20=E5=A2=9E?=
+ =?UTF-8?q?=E5=8A=A0=20a-memorix=20=E8=AF=BB=E8=9E=8D=E5=90=88=20+=20new?=
+ =?UTF-8?q?=5Fdialog=20to=5Ftext=20=E5=9D=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+UC1 Final Gate 转正 #8（workplan P1-1 #8）：a-memorix-service 出关键路径
+后读融合转正为必做——检索增益路（默认 off，部署 a-memorix-service 时开）。
+
+- config：A_MEMORIX_URL（默认 http://127.0.0.1:48921）+
+  A_MEMORIX_READ_FUSION_ENABLED（默认 off；NEKO_A_MEMORIX_READ_FUSION_
+  ENABLED=1 开）+ 超时 1s / RRF k=60 / top_k=5 等参数，env 可覆盖。
+- memory/amemorix_client.py：读侧客户端。契约照 MaiBot 宿主 wire 格式
+  （module-interface-audit §3/§6）：POST /a_memorix/v1/search
+  {query,limit,chat_id} → MemorySearchResult.to_dict 形状。降级纪律：不可达/
+  超时/success=false/形状异常 → 空 hits + WARN，绝不阻塞单源检索。
+- /query_memory 融合：hybrid_recall 结果与 a-memorix hits 两路 RRF（k=60），
+  a-memorix 条目 id 带 amemorix: 前缀隔离（不与本地 fact/reflection 撞名，
+  同一事实双源保留为两条独立证据）；candidates_total 累加 +
+  a_memorix_contributions 可观测字段。**subjects 非空（群聊）时跳过融合**：
+  a-memorix 索引无 subject scope 标注，融合会把私有语料泄进群聊——宁可
+  少一路，不可破边界。time-only 路径（recall_by_time）不做 query 驱动融合。
+- /new_dialog 追加 to_text 块（A_MEMORIX_MEMORY_HEADER i18n 8 语言）：检索词
+  取最近 6 条对话文本；预算与 persona 渲染**共享 PERSONA_RENDER_MAX_TOKENS
+  总额度**（persona 实花 token 计数后剩余才是本块上限，撑满即缺席）；逐条
+  计入渲染行 token，耗尽即停（跳过不塞半条）；无命中/未启用整块缺席。
+
+测试：tests/unit/test_amemorix_read_fusion.py 13 例——RRF 数学与 id 隔离/
+同事实双源保留/连接错误+超时+success=false+坏形状四路降级 WARN/请求体契约/
+端点路由（off 不发请求、on 融合、subjects 跳过、降级单源）/预算裁剪（收一条、
+跳过不塞半条、预算 1 整块空）/长内容截断/检索词窗口（最近 6 条）。
+相关回归 149 passed（含 persona 渲染预算、hybrid_recall、cache_settle）。
+---
+ app/memory_server/routes.py             |  42 ++-
+ config/__init__.py                      |   7 +
+ config/memory_settings.py               |  14 +
+ config/prompts/prompts_memory.py        |  13 +
+ memory/amemorix_client.py               | 266 +++++++++++++++++
+ tests/unit/test_amemorix_read_fusion.py | 363 ++++++++++++++++++++++++
+ 6 files changed, 703 insertions(+), 2 deletions(-)
+ create mode 100644 memory/amemorix_client.py
+ create mode 100644 tests/unit/test_amemorix_read_fusion.py
+
+diff --git a/app/memory_server/routes.py b/app/memory_server/routes.py
+index 736715a8..31069f9b 100644
+--- a/app/memory_server/routes.py
++++ b/app/memory_server/routes.py
+@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
+ 
+ from config.prompts.prompts_sys import _loc
+ from config.prompts.prompts_memory import (
++    A_MEMORIX_MEMORY_HEADER,
+     INNER_THOUGHTS_HEADER,
+     CHAT_GAP_NOTICE, CHAT_GAP_LONG_HINT, CHAT_GAP_CURRENT_TIME,
+     CHAT_HOLIDAY_CONTEXT,
+@@ -47,6 +48,7 @@ from config.prompts.prompts_memory import (
+     _normalize_memory_prompt_lang,
+ )
+ from utils.frontend_utils import get_timestamp
++from utils.tokenize import count_tokens
+ from utils.language_utils import (
+     get_global_language_full,
+     is_supported_language_code,
+@@ -59,6 +61,7 @@ from utils.cloudsave_runtime import MaintenanceModeError, assert_cloudsave_writa
+ from memory.external_markdown_import import MAX_ENTRIES, MAX_ENTRY_CHARS
+ from memory.outbox import OP_PERSIST_PROMPT_LOCALE
+ from memory.persona.fusion import ExternalMemoryImportTooLargeError
++from memory import amemorix_client
+ from utils.natural_expression_candidates import (
+     CandidateMinerError,
+     SourceMessage,
+@@ -3558,7 +3561,7 @@ async def query_memory(lanlan_name: str, req: QueryMemoryRequest):
+         # 时间"联合检索（窗口内按 query 排序）。
+         from memory.hybrid_recall import hybrid_recall
+         with language_context(resolved_language):
+-            return await hybrid_recall(
++            payload = await hybrid_recall(
+                 lanlan_name=lanlan_name,
+                 query=query_text,
+                 fact_store=runtime.fact_store,
+@@ -3567,6 +3570,18 @@ async def query_memory(lanlan_name: str, req: QueryMemoryRequest):
+                 time_window=time_window,
+                 subjects=subjects,
+             )
++            # UC1 转正 #8（patch 009）：a-memorix 读融合——开启且本调用无
++            # subjects 时，与 hybrid 结果 RRF 融合（k=60）。subjects 非空
++            # （群聊安全边界）时跳过：a-memorix 索引无 subject scope 标注，
++            # 融合会把私有语料泄进群聊——宁可少一路，不可破边界。time-only
++            # 路径（recall_by_time）在上方已提前 return，不做 query 驱动融合。
++            if amemorix_client.is_read_fusion_enabled() and query_text and not subjects:
++                amem_hits = await amemorix_client.asearch(lanlan_name, query_text)
++                if amem_hits:
++                    payload = amemorix_client.fuse_hybrid_with_amemorix(
++                        payload, amem_hits,
++                    )
++            return payload
+     except Exception as exc:
+         # 永不让一次召回失败把 tool call 整死——返回空 results，main_server
+         # 那边的 handler 会把空 results 翻译成 "没有找到相关记忆"，模型可以
+@@ -4093,7 +4108,8 @@ async def _new_dialog(
+             time=get_timestamp(),
+         )
+ 
+-        for i in await runtime.recent_history_manager.aget_recent_history(lanlan_name):
++        recent_history = await runtime.recent_history_manager.aget_recent_history(lanlan_name)
++        for i in recent_history:
+             if isinstance(i.content, str):
+                 cleaned_content = brackets_pattern.sub('', i.content).strip()
+                 result += f"{name_mapping[i.type]} | {cleaned_content}\n"
+@@ -4101,6 +4117,28 @@ async def _new_dialog(
+                 texts = [brackets_pattern.sub('', j['text']).strip() for j in i.content if j['type'] == 'text']
+                 result += f"{name_mapping[i.type]} | " + "\n".join(texts) + "\n"
+ 
++        # ── a-memorix 跨源长期记忆块（UC1 Final Gate 转正 #8，patch 009）──
++        # 预算纪律：与 persona 渲染**共享 PERSONA_RENDER_MAX_TOKENS 总额度**——
++        # persona 实际花掉多少按渲染结果计数，剩余才是本块上限；persona 撑满
++        # 时本块为空（预算优先于注入欲望）。未启用/无命中/无近期对话可作检索
++        # 词时整块缺席（不留空标题）。失败只 WARN，绝不阻塞开场上下文。
++        if amemorix_client.is_read_fusion_enabled():
++            try:
++                from config import PERSONA_RENDER_MAX_TOKENS
++                persona_spent = count_tokens(persona_md or '')
++                amem_block = await amemorix_client.render_new_dialog_block(
++                    lanlan_name,
++                    recent_history,
++                    token_budget=max(0, PERSONA_RENDER_MAX_TOKENS - persona_spent),
++                    header=_loc(A_MEMORIX_MEMORY_HEADER, _lang),
++                )
++                if amem_block:
++                    result += amem_block
++            except Exception as e:
++                logger.warning(
++                    f"[MemoryServer] new_dialog: {lanlan_name} a-memorix 块渲染失败(跳过): {e}"
++                )
++
+         # ── 距上次聊天间隔提示（放在最末尾，紧接 CONTEXT_SUMMARY_READY 之前） ──
+         try:
+             from datetime import datetime as _dt
+diff --git a/config/__init__.py b/config/__init__.py
+index 685d34d4..93ffa5b7 100644
+--- a/config/__init__.py
++++ b/config/__init__.py
+@@ -316,6 +316,13 @@ from .memory_settings import (  # noqa: F401
+     VECTORS_MIN_RAM_GB,
+     VECTORS_MODEL_PROFILE_ID,
+     VECTORS_WARMUP_DELAY_SECONDS,
++    A_MEMORIX_URL,
++    A_MEMORIX_READ_FUSION_ENABLED,
++    A_MEMORIX_TIMEOUT_SECONDS,
++    A_MEMORIX_FUSION_RRF_K,
++    A_MEMORIX_QUERY_LIMIT,
++    A_MEMORIX_NEW_DIALOG_TOP_K,
++    A_MEMORIX_NEW_DIALOG_MAX_CONTENT_CHARS,
+ )
+ 
+ from .agent_settings import (  # noqa: F401
+diff --git a/config/memory_settings.py b/config/memory_settings.py
+index 571c8682..49b8dd56 100644
+--- a/config/memory_settings.py
++++ b/config/memory_settings.py
+@@ -1006,3 +1006,17 @@ VECTORS_MODEL_PROFILE_ID = "local-text-retrieval-v1"  # anonymous profile id + l
+ # event after startup. The warmup task waits up to this many seconds
+ # after startup OR until first /process call, whichever comes first.
+ VECTORS_WARMUP_DELAY_SECONDS = 30
++
++# ---- Memory: a-memorix 读融合（UC1 Final Gate 转正 #8，patch 009）----
++# /query_memory 端点内增加 a-memorix-service 检索路：与 hybrid_recall 结果做
++# RRF 融合；/new_dialog 追加 a-memorix to_text 块（预算入 PERSONA_RENDER_
++# MAX_TOKENS 总额度）。默认 **off**——a-memorix-service 是平行部署的独立
++# FastAPI（neko-services P0-1），部署时置 NEKO_A_MEMORIX_READ_FUSION_ENABLED=1
++# 开启；不可达/超时一律降级单源 + WARN，绝不阻塞检索。
++A_MEMORIX_URL = _read_str_env("A_MEMORIX_URL", "http://127.0.0.1:48921")
++A_MEMORIX_READ_FUSION_ENABLED = _read_bool_env("A_MEMORIX_READ_FUSION_ENABLED", False)
++A_MEMORIX_TIMEOUT_SECONDS = 1.0   # 不可达/超时 → 降级单源 + WARN（S2 故障表）
++A_MEMORIX_FUSION_RRF_K = 60       # RRF k；与 hybrid_recall 内部融合同量级
++A_MEMORIX_QUERY_LIMIT = 10        # /query_memory 融合路请求的 hit 上限
++A_MEMORIX_NEW_DIALOG_TOP_K = 5    # /new_dialog to_text 块条目上限（MemorySearchResult.to_text 默认同值）
++A_MEMORIX_NEW_DIALOG_MAX_CONTENT_CHARS = 160  # 单条内容截断（to_text truncate_content 同值）
+diff --git a/config/prompts/prompts_memory.py b/config/prompts/prompts_memory.py
+index 984f8b12..85ae185b 100644
+--- a/config/prompts/prompts_memory.py
++++ b/config/prompts/prompts_memory.py
+@@ -1056,6 +1056,19 @@ NO_RECENT_HISTORY = {
+     "pt": "Antes de iniciar a conversa, não há histórico.\n",
+ }
+ 
++# ---------- /new_dialog 的 a-memorix 跨源记忆块头（patch 009；消费方 memory_
++# server _new_dialog，i18n 表驱动同上）。空命中/未启用时不渲染整个块。 ----------
++A_MEMORIX_MEMORY_HEADER = {
++    "zh": "[跨源长期记忆]\n以下是她从更早对话里关联到的片段：\n",
++    "zh-TW": "[跨源長期記憶]\n以下是她從更早對話裡關聯到的片段：\n",
++    "en": "[Cross-source long-term memory]\nFragments she recalled from earlier conversations:\n",
++    "ja": "[クロスソース長期記憶]\n彼女がより古い会話から思い出した断片：\n",
++    "ko": "[교차 출처 장기 기억]\n그녀가 더 이전 대화에서 떠올린 조각들:\n",
++    "ru": "[Долговременная память из других источников]\nФрагменты, которые она вспомнила из более ранних разговоров:\n",
++    "es": "[Memoria a largo plazo de otras fuentes]\nFragmentos que ella recordó de conversaciones anteriores:\n",
++    "pt": "[Memória de longo prazo de outras fontes]\nFragmentos que ela lembrou de conversas anteriores:\n",
++}
++
+ 
+ # ---------- Locale-independent /new_dialog splitter ----------
+ # new_dialog 的文本结构固定为三段拼接：
+diff --git a/memory/amemorix_client.py b/memory/amemorix_client.py
+new file mode 100644
+index 00000000..6efd0f20
+--- /dev/null
++++ b/memory/amemorix_client.py
+@@ -0,0 +1,266 @@
++# -*- coding: utf-8 -*-
++# Copyright 2025-2026 Project N.E.K.O. Team
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""a-memorix-service 读侧客户端（UC1 Final Gate 转正 #8，patch 009）。
++
++只做**检索路**（读融合）：/query_memory 的 RRF 融合 + /new_dialog 的
++to_text 块。写钩子（settle 后 ingest_text/ingest_summary）是 P0-1 服务化
++的另一条线，不在这里。
++
++HTTP 契约（照 MaiBot 宿主 MemoryService/MemoryHit 的 wire 格式，见
++neko-services/docs/design/module-interface-audit.md §3/§6——请求体照抄
++KernelSearchRequest 的字段名，响应照抄 MemorySearchResult.to_dict）::
++
++    POST {A_MEMORIX_URL}/a_memorix/v1/search
++    body: {"query": str, "limit": int, "chat_id": str}
++    resp: {"success": bool, "hits": [MemoryHit.to_dict()...], "filtered": bool, ...}
++          MemoryHit.to_dict 键: content/score/type/source/hash/metadata/episode_id/title
++
++降级纪律（设计文档 S2 故障表）：不可达/超时（A_MEMORIX_TIMEOUT_SECONDS）/
++形状异常 → 返回空 + WARN，**绝不阻塞单源检索**——a-memorix 是增益路，不是
++依赖路。默认 off（A_MEMORIX_READ_FUSION_ENABLED），部署 a-memorix-service
++时置 NEKO_A_MEMORIX_READ_FUSION_ENABLED=1。
++"""
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++import httpx
++
++from config import (
++    A_MEMORIX_FUSION_RRF_K,
++    A_MEMORIX_NEW_DIALOG_MAX_CONTENT_CHARS,
++    A_MEMORIX_NEW_DIALOG_TOP_K,
++    A_MEMORIX_QUERY_LIMIT,
++    A_MEMORIX_READ_FUSION_ENABLED,
++    A_MEMORIX_TIMEOUT_SECONDS,
++    A_MEMORIX_URL,
++)
++from utils.logger_config import get_module_logger
++from utils.tokenize import count_tokens
++
++logger = get_module_logger(__name__, "Memory")
++
++A_MEMORIX_SEARCH_PATH = "/a_memorix/v1/search"
++
++# 融合结果里 a-memorix 条目的 tier 标识（hybrid_recall 的 tier 枚举新增一员；
++# 渲染侧按 tier 透传，不认识的新值原样展示）。
++A_MEMORIX_TIER = "a_memorix"
++
++
++def is_read_fusion_enabled() -> bool:
++    """读融合总开关（默认 off；env NEKO_A_MEMORIX_READ_FUSION_ENABLED=1 开）。"""
++    return bool(A_MEMORIX_READ_FUSION_ENABLED)
++
++
++def _hit_id(hit: dict, index: int) -> str:
++    """a-memorix hit 的融合去重键——前缀隔离，绝不与本地 fact/reflection id 撞名。"""
++    raw = str(hit.get("hash") or hit.get("episode_id") or "").strip()
++    if not raw:
++        raw = f"idx{index}"
++    return f"{A_MEMORIX_TIER}:{raw}"
++
++
++async def asearch(
++    lanlan_name: str,
++    query: str,
++    *,
++    limit: int = A_MEMORIX_QUERY_LIMIT,
++    timeout: float = A_MEMORIX_TIMEOUT_SECONDS,
++    transport: httpx.AsyncBaseTransport | None = None,
++) -> list[dict]:
++    """Query a-memorix-service; degrade to [] + WARN on any failure.
++
++    ``transport`` 只给测试注入 MockTransport 用，生产路径不传。
++    """
++    if not query or not query.strip():
++        return []
++    url = f"{A_MEMORIX_URL.rstrip('/')}{A_MEMORIX_SEARCH_PATH}"
++    payload = {"query": query.strip(), "limit": int(limit), "chat_id": lanlan_name}
++    try:
++        async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
++            resp = await client.post(url, json=payload)
++            resp.raise_for_status()
++            body = resp.json()
++        if not isinstance(body, dict) or body.get("success") is False:
++            # 契约里 success=False 携带 error 字段；不把它当异常抛——降级语义一致
++            logger.warning(
++                "[a-memorix] %s: search 返回 success=false: %r", lanlan_name, body,
++            )
++            return []
++        hits = body.get("hits")
++        if not isinstance(hits, list):
++            logger.warning(
++                "[a-memorix] %s: search 响应 hits 形状异常(%s)，按降级处理",
++                lanlan_name, type(hits).__name__,
++            )
++            return []
++        return [h for h in hits if isinstance(h, dict) and str(h.get("content") or "").strip()]
++    except (asyncio.TimeoutError, httpx.TimeoutException):
++        # httpx 的超时是 httpx.TimeoutException（不是 asyncio.TimeoutError 的
++        # 子类），两个都归到超时口径。
++        logger.warning(
++            "[a-memorix] %s: search 超时(%.1fs)，降级单源检索", lanlan_name, timeout,
++        )
++        return []
++    except Exception as e:
++        logger.warning(
++            "[a-memorix] %s: search 不可达(%s: %s)，降级单源检索",
++            lanlan_name, type(e).__name__, e,
++        )
++        return []
++
++
++def _rrf_score(rank: int, k: int) -> float:
++    return 1.0 / (k + rank)
++
++
++def fuse_hybrid_with_amemorix(
++    hybrid_payload: dict[str, Any],
++    amem_hits: list[dict],
++    *,
++    k: int = A_MEMORIX_FUSION_RRF_K,
++) -> dict[str, Any]:
++    """RRF-fuse hybrid_recall results with a-memorix hits (in-place on a copy).
++
++    两路排名：hybrid_payload["results"]（已按融合分降序）与 amem_hits（按
++    score 降序）。RRF: score(d) = Σ 1/(k + rankᵢ(d))；去重键 = hybrid 条目的
++    ``id`` vs a-memorix 的 ``amemorix:<hash>`` 前缀键——两侧 id 空间隔离，
++    天然不合并（同一事实在两侧是两条独立证据，RRF 只做排序不做等价合并）。
++
++    返回新 dict（原 payload 不动）：results 重排、score 换成 RRF 分（6 位小
++    数，与 hybrid_recall 的可观测口径一致）、candidates_total 累加 a-memorix
++    命中数，另附 ``a_memorix_contributions`` 供可观测。
++    """
++    results = list(hybrid_payload.get("results") or [])
++    fused_scores: dict[str, float] = {}
++    by_id: dict[str, dict] = {}
++
++    for rank, row in enumerate(results, start=1):
++        did = str(row.get("id") or "")
++        if not did:
++            continue
++        by_id[did] = row
++        fused_scores[did] = fused_scores.get(did, 0.0) + _rrf_score(rank, k)
++
++    sorted_hits = sorted(
++        amem_hits, key=lambda h: float(h.get("score") or 0.0), reverse=True,
++    )
++    for rank, hit in enumerate(sorted_hits, start=1):
++        did = _hit_id(hit, rank - 1)
++        entry = {
++            "id": did,
++            "text": str(hit.get("content") or ""),
++            "tier": A_MEMORIX_TIER,
++            "entity": None,
++            "subject_kind": None,
++            "subject_id": None,
++            # a-memorix 是全局索引（无 subject scope 标注），融合条目标
++            # legacy_private 与单源路径默认一致；subjects 非空的群聊调用在
++            # 端点侧已整体跳过融合（安全边界），不会走到这里。
++            "scope": "legacy_private",
++            "score": 0.0,
++            "created_at": None,
++            "event_start_at": None,
++            "event_end_at": None,
++        }
++        by_id[did] = entry
++        fused_scores[did] = fused_scores.get(did, 0.0) + _rrf_score(rank, k)
++
++    ordered = sorted(fused_scores.keys(), key=lambda d: fused_scores[d], reverse=True)
++    fused_results = []
++    for did in ordered:
++        row = dict(by_id[did])
++        row["score"] = round(fused_scores[did], 6)
++        fused_results.append(row)
++
++    out = dict(hybrid_payload)
++    out["results"] = fused_results
++    out["candidates_total"] = int(hybrid_payload.get("candidates_total") or 0) + len(sorted_hits)
++    out["a_memorix_contributions"] = len(sorted_hits)
++    return out
++
++
++def _recent_dialog_query_text(history, max_chars: int = 400) -> str:
++    """拼 /new_dialog 的检索词：最近几条对话文本（截断防 prompt 爆炸）。"""
++    texts: list[str] = []
++    for message in list(history)[-6:]:
++        content = getattr(message, "content", "")
++        if isinstance(content, list):
++            content = " ".join(
++                str(p.get("text") or "") for p in content if isinstance(p, dict)
++            )
++        text = str(content or "").strip()
++        if text:
++            texts.append(text)
++    query = " ".join(texts).strip()
++    return query[:max_chars]
++
++
++def render_hits_as_text(
++    hits: list[dict],
++    *,
++    token_budget: int,
++    max_entries: int = A_MEMORIX_NEW_DIALOG_TOP_K,
++    max_content_chars: int = A_MEMORIX_NEW_DIALOG_MAX_CONTENT_CHARS,
++) -> str:
++    """to_text 风格渲染（照 MaiBot MemorySearchResult.to_text 的编号列表），
++    按 token 预算逐条收纳（预算来自 PERSONA_RENDER_MAX_TOKENS 总额度的剩余）。
++
++    每条计入「渲染行」的 token（前缀 + 截断后内容 + 换行），预算耗尽即停——
++    跳过而不是塞半条（半截记忆比没有更糟，SCOPED_RENDER_SUBJECT_MIN_TOKENS
++    同一哲学）。
++    """
++    lines: list[str] = []
++    spent = 0
++    for index, hit in enumerate(hits[: max(1, int(max_entries))], start=1):
++        content = str(hit.get("content") or "").strip().replace("\n", " ")
++        if max_content_chars and len(content) > max_content_chars:
++            content = content[:max_content_chars] + "..."
++        line = f"{index}. {content}"
++        cost = count_tokens(line) + 1  # +1 = 换行
++        if spent + cost > token_budget:
++            break
++        lines.append(line)
++        spent += cost
++    return "\n".join(lines)
++
++
++async def render_new_dialog_block(
++    lanlan_name: str,
++    recent_history: list,
++    *,
++    token_budget: int,
++    header: str,
++    transport: httpx.AsyncBaseTransport | None = None,
++) -> str:
++    """/new_dialog 的 a-memorix 跨源记忆块（无命中/未启用/预算耗尽 → 空串）。
++
++    检索词 = 最近几条对话文本（new_dialog 是会话开场，没有显式 query）；预算
++    是 PERSONA_RENDER_MAX_TOKENS 总额度扣除 persona 渲染已花后的剩余——两个
++    块共享同一总额度，persona 撑满时本块自然为空（预算纪律优先于注入欲望）。
++    """
++    if token_budget <= 0:
++        return ""
++    query = _recent_dialog_query_text(recent_history)
++    if not query:
++        return ""
++    hits = await asearch(lanlan_name, query, transport=transport)
++    if not hits:
++        return ""
++    body = render_hits_as_text(hits, token_budget=token_budget)
++    if not body:
++        return ""
++    return f"{header}{body}\n"
+diff --git a/tests/unit/test_amemorix_read_fusion.py b/tests/unit/test_amemorix_read_fusion.py
+new file mode 100644
+index 00000000..e20c142c
+--- /dev/null
++++ b/tests/unit/test_amemorix_read_fusion.py
+@@ -0,0 +1,363 @@
++# -*- coding: utf-8 -*-
++"""a-memorix read-fusion tests (UC1 Final Gate #8, patch 009).
++
++/query_memory 端点内增加 a-memorix 检索路（RRF k=60 融合）+ /new_dialog
++to_text 块（预算入 PERSONA_RENDER_MAX_TOKENS 总额度）。验收（设计文档 S2
++故障表：a-memorix 超时 → 降级单源 + WARN 不阻塞）：
++
++1. 融合命中：双源 RRF 排序正确、id 前缀隔离（不与本地 fact 撞名）；
++2. 降级：不可达/超时/success=false/坏形状 → 空 hits + WARN，绝不抛；
++3. 端点路由：enabled off 不发请求；subjects 非空（群聊安全边界）跳过融合；
++4. 预算裁剪：to_text 块逐条计入 token 预算，耗尽即停（跳过不塞半条）。
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++
++import httpx
++import pytest
++
++import memory.amemorix_client as amemorix_client
++from memory.amemorix_client import (
++    A_MEMORIX_TIER,
++    asearch,
++    fuse_hybrid_with_amemorix,
++    render_hits_as_text,
++    render_new_dialog_block,
++)
++from utils.llm_client import HumanMessage
++
++pytestmark = pytest.mark.unit
++
++_LANLAN = "Xiaoba"
++
++
++def _hit(content: str, score: float, hash_: str = "") -> dict:
++    return {
++        "content": content, "score": score, "type": "narrative",
++        "source": "memory", "hash": hash_ or f"h-{content}", "metadata": {},
++        "episode_id": "", "title": "",
++    }
++
++
++class _WarningLog:
++    """N.E.K.O 自有日志系统不挂 pytest caplog——直接替换模块 logger 捕获。"""
++
++    def __init__(self):
++        self.messages: list[str] = []
++
++    def warning(self, msg, *args, **kwargs):
++        try:
++            self.messages.append(msg % args if args else str(msg))
++        except TypeError:
++            self.messages.append(str(msg))
++
++    def info(self, *a, **kw):
++        pass
++
++    def error(self, *a, **kw):
++        pass
++
++    def debug(self, *a, **kw):
++        pass
++
++
++@pytest.fixture
++def warn_log(monkeypatch):
++    fake = _WarningLog()
++    monkeypatch.setattr(amemorix_client, "logger", fake)
++    return fake
++
++
++def _hybrid_row(id_: str, score: float) -> dict:
++    return {
++        "id": id_, "text": f"text-{id_}", "tier": "fact", "entity": None,
++        "subject_kind": None, "subject_id": None, "scope": "legacy_private",
++        "score": score, "created_at": None, "event_start_at": None,
++        "event_end_at": None,
++    }
++
++
++# ─────────────────── 1. RRF 融合 ───────────────────
++
++
++def test_fuse_rrf_ordering_and_id_isolation():
++    """双源各 2 条：RRF 分数决定总排序；a-memorix id 带前缀，不与本地撞名。"""
++    payload = {
++        "results": [_hybrid_row("fact_a", 0.9), _hybrid_row("fact_b", 0.5)],
++        "query": "q", "candidates_total": 10, "elapsed_ms": 1.0,
++    }
++    hits = [_hit("amem content x", 0.8), _hit("amem content y", 0.4)]
++
++    fused = fuse_hybrid_with_amemorix(payload, hits, k=60)
++
++    # k=60：rank1=1/61≈0.016393，rank2=1/62≈0.016129（不同名条目按各自 rank）
++    scores = {r["id"]: r["score"] for r in fused["results"]}
++    assert scores["fact_a"] == pytest.approx(1 / 61, abs=1e-6)
++    assert scores[f"{A_MEMORIX_TIER}:h-amem content x"] == pytest.approx(1 / 61, abs=1e-6)
++    assert scores["fact_b"] == pytest.approx(1 / 62, abs=1e-6)
++    # 排序：rank1 的两条在前（同分按 dict 序，不做次序断言），rank2 在后
++    assert fused["results"][0]["score"] >= fused["results"][2]["score"]
++
++    # id 前缀隔离：a-memorix 条目绝不冒充本地 fact/reflection id
++    amem_rows = [r for r in fused["results"] if r["tier"] == A_MEMORIX_TIER]
++    assert len(amem_rows) == 2
++    assert all(r["id"].startswith(f"{A_MEMORIX_TIER}:") for r in amem_rows)
++    assert amem_rows[0]["text"] == "amem content x"
++
++    # 原地不可变：入参 payload 不被改动
++    assert len(payload["results"]) == 2
++    assert "a_memorix_contributions" not in payload
++    # 可观测字段
++    assert fused["a_memorix_contributions"] == 2
++    assert fused["candidates_total"] == 12
++
++
++def test_fuse_same_fact_two_sources_both_kept():
++    """同一事实在两侧是两条独立证据：RRF 排序、不做等价合并（id 空间隔离）。"""
++    payload = {"results": [_hybrid_row("fact_x", 0.9)], "query": "q",
++               "candidates_total": 5, "elapsed_ms": 0.0}
++    hits = [_hit("same fact text", 0.9, hash_="same-hash")]
++
++    fused = fuse_hybrid_with_amemorix(payload, hits)
++    assert len(fused["results"]) == 2
++
++
++# ─────────────────── 2. 降级纪律 ───────────────────
++
++
++@pytest.mark.asyncio
++async def test_asearch_unreachable_degrades_with_warning(warn_log):
++    transport = httpx.MockTransport(
++        lambda request: (_ for _ in ()).throw(httpx.ConnectError("refused"))
++    )
++    hits = await asearch(_LANLAN, "query", transport=transport)
++    assert hits == []
++    assert any("降级单源" in m for m in warn_log.messages)
++
++
++@pytest.mark.asyncio
++async def test_asearch_timeout_degrades_with_warning(warn_log):
++    transport = httpx.MockTransport(
++        lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("timed out"))
++    )
++    hits = await asearch(_LANLAN, "query", transport=transport)
++    assert hits == []
++    assert any("超时" in m for m in warn_log.messages)
++
++
++@pytest.mark.asyncio
++async def test_asearch_success_false_and_bad_shape_degrade(caplog):
++    def _handler(request):
++        body = json.loads(request.content.decode("utf-8"))
++        if body["query"] == "q-false":
++            return httpx.Response(200, json={"success": False, "error": "disabled"})
++        if body["query"] == "q-badshape":
++            return httpx.Response(200, json={"success": True, "hits": "not-a-list"})
++        return httpx.Response(200, json={
++            "success": True,
++            "hits": [_hit("ok hit", 1.0), {"no_content": True}, "garbage"],
++        })
++
++    transport = httpx.MockTransport(_handler)
++    assert await asearch(_LANLAN, "q-false", transport=transport) == []
++    assert await asearch(_LANLAN, "q-badshape", transport=transport) == []
++    # 形状合法但无内容的条目被剔除；合法条目保留
++    hits = await asearch(_LANLAN, "q-ok", transport=transport)
++    assert [h["content"] for h in hits] == ["ok hit"]
++    # 请求体契约：query/limit/chat_id 三字段
++    seen = []
++
++    def _capture(request):
++        seen.append(json.loads(request.content.decode("utf-8")))
++        return httpx.Response(200, json={"success": True, "hits": []})
++
++    await asearch(_LANLAN, "contract", transport=httpx.MockTransport(_capture))
++    assert seen == [{"query": "contract", "limit": 10, "chat_id": _LANLAN}]
++
++
++@pytest.mark.asyncio
++async def test_asearch_empty_query_short_circuits():
++    assert await asearch(_LANLAN, "   ") == []
++
++
++# ─────────────────── 3. /query_memory 端点路由 ───────────────────
++
++
++class _EndpointHarness:
++    """POST /query_memory with hermetic runtime swaps + mocked recall layers."""
++
++    def __init__(self, tmp_path, monkeypatch, *, enabled, hits, subjects=None):
++        from app.memory_server import routes, runtime
++
++        self._routes = routes
++        self._runtime = runtime
++        self.asearch_calls: list[str] = []
++
++        async def _fake_hybrid_recall(**kwargs):
++            return {
++                "results": [_hybrid_row("fact_local", 0.03)],
++                "query": kwargs.get("query") or "",
++                "candidates_total": 3, "elapsed_ms": 0.5,
++            }
++
++        async def _fake_asearch(name, query, **kwargs):
++            self.asearch_calls.append(query)
++            return hits
++
++        # /query_memory 里是函数内 from memory.hybrid_recall import hybrid_recall
++        # ——patch 源模块的属性才能拦住局部 import。
++        import memory.hybrid_recall as hybrid_module
++        monkeypatch.setattr(hybrid_module, "hybrid_recall", _fake_hybrid_recall)
++        monkeypatch.setattr(amemorix_client, "is_read_fusion_enabled", lambda: enabled)
++        monkeypatch.setattr(amemorix_client, "asearch", _fake_asearch)
++
++        self._saved = (
++            runtime.fact_store, runtime.reflection_engine,
++            runtime._memory_runtime_init_completed,
++            runtime._memory_storage_blocked_after_init,
++        )
++        runtime.fact_store = object()
++        runtime.reflection_engine = object()
++        runtime._memory_runtime_init_completed = True
++        runtime._memory_storage_blocked_after_init = False
++        self._subjects = subjects
++
++    async def post(self, query="hello?", time=None):
++        body = {"query": query}
++        if time:
++            body["time"] = time
++        if self._subjects is not None:
++            body["subjects"] = self._subjects
++        transport = httpx.ASGITransport(app=self._routes.app)
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://127.0.0.1",
++        ) as client:
++            return await client.post(f"/query_memory/{_LANLAN}", json=body)
++
++    def restore(self):
++        (
++            self._runtime.fact_store, self._runtime.reflection_engine,
++            self._runtime._memory_runtime_init_completed,
++            self._runtime._memory_storage_blocked_after_init,
++        ) = self._saved
++
++
++async def test_query_memory_fusion_off_does_not_call_amemorix(tmp_path, monkeypatch):
++    h = _EndpointHarness(tmp_path, monkeypatch, enabled=False, hits=[_hit("x", 1.0)])
++    try:
++        resp = await h.post()
++        body = resp.json()
++        assert [r["id"] for r in body["results"]] == ["fact_local"]
++        assert h.asearch_calls == [], "off 时不得发起 a-memorix 请求"
++        assert "a_memorix_contributions" not in body
++    finally:
++        h.restore()
++
++
++async def test_query_memory_fusion_on_merges_amemorix_hits(tmp_path, monkeypatch):
++    h = _EndpointHarness(
++        tmp_path, monkeypatch, enabled=True,
++        hits=[_hit("amem hit", 0.9, hash_="ep-1")],
++    )
++    try:
++        body = (await h.post()).json()
++        assert h.asearch_calls == ["hello?"]
++        tiers = {r["tier"] for r in body["results"]}
++        assert tiers == {"fact", A_MEMORIX_TIER}
++        assert body["a_memorix_contributions"] == 1
++        assert body["candidates_total"] == 4
++    finally:
++        h.restore()
++
++
++async def test_query_memory_subjects_skip_fusion_safety_boundary(tmp_path, monkeypatch):
++    """subjects 非空（群聊）：a-memorix 无 subject scope，融合=越权面，跳过。"""
++    h = _EndpointHarness(
++        tmp_path, monkeypatch, enabled=True, hits=[_hit("x", 1.0)],
++        subjects=[{"subject_kind": "group_chat", "subject_id": "qq:7788"}],
++    )
++    try:
++        resp = await h.post()
++        body = resp.json()
++        assert resp.status_code == 200, body
++        assert h.asearch_calls == [], "subjects 非空时不得融合"
++        assert [r["id"] for r in body["results"]] == ["fact_local"]
++    finally:
++        h.restore()
++
++
++async def test_query_memory_degraded_amemorix_returns_single_source(tmp_path, monkeypatch):
++    h = _EndpointHarness(tmp_path, monkeypatch, enabled=True, hits=[])
++    try:
++        body = (await h.post()).json()
++        assert [r["id"] for r in body["results"]] == ["fact_local"]
++        assert "a_memorix_contributions" not in body, "无贡献时不附融合字段"
++    finally:
++        h.restore()
++
++
++# ─────────────────── 4. to_text 块与预算裁剪 ───────────────────
++
++
++def test_render_hits_as_text_trims_by_token_budget():
++    hits = [
++        _hit("first memory line", 0.9),
++        _hit("second memory line", 0.8),
++        _hit("third memory line", 0.7),
++    ]
++    # 宽预算：全部收下，编号列表（to_text 同款格式）
++    full = render_hits_as_text(hits, token_budget=10000)
++    assert full.splitlines() == [
++        "1. first memory line", "2. second memory line", "3. third memory line",
++    ]
++
++    # 窄预算：只收得下第一条——跳过而不是塞半条
++    from utils.tokenize import count_tokens
++    first_line_cost = count_tokens("1. first memory line") + 1
++    one_and_a_bit = first_line_cost + 2
++    trimmed = render_hits_as_text(hits, token_budget=one_and_a_bit)
++    assert trimmed.splitlines() == ["1. first memory line"]
++
++    # 预算连第一条都不够：空（整块缺席，不留残段）
++    assert render_hits_as_text(hits, token_budget=1) == ""
++
++
++def test_render_hits_as_text_truncates_long_content():
++    long_hit = _hit("长" * 400, 0.9)
++    out = render_hits_as_text([long_hit], token_budget=10000)
++    assert out.endswith("...")
++    assert len(out) < 200
++
++
++async def test_render_new_dialog_block_budget_and_query_from_history():
++    header = "[跨源长期记忆]\n"
++    history = [HumanMessage(content=f"msg {i}") for i in range(8)]
++
++    def _handler(request):
++        body = json.loads(request.content.decode("utf-8"))
++        # 检索词来自最近 6 条对话文本（msg 2..7；更早的不进检索词）
++        assert "msg 7" in body["query"] and "msg 1" not in body["query"]
++        return httpx.Response(200, json={
++            "success": True, "hits": [_hit("cross-source hit", 0.9)],
++        })
++
++    block = await render_new_dialog_block(
++        _LANLAN, history, token_budget=500, header=header,
++        transport=httpx.MockTransport(_handler),
++    )
++    assert block.startswith(header)
++    assert "1. cross-source hit" in block
++
++    # 预算耗尽（persona 撑满总额度）→ 整块缺席
++    assert await render_new_dialog_block(
++        _LANLAN, history, token_budget=0, header=header,
++        transport=httpx.MockTransport(_handler),
++    ) == ""
++
++    # 无近期对话 → 无检索词 → 不发请求、空块
++    assert await render_new_dialog_block(
++        _LANLAN, [], token_budget=500, header=header,
++        transport=httpx.MockTransport(_handler),
++    ) == ""
+-- 
+2.43.0
+
