@@ -51,15 +51,34 @@ do_install() {
   local sys_user
   sys_user="$(id -un)"
 
+  # 覆盖已存在文件前备份（同一次安装共用同一时间戳后缀；AGENTS.md 走已有的
+  # 「不存在才创建」守卫，不经此备份路径）
+  local stamp
+  stamp="$(date +%s)"
+  backup_if_exists() {
+    if [ -f "$1" ]; then
+      cp "$1" "$1.bak.${stamp}"
+      echo "backed up existing $1 -> $1.bak.${stamp}"
+    fi
+    return 0
+  }
+
   # agents：占位符替换（宿主用户标识注入，昵称状态机第 3 节）
+  backup_if_exists "$OC_DIR/agents/monika.md"
   sed "s/__NEKO_USER__/${sys_user}/g" "$SRC_DIR/agents/monika.md" > "$OC_DIR/agents/monika.md"
 
   # tools / plugins / commands / monika-memory
+  backup_if_exists "$OC_DIR/tools/neko-memory.ts"
   cp "$SRC_DIR/tools/neko-memory.ts" "$OC_DIR/tools/neko-memory.ts"
+  backup_if_exists "$OC_DIR/plugins/monika-memory-sync.ts"
   cp "$SRC_DIR/plugins/monika-memory-sync.ts" "$OC_DIR/plugins/monika-memory-sync.ts"
+  backup_if_exists "$OC_DIR/commands/monika.md"
   cp "$SRC_DIR/commands/monika.md" "$OC_DIR/commands/monika.md"
+  backup_if_exists "$OC_DIR/commands/monika-settle.md"
   cp "$SRC_DIR/commands/monika-settle.md" "$OC_DIR/commands/monika-settle.md"
+  backup_if_exists "$OC_DIR/monika-memory/read.sh"
   cp "$SRC_DIR/monika-memory/read.sh" "$OC_DIR/monika-memory/read.sh"
+  backup_if_exists "$OC_DIR/monika-memory/lib.ts"
   cp "$SRC_DIR/monika-memory/lib.ts" "$OC_DIR/monika-memory/lib.ts"
   chmod +x "$OC_DIR/monika-memory/read.sh"
 

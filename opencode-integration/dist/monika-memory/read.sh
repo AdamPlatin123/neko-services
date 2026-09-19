@@ -140,10 +140,17 @@ if [ -n "$outbox_files" ]; then
     fi
   fi
 else
-  # 0 增量：/settle 幂等结算（不查本地计数；失败容忍——下次 settle 或他会话热重置收尾）
-  curl -s -o /dev/null --max-time "$SETTLE_TIMEOUT" -X POST "$BASE_URL/settle/$NAME" \
+  # 0 增量：/settle 幂等结算（不查本地计数）；双层校验同 renew 路径（HTTP 200 + body
+  # status=="settled"，200+status:error 反模式必须查 body）；失败容忍可重试
+  settle_code=$(curl -s -o /tmp/.neko-read-settle.$$ -w '%{http_code}' \
+    --max-time "$SETTLE_TIMEOUT" -X POST "$BASE_URL/settle/$NAME" \
     -H 'content-type: application/json' \
-    -d '{"input_history":"[]"}' 2>/dev/null || log_warn "settle failed (tolerated, idempotent)"
+    -d '{"input_history":"[]"}' 2>/dev/null)
+  settle_status=$(jq -r '.status // empty' /tmp/.neko-read-settle.$$ 2>/dev/null)
+  rm -f /tmp/.neko-read-settle.$$
+  if [ "$settle_code" != "200" ] || [ "$settle_status" != "settled" ]; then
+    log_warn "settle failed (http=${settle_code:-none} status=${settle_status:-none}); tolerated, idempotent retry"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

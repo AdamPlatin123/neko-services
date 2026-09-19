@@ -252,10 +252,19 @@ async function settleBranch(sessionID: string): Promise<void> {
     const r = await lib.postWrite("process", lib.combineOutboxEntries(entries), lib.TIMEOUT_MS.process)
     if (r.ok) {
       for (const f of files) lib.outboxRemove(f)
-      await lib.withState((s) => {
-        lib.ensureSession(s, sessionID).pending_cache = 0
-      })
       lib.logLine(`settle branch: /process committed ${files.length} outbox entries`)
+      // /process 只提交并压缩 outbox 增量，**不结算此前已 /cache 的存量**——混合状态
+      // （outbox 积压 + pending_cache>0）下须追加一次空增量 /settle 一步到位结算；
+      // 计数仅在 /settle 成功后清零（失败保留，下次去抖再收口）
+      const sr = await lib.postWrite("settle", [], lib.TIMEOUT_MS.settle)
+      if (sr.ok) {
+        await lib.withState((s) => {
+          lib.ensureSession(s, sessionID).pending_cache = 0
+        })
+        lib.logLine("settle branch: /settle ok (stock settled after /process)")
+      } else {
+        lib.logLine(`WARN settle branch /settle after /process failed: ${sr.error} (pending_cache kept)`)
+      }
     } else {
       // /process 失败不删 outbox、不丢语义——保留待下次重放（结算可重试，WARN 即可）
       lib.logLine(`WARN settle branch /process failed: ${r.error} (outbox kept: ${files.length})`)
