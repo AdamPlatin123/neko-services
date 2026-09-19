@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# replay-patches.sh — 将 patches/neko/*.patch 按序重放到 N.E.K.O 子项目仓库。
+# replay-patches.sh — 将 patches/neko/*.patch 整组重放到 N.E.K.O 子项目仓库。
 #
 # 配套文档：patches/neko/README.md（patch manifest 使用说明）
 #           patches/neko/BASELINE.md（基线 commit 记录，本脚本校验其一致性）
@@ -9,8 +9,16 @@ usage() {
     cat <<'EOF'
 用法: replay-patches.sh [--dry-run] [--force]
 
-将本仓库 patches/neko/ 下的补丁按文件名序（NNN-<slug>.patch 的字典序即应用序）
-依次 git am 到目标 N.E.K.O 仓库。
+将本仓库 patches/neko/ 下的全部补丁按 NNN 序（文件名字典序）作为**一次
+git am 调用**应用到目标 N.E.K.O 仓库——失败时 git am --abort 撤销的是
+整组补丁（回到重放前 HEAD），修复后重新运行本脚本从基线整体重放，
+不存在「部分残留」的中间态。
+
+前置校验:
+  - 目标仓库 HEAD 须与 BASELINE.md 记录的基线一致（--force 可跳过）。
+  - 目标仓库工作树须干净（含零补丁场景，--dry-run 除外）。
+  - 补丁文件名须为 NNN-<slug>.patch（三位序号-小写短横线短名），
+    且序号从 001 起严格连续；不符合即拒绝执行。
 
 选项:
   --dry-run     空跑：列出将应用的补丁与基线校验结果，不改动目标仓库。
@@ -26,7 +34,8 @@ usage() {
 
 退出码:
   0  成功（含「无补丁可应用」的基线状态）
-  1  参数错误 / 基线校验拒绝 / 目标仓库不可用或脏 / git am 失败
+  1  参数错误 / 校验拒绝（基线不一致、目标仓库脏、补丁命名不合规）/
+     git am 失败（此时请进目标仓库 git am --abort 清理后再重试）
 EOF
 }
 
@@ -95,21 +104,43 @@ else
     fi
 fi
 
+# --- 脏树检查：任何非 dry-run 场景（含零补丁）都要求目标工作树干净 ---
+# 放在零补丁提前返回之前，避免「基线匹配但树脏」被误报为重放成功。
+if [ "$DRY_RUN" -eq 0 ]; then
+    [ -z "$(git -C "$NEKO_REPO" status --porcelain)" ] \
+        || die "目标仓库有未提交修改: $NEKO_REPO（git am 及重放成功判定均要求干净工作树，请先提交或清理）"
+fi
+
 # --- 收集补丁（nullglob：目录为空时得到空数组而非字面量）---
 shopt -s nullglob
 patches=( "$patch_dir"/*.patch )
 shopt -u nullglob
 
+# --- 补丁命名与序号校验：NNN-<slug>.patch，序号从 001 起严格连续 ---
+expected_seq=1
+for p in "${patches[@]}"; do
+    name="$(basename "$p")"
+    if ! [[ $name =~ ^[0-9]{3}-[a-z0-9][a-z0-9-]*\.patch$ ]]; then
+        die "补丁文件名不符合 NNN-<slug>.patch 规范: $name（三位序号-小写短横线短名）"
+    fi
+    seq_num="${name%%-*}"
+    want_seq="$(printf '%03d' "$expected_seq")"
+    if [ "$seq_num" != "$want_seq" ]; then
+        die "补丁序号不连续或乱序: $name（按应用序此处应为 ${want_seq}- 开头；补丁只追加不插队，改历史须整组重建）"
+    fi
+    expected_seq=$((expected_seq + 1))
+done
+
 if [ "${#patches[@]}" -eq 0 ]; then
     log "patches/neko/ 下没有 *.patch —— 基线状态无补丁可应用，视为重放成功。"
     log "（后续有补丁时，成功应用后请运行回归："
-    log "  cd \"$NEKO_REPO\" && pytest -m plugin_unit,plugin_integration"
+    log "  cd \"$NEKO_REPO\" && pytest -m 'plugin_unit or plugin_integration'"
     log "  $repo_root/scripts/smoke.sh ）"
     exit 0
 fi
 
 log ""
-log "将按序应用 ${#patches[@]} 个补丁（目标仓库: $NEKO_REPO）:"
+log "将整组应用 ${#patches[@]} 个补丁（一次 git am，目标仓库: $NEKO_REPO）:"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     for p in "${patches[@]}"; do
@@ -120,23 +151,17 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
-# --- 实际应用 ---
-[ -z "$(git -C "$NEKO_REPO" status --porcelain)" ] \
-    || die "目标仓库有未提交修改，git am 会拒绝执行；请先提交或清理后重试"
-
-applied=0
-for p in "${patches[@]}"; do
-    log "应用: $(basename "$p")"
-    if ! git -C "$NEKO_REPO" am "$p"; then
-        errlog ""
-        errlog "补丁应用失败: $(basename "$p")"
-        errlog "回滚方法: git -C \"$NEKO_REPO\" am --abort"
-        die "中止于第 $((applied + 1)) 个补丁（已应用 $applied 个）"
-    fi
-    applied=$((applied + 1))
-done
+# --- 实际应用：整组一次 git am（失败时 --abort 撤销整组，无部分残留）---
+if ! git -C "$NEKO_REPO" am "${patches[@]}"; then
+    errlog ""
+    errlog "整组补丁应用失败。请勿带着失败状态重跑（会因基线不匹配被拒）。"
+    errlog "回滚方法（撤销本次全部已应用补丁，回到重放前 HEAD）:"
+    errlog "  git -C \"$NEKO_REPO\" am --abort"
+    errlog "修复补丁或目标仓库后，重新运行本脚本从基线整体重放。"
+    exit 1
+fi
 
 log ""
-log "全部 $applied 个补丁应用完成。请运行回归确认（全绿才算完成，P0-0 #9 规则）:"
-log "  1) cd \"$NEKO_REPO\" && pytest -m plugin_unit,plugin_integration"
+log "全部 ${#patches[@]} 个补丁应用完成。请运行回归确认（全绿才算完成，P0-0 #9 规则）:"
+log "  1) cd \"$NEKO_REPO\" && pytest -m 'plugin_unit or plugin_integration'"
 log "  2) $repo_root/scripts/smoke.sh"

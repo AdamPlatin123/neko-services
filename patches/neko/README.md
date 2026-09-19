@@ -14,16 +14,21 @@ NNN-<slug>.patch
 - `<slug>`：全小写、短横线分隔的短名，概括补丁内容，例如 `001-memory-server-recent-history.patch`；
 - **只追加、不插队**：新补丁永远取当前最大序号 +1。需要修改历史补丁时，等价于从该补丁起重建其后整段序列。
 
-## 补丁如何生成
+## 补丁如何生成（临时目录 → 核对 → 原子替换）
 
-在 N.E.K.O 仓库中基于 BASELINE.md 记录的基线 commit 建分支、提交改动，然后导出并按命名规范重命名：
+在 N.E.K.O 仓库中基于 BASELINE.md 记录的基线 commit 建分支、提交改动，然后在**临时空目录**导出全量补丁，核对无误后**原子替换**本目录的全部旧补丁——不要直接向本目录追加导出（改名/删除旧补丁后新旧并存，会被一起重放）：
 
 ```bash
+tmpdir="$(mktemp -d)"
 cd <N.E.K.O 仓库>    # 默认 ../N.E.K.O，可用环境变量 NEKO_REPO 覆盖
-git format-patch <基线commit>..<你的分支> -o <neko-services>/patches/neko/
-cd <neko-services>/patches/neko/
-mv 0001-xxx-yyy.patch 001-<slug>.patch   # format-patch 的 0001- 前缀换成 NNN- 规范
+git format-patch <基线commit>..<你的分支> -o "$tmpdir"
+# 核对：数量 = 分支上的 commit 数；逐个把 0001- 前缀重命名为 NNN-<slug>.patch
+# （在 "$tmpdir" 内完成重命名，确认序号从 001 连续、slug 全小写短横线）
+rm -f <neko-services>/patches/neko/*.patch     # 清掉全部旧补丁（BASELINE.md/README.md 保留原位）
+mv "$tmpdir"/*.patch <neko-services>/patches/neko/ && rmdir "$tmpdir"
 ```
+
+`replay-patches.sh` 会自动校验：文件名符合 `NNN-<slug>.patch`、序号从 001 起严格连续，不合规即拒绝重放。
 
 生成或修改任何补丁后，必须完成下述重放 + 回归，才算完成一次改动。
 
@@ -37,15 +42,17 @@ scripts/replay-patches.sh --dry-run
 scripts/replay-patches.sh [--force]
 ```
 
-脚本行为细节、参数与环境变量（`NEKO_REPO` 覆盖目标仓库路径）见脚本内 usage（`scripts/replay-patches.sh -h`）。应用失败时脚本会提示进入目标仓库执行 `git am --abort` 回滚。
+脚本行为细节、参数与环境变量（`NEKO_REPO` 覆盖目标仓库路径）见脚本内 usage（`scripts/replay-patches.sh -h`）。
+
+重放是**整组一次 `git am`**：中途失败时 `git am --abort` 撤销的是本次全部补丁（回到重放前 HEAD），不存在部分残留；修复后重新运行脚本从基线整体重放。
 
 ## 回归规则（workplan P0-0 #9 固化）
 
 **改 patch → 重放 → 回归全绿**，三步缺一不可：
 
 ```bash
-cd <N.E.K.O 仓库> && pytest -m plugin_unit,plugin_integration
-<neko-services>/scripts/smoke.sh
+cd <N.E.K.O 仓库> && pytest -m 'plugin_unit or plugin_integration'
+<neko-services>/scripts/smoke.sh    # P0-0 #6 产出，随该任务合并后可用
 ```
 
 ## 与 BASELINE.md 的关系
