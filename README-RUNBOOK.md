@@ -79,6 +79,8 @@ cd $NEKO_SRC && uv run python -c \
 | 48913 | monitor | 监控服务 |
 | 38865 / 38866 / 38867 | ZMQ 消息面 | RPC / PUB / INGEST。外部进程可无鉴权 SUB 38866 订阅事件（a-memorix 未来 L2 用） |
 
+> **模型分层**：各服务背后的 12 档模型（主对话 conversation 跨端同档 / summary 等杂活档配便宜模型）、a-memorix 独立模型配置、以及 P2-3 成本取数（token_usage.json），统一见 `$NEKO_SERVICES/docs/model-tiers.md`；配置验证跑 `$NEKO_SERVICES/scripts/verify-tiers.sh`（纯只读）。
+
 ## 2. 启动与停止顺序
 
 ### launcher 的端口预检三态（先懂这个再启动）
