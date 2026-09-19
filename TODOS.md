@@ -24,3 +24,8 @@
 - P2：stats 双键形（ready 复数 vs disabled 单数）——README/audit 加注
 - P2：pyproject 注释「锁版本在 P0-1b」与现实矛盾——锁版本或改注释
 - P3：timeout_ms<=0 应 400/422 非 500；/health model_config 快照不随 reload 刷新；504 路径无测试；admin 13 组件全量遍历测试
+
+## P1-3 跟进项（代审通过后遗留）
+- P2（架构）：external_id 上 wire——/cache /process body 带 dedup 键（P1-1 侧契约扩展立项：HistoryRequest 加 external_id/turn_uid 字段+服务端幂等），当前 opencode 重试是服务端无去重的盲发
+- P2：P2-3 人工验收清单加「/monika 命令轮的 /cache 载荷断言无注入文本回灌」（TUI 路径未实测）
+- P3：onIdle 先落 outbox 再记 last_turn_id（崩溃窗口丢单轮）；read.sh 过滤 corrupt- 前缀；monika.md 十三补 edit 被拒的降级话术；PLAN 文件表两处陈旧（六端点工具→三工具、read.sh 路径）
