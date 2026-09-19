@@ -77,28 +77,47 @@ require_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# JSON 字段提取（jq > python3 > grep 三级降级；只支持顶层字符串/数值字段）
-# 用法：json_field <json文本> <字段名>；输出字段值（缺失输出空串）
+# JSON 字段提取（jq > python3 两级；无可靠解析器时宁可失败也不降级猜测）
+# 用法：json_field <json文本> <字段名>
+# 出口码：0 = 顶层对象解析成功，stdout 输出字段值（字段缺失输出空串）
+#         1 = 解析失败（body 非单一合法 JSON 对象、含尾部垃圾、顶层非对象，
+#             或 jq 与 python3 均不可用）——调用方必须视为检查失败，不得放行
+# 安全性说明（codex pre-merge review P1 修复）：
+#   - jq 路径不吞退出码：jq 对「合法对象后追加垃圾」会在输出后返回非 0，
+#     此处显式判非 0 即失败，防止部分输出被误当作字段值；
+#   - python3 路径用 json.load 严格解析整个输入（尾部垃圾抛异常），
+#     且要求顶层必须是对象（数组/标量判失败）；
+#   - 刻意不做 grep 文本匹配降级：嵌套字段（如 {"detail":{"status":"ok"}}）
+#     会被正则误取导致放行，宁严勿松。
 # ---------------------------------------------------------------------------
 json_field() {
-    local json=$1 key=$2
+    local json=$1 key=$2 out
     if have_cmd jq; then
-        jq -r --arg k "$key" 'if has($k) then (.[$k]|tostring) else "" end' \
-            <<<"$json" 2>/dev/null || true
+        if ! out=$(jq -r --arg k "$key" 'if has($k) then (.[$k]|tostring) else "" end' \
+            <<<"$json" 2>/dev/null); then
+            return 1
+        fi
+        # 多值输入流（如两个拼接对象）会产生多行输出，多行不等于单行期望值，
+        # 由调用方的严格相等比较天然拦截；此处再显式拒绝多行，语义更明确
+        if [[ "$(printf '%s\n' "$out" | wc -l)" -gt 1 ]]; then
+            return 1
+        fi
+        printf '%s\n' "$out"
     elif have_cmd python3; then
         python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
-    value = data.get(sys.argv[1]) if isinstance(data, dict) else None
-    print("" if value is None else value)
 except Exception:
-    pass
-' "$key" <<<"$json" 2>/dev/null || true
+    sys.exit(1)  # 非法 JSON / 尾部垃圾：解析失败而非静默通过
+if not isinstance(data, dict):
+    sys.exit(1)  # 顶层必须是对象
+value = data.get(sys.argv[1])
+print("" if value is None else value)
+' "$key" <<<"$json" 2>/dev/null
     else
-        # 最后一档：仅支持字符串值，够用于 status/app/service/instance_id
-        grep -o "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" <<<"$json" 2>/dev/null \
-            | head -n1 | sed -e 's/^[^:]*:[[:space:]]*"//' -e 's/"$//' || true
+        # 无 jq 且无 python3：不做文本猜测，明确失败（安装其一即可恢复）
+        return 1
     fi
 }
 
@@ -171,8 +190,9 @@ PY
 # http_check <检查名> <URL> [期望service字段]
 # N.E.K.O 服务健康断言（防「200+error」反模式与端口被无关进程占用）：
 #   1) HTTP 状态码 == 200
-#   2) body 为 JSON 且 status == "ok"
-#   3) body 若带 app 字段，必须等于 NEKO_APP_SIGNATURE（区分真后端与占端口进程）
+#   2) body 为单一合法 JSON 对象且 status == "ok"（解析失败=失败，不放行）
+#   3) app 字段必须存在且严格等于 NEKO_APP_SIGNATURE——缺失/为空/不符均失败
+#      （区分真后端与占端口进程；codex review P1 修复：不再放行缺失指纹）
 #   4) 可选：service 字段匹配（memory / main / ...）
 # 通过后调用方可读取全局变量 HTTP_CODE / HTTP_BODY。
 # 出口码：0=通过；1=失败（已打印原因）
@@ -205,7 +225,10 @@ http_check() {
         fail "${name}: HTTP ${code}（期望 200）URL=${url} body=${HTTP_BODY:0:160}"
         return 1
     fi
-    status=$(json_field "$HTTP_BODY" status)
+    if ! status=$(json_field "$HTTP_BODY" status); then
+        fail "${name}: body 无法解析为单一 JSON 对象（非法 JSON/尾部垃圾/无 jq 与 python3）body=${HTTP_BODY:0:160}"
+        return 1
+    fi
     if [[ -z "$status" ]]; then
         fail "${name}: body 无 status 字段（非 N.E.K.O 健康格式）body=${HTTP_BODY:0:160}"
         return 1
@@ -215,13 +238,19 @@ http_check() {
         fail "${name}: 200+error 反模式——body status='${status}'（期望 'ok'）body=${HTTP_BODY:0:160}"
         return 1
     fi
-    app=$(json_field "$HTTP_BODY" app)
-    if [[ -n "$app" && "$app" != "${NEKO_APP_SIGNATURE}" ]]; then
-        fail "${name}: app 指纹 '${app}' != '${NEKO_APP_SIGNATURE}'（端口可能被其他进程占用）URL=${url}"
+    if ! app=$(json_field "$HTTP_BODY" app); then
+        fail "${name}: app 字段解析失败 body=${HTTP_BODY:0:160}"
+        return 1
+    fi
+    if [[ "$app" != "${NEKO_APP_SIGNATURE}" ]]; then
+        fail "${name}: app 指纹缺失或不符（得到 '${app:-<缺失/空>}'，期望 '${NEKO_APP_SIGNATURE}'；端口可能被其他进程占用）URL=${url}"
         return 1
     fi
     if [[ -n "$expect_service" ]]; then
-        service=$(json_field "$HTTP_BODY" service)
+        if ! service=$(json_field "$HTTP_BODY" service); then
+            fail "${name}: service 字段解析失败 body=${HTTP_BODY:0:160}"
+            return 1
+        fi
         if [[ "$service" != "$expect_service" ]]; then
             fail "${name}: service='${service}'（期望 '${expect_service}'）URL=${url}"
             return 1

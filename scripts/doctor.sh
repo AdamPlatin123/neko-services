@@ -34,7 +34,7 @@ info "NEKO_HOME=${NEKO_HOME}"
 section "1/6 memory_server /health（核心项）"
 if http_check "memory_server (127.0.0.1:${NEKO_MEMORY_PORT})" \
     "http://127.0.0.1:${NEKO_MEMORY_PORT}/health" "memory"; then
-    instance_id=$(json_field "$HTTP_BODY" instance_id)
+    instance_id=$(json_field "$HTTP_BODY" instance_id) || instance_id=""
     ok "INSTANCE_ID=${instance_id:-<空>}"
 else
     CORE_FAIL=$((CORE_FAIL + 1))
@@ -47,7 +47,7 @@ fi
 section "2/6 主进程 /health（核心项）"
 if http_check "主进程 (127.0.0.1:${NEKO_MAIN_PORT})" \
     "http://127.0.0.1:${NEKO_MAIN_PORT}/health" "main"; then
-    instance_id=$(json_field "$HTTP_BODY" instance_id)
+    instance_id=$(json_field "$HTTP_BODY" instance_id) || instance_id=""
     ok "INSTANCE_ID=${instance_id:-<空>}"
 else
     CORE_FAIL=$((CORE_FAIL + 1))

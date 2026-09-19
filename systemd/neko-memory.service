@@ -17,6 +17,8 @@ Description=N.E.K.O memory_server (central memory HTTP service, 127.0.0.1:48912)
 Documentation=file:///mnt/shared/_Projects/N.E.K.O/neko-services/README.md
 # 仅排序不作依赖（memory_server 绑定 127.0.0.1，无桌面环境亦可运行）
 After=graphical-session.target
+# stop/restart neko.target 时联动停本服务（Wants 只管启动不管停止）
+PartOf=neko.target
 
 [Service]
 Type=exec

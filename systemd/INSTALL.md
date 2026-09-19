@@ -21,10 +21,12 @@
 # 0) 前置：N.E.K.O 仓库根先建好 venv（Python 3.11）
 cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O && uv sync
 
-# 1) 拷贝单元到 systemd user 目录
-#    （从本仓库 worktree/clone 根执行；路径以实际位置为准）
+# 1) 拷贝单元到 systemd user 目录（源用绝对路径，不依赖当前目录）
+NEKO_SERVICES=/mnt/shared/_Projects/N.E.K.O/neko-services   # 本仓库根，按实际位置调整
 mkdir -p ~/.config/systemd/user
-cp systemd/neko-memory.service systemd/neko-a-memorix.service systemd/neko.target \
+cp "${NEKO_SERVICES}/systemd/neko-memory.service" \
+   "${NEKO_SERVICES}/systemd/neko-a-memorix.service" \
+   "${NEKO_SERVICES}/systemd/neko.target" \
    ~/.config/systemd/user/
 
 # 2) 重载并启用
@@ -41,7 +43,7 @@ curl -s http://127.0.0.1:48912/health   # 期望 {"app":"N.E.K.O","service":"mem
 
 ```bash
 systemctl --user start neko.target       # 一键冷启（验收目标 <2 分钟）
-systemctl --user stop neko.target        # 一键停
+systemctl --user stop neko.target        # 一键停（两个 service 均设 PartOf=neko.target，stop/restart 联动生效）
 systemctl --user restart neko-memory.service
 journalctl --user -u neko-memory.service -f   # 跟日志
 ```

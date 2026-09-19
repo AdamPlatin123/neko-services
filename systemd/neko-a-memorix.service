@@ -15,6 +15,8 @@
 Description=N.E.K.O a-memorix memory retrieval service (P0-1 placeholder)
 Documentation=file:///mnt/shared/_Projects/N.E.K.O/neko-services/README.md
 After=neko-memory.service
+# stop/restart neko.target 时联动停本服务（Wants 只管启动不管停止）
+PartOf=neko.target
 # P0-1 落地前该路径不存在 → 本 unit start 自动跳过（显示 skipped，非失败）
 ConditionPathExists=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python
 

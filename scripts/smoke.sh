@@ -36,7 +36,7 @@ section "腿 1/5 桌面腿（自动）"
 
 if http_check "memory_server /health (127.0.0.1:${NEKO_MEMORY_PORT})" \
     "http://127.0.0.1:${NEKO_MEMORY_PORT}/health" "memory"; then
-    instance_id=$(json_field "$HTTP_BODY" instance_id)
+    instance_id=$(json_field "$HTTP_BODY" instance_id) || instance_id=""
     info "memory_server INSTANCE_ID=${instance_id:-<空>}"
 else
     AUTO_FAIL=$((AUTO_FAIL + 1))
@@ -46,7 +46,7 @@ fi
 
 if http_check "主进程 /health (127.0.0.1:${NEKO_MAIN_PORT})" \
     "http://127.0.0.1:${NEKO_MAIN_PORT}/health" "main"; then
-    instance_id=$(json_field "$HTTP_BODY" instance_id)
+    instance_id=$(json_field "$HTTP_BODY" instance_id) || instance_id=""
     info "主进程 INSTANCE_ID=${instance_id:-<空>}"
 else
     AUTO_FAIL=$((AUTO_FAIL + 1))
