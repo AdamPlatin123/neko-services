@@ -43,7 +43,7 @@ P0-0 分叉治理（前置容器，一切上游改动的前提）
 | 6 | 维护者三件：`neko-services/README.md`（runbook：启动顺序/日志位置/health/3 条常见故障）+ `scripts/smoke.sh`（四端各一条+切端一条，带断言 <5min，QQ 腿拆人工）+ `scripts/doctor.sh`（NapCat WS/插件/memory_server /health/a-memorix stats/LLM key） | 三件可用 |
 | 7 | 部署裁决落地：常驻进程 = systemd user unit（`neko.target`）；launcher 仅桌面；NapCat 保持插件托管（不设独立 unit，stdout 接日志文件供 doctor）；删 Windows creationflags 死代码 | `systemctl --user start neko.target` 冷启 <2min |
 | 8 | 数据升级退路：组件/配置/数据格式版本记录；必备份（memory/ 角色数据）与可重建（a-memorix 索引）清单；一次「带记忆升级→回滚」演练 | 演练通过 |
-| 9 | patch 回归规则固化：改 patch → 重放 → `pytest -m plugin_unit,plugin_integration` + smoke 全绿 | 规则写入 runbook |
+| 9 | patch 回归规则固化：改 patch → 重放 → `pytest -m 'plugin_unit or plugin_integration'` + smoke 全绿 | 规则写入 runbook |
 
 ## P0-1 a-memorix-service 服务化（UC1 保留，human ~5-8 天 / CC ~1-1.5 天）
 
