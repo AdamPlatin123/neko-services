@@ -16,11 +16,15 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # 可配置项（环境变量覆盖，全部有默认值）
+# 命名注意：本组 NEKO_*_PORT 是「本脚本探针」的覆盖键；与服务自身的端口
+# 覆盖键不同名（上游读 NEKO_MAIN_SERVER_PORT / NEKO_MEMORY_SERVER_PORT /
+# NEKO_TOOL_SERVER_PORT 等，见 config/network.py 的 _read_port_env）。
+# 若服务侧改了端口，两处都要改（脚本探针键 + 服务 Environment=）。
 # ---------------------------------------------------------------------------
 # N.E.K.O 子项目根（=上游 git 仓库根，非工作区根）
 : "${NEKO_HOME:=/mnt/shared/_Projects/N.E.K.O/N.E.K.O}"
 # 进程端口全景（config/network.py 与 plugin/settings.py）
-: "${NEKO_MAIN_PORT:=48911}"      # 主进程 HTTP（/health 可用）
+: "${NEKO_MAIN_PORT:=48911}"      # 主进程 main_server HTTP（/health 可用）
 : "${NEKO_MEMORY_PORT:=48912}"    # memory_server HTTP
 : "${NEKO_ZMQ_RPC_PORT:=38865}"   # ZMQ ROUTER（RPC，消息面）
 : "${NEKO_ZMQ_PUB_PORT:=38866}"   # ZMQ PUB（消息面订阅）
@@ -102,7 +106,9 @@ json_field() {
             ' <<<"$json" 2>/dev/null); then
             return 1
         fi
-        # 单值验证通过后，多行只可能来自字段值内嵌换行——同样拒绝
+        # 单值验证通过后，多行只可能来自字段值内嵌换行——同样拒绝。
+        # 实测依据（非死代码）：jq 的 tostring 对字符串是恒等（不转义换行），
+        # -r 原样输出，{"k":"a\nb"} 会产生物理两行（2026-09 实测 od -c 确认）。
         if [[ "$(printf '%s\n' "$out" | wc -l)" -gt 1 ]]; then
             return 1
         fi

@@ -1,21 +1,27 @@
 # =============================================================================
 # neko-memory.service — N.E.K.O memory_server 常驻服务（systemd user unit）
-# 部署裁决（workplan P0-0 第 7 项 / mvp-tech-design DX-6）：
-#   - 常驻进程统一走 systemd user unit，由 neko.target 一键启停；
-#   - 主进程（48911 全家桶）由 launcher 手动/桌面启动，故意不在 target 内；
+# 部署裁决（workplan P0-0 第 7 项，代审后更新为三件套拓扑）：
+#   - 48911(main) / 48912(memory) / 48915(agent) 三服务全部 unit 化，由
+#     neko.target 一键启停。原因（launcher_core/runtime.py 源码）：
+#     _validated_existing_backend_instance 只在三口 /health 齐全且
+#     instance_id 全同时 attach 桌面前端；部分占用则 apply_port_strategy
+#     整套换 fallback 端口另起第二套——两套 memory_server 写同一数据根
+#     （双写分裂）。三件套必须同生同死、共享同一 NEKO_INSTANCE_ID。
 #   - NapCat 由 qq_auto_reply 插件托管（stdout 接日志文件），不设 unit。
+#   - 与桌面 launcher 互斥使用，详见 systemd/INSTALL.md 的警告节。
 #
 # 安装前准备：
 #   1. 在 N.E.K.O 仓库根执行 `uv sync`（Python 3.11）生成 .venv；
-#   2. 若部署路径与本文件默认不同，替换下方所有
-#      /mnt/shared/_Projects/N.E.K.O/N.E.K.O 前缀（systemd user unit 不支持
-#      外部环境变量展开，统一用绝对路径；%h 仅可用于 home 目录下的部署）。
+#   2. 部署路径不同时替换下方 /mnt/shared/_Projects/N.E.K.O/N.E.K.O 前缀
+#      （systemd user unit 不支持外部环境变量展开；%h 仅限 home 下部署）；
+#   3. 三处 unit 的 NEKO_INSTANCE_ID 必须替换为同一个部署时生成的值
+#      （生成命令见 systemd/INSTALL.md）。
 # =============================================================================
 
 [Unit]
 Description=N.E.K.O memory_server (central memory HTTP service, 127.0.0.1:48912)
 Documentation=file:///mnt/shared/_Projects/N.E.K.O/neko-services/README.md
-# 仅排序不作依赖（memory_server 绑定 127.0.0.1，无桌面环境亦可运行）
+# 启动顺序对齐 docker/entrypoint.sh：memory → main → agent
 After=graphical-session.target
 # stop/restart neko.target 时联动停本服务（Wants 只管启动不管停止）
 PartOf=neko.target
@@ -27,8 +33,13 @@ ExecStart=/mnt/shared/_Projects/N.E.K.O/N.E.K.O/.venv/bin/python -m app.memory_s
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
-# 端口覆盖示例（默认 48912，见 config/network.py）：
-# Environment=NEKO_MEMORY_PORT=48912
+# 三件套共享的实例指纹（config/network.py:212 读此键，未设则每进程随机
+# 生成——那会导致 launcher 判不齐三口、桌面端无法 attach）。
+# 占位值，部署时替换为本部署唯一值，且必须与 neko-main/neko-agent 一致：
+Environment=NEKO_INSTANCE_ID=00000000-0000-0000-0000-000000000000
+# 端口覆盖示例（默认 48912；上游读 NEKO_MEMORY_SERVER_PORT 或 MEMORY_SERVER_PORT，
+# 见 config/network.py 的 _read_port_env）：
+# Environment=NEKO_MEMORY_SERVER_PORT=48912
 # 日志查看：journalctl --user -u neko-memory.service -f
 # 单独启停：systemctl --user start|stop|status neko-memory.service
 

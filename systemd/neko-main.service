@@ -1,0 +1,32 @@
+# =============================================================================
+# neko-main.service — N.E.K.O 主服务 main_server（systemd user unit）
+# 对齐 docker/entrypoint.sh 先例：$VENV_PYTHON -m app.main_server。
+# 拓扑与互斥说明见 neko-memory.service 头注释与 systemd/INSTALL.md：
+# 三件套（memory 48912 / main 48911 / agent 48915）共享 NEKO_INSTANCE_ID，
+# 由 neko.target 统一启停；勿与桌面 launcher 同时运行。
+# =============================================================================
+
+[Unit]
+Description=N.E.K.O main_server (desktop/chat main HTTP service, 127.0.0.1:48911)
+Documentation=file:///mnt/shared/_Projects/N.E.K.O/neko-services/README.md
+# 启动顺序对齐 docker/entrypoint.sh：memory → main → agent
+After=neko-memory.service
+# stop/restart neko.target 时联动停本服务（Wants 只管启动不管停止）
+PartOf=neko.target
+
+[Service]
+Type=exec
+WorkingDirectory=/mnt/shared/_Projects/N.E.K.O/N.E.K.O
+ExecStart=/mnt/shared/_Projects/N.E.K.O/N.E.K.O/.venv/bin/python -m app.main_server
+# 主服务启动较重（LLM 配置/角色加载），失败重启放宽间隔
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# 与 neko-memory / neko-agent 共享同一部署值（占位，部署时三处统一替换）：
+Environment=NEKO_INSTANCE_ID=00000000-0000-0000-0000-000000000000
+# 端口覆盖示例（默认 48911；上游读 NEKO_MAIN_SERVER_PORT 或 MAIN_SERVER_PORT）：
+# Environment=NEKO_MAIN_SERVER_PORT=48911
+# 日志查看：journalctl --user -u neko-main.service -f
+
+[Install]
+WantedBy=default.target

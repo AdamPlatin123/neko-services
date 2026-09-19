@@ -23,7 +23,7 @@ SECONDS=0
 AUTO_FAIL=0
 ANY_AUTO_FAILED=0
 
-SERVICE_DOWN_HINT="先启动：systemctl --user start neko.target（unit 安装步骤见 systemd/INSTALL.md）"
+SERVICE_DOWN_HINT="先启动：systemctl --user start neko.target（main/memory/agent 三件套；与桌面 launcher 二选一，勿同时。安装见 systemd/INSTALL.md）"
 
 printf '%s\n' "${C_BLUE}N.E.K.O 四端冒烟测试${C_RESET} $(date '+%F %T')"
 info "NEKO_HOME=${NEKO_HOME}"

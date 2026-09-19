@@ -23,7 +23,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "${SCRIPT_DIR}/lib.sh"
 
 CORE_FAIL=0
-SERVICE_DOWN_HINT="先启动：systemctl --user start neko.target（unit 安装步骤见 systemd/INSTALL.md）"
+SERVICE_DOWN_HINT="先启动：systemctl --user start neko.target（main/memory/agent 三件套；与桌面 launcher 二选一，勿同时。安装见 systemd/INSTALL.md）"
 
 printf '%s\n' "${C_BLUE}N.E.K.O 一键体检${C_RESET} $(date '+%F %T')"
 info "NEKO_HOME=${NEKO_HOME}"
@@ -51,7 +51,7 @@ if http_check "主进程 (127.0.0.1:${NEKO_MAIN_PORT})" \
     ok "INSTANCE_ID=${instance_id:-<空>}"
 else
     CORE_FAIL=$((CORE_FAIL + 1))
-    warn "主进程由 launcher 手动/桌面启动（不在 neko.target 内）：请先启动桌面端（uv run launcher.py）"
+    warn "先启动三件套：systemctl --user start neko.target（main/memory/agent 三 unit），或桌面 launcher（uv run launcher.py）——二选一，勿同时（部分占用端口会触发 launcher 换端口另起第二套）"
 fi
 
 # ---------------------------------------------------------------------------
@@ -170,5 +170,5 @@ if [[ $CORE_FAIL -eq 0 ]]; then
     ok "核心项（memory_server / 主进程 / ZMQ PUB）全部通过"
     exit 0
 fi
-fail "核心项失败 ${CORE_FAIL} 项——排查建议：$SERVICE_DOWN_HINT；主进程需 launcher 桌面启动"
+fail "核心项失败 ${CORE_FAIL} 项——排查建议：$SERVICE_DOWN_HINT"
 exit 1
