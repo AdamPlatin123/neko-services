@@ -67,7 +67,7 @@ cd $NEKO_SRC && uv run python -c \
 | --- | --- | --- | --- | --- |
 | **N.E.K.O 后端**（launcher 拉起，含 main + memory + agent 三服务） | 48911 主服务；48912/48915 由同组拓扑占用 | `cd $NEKO_SRC && uv run launcher.py`。launcher 有**两种拓扑**（`launcher_core/runtime.py` 的 `_should_use_merged_mode`）：**源码运行默认多进程模式**——1 个 launcher 进程 spawn 3 个子进程（memory→main→agent 顺序 spawn，逐个等模块加载完成再放下一个以防低内存 OOM，最后统一等全部端口就绪，60s 超时）；**合并模式**须显式 `NEKO_MERGED=1 uv run launcher.py`——单进程内 3 个 uvicorn 并发启动、统一健康检查（30s 超时）；打包发行版（IS_FROZEN）默认合并。启动前 launcher 自带端口预检（见第 2 节的 attach/避让行为） | 两种拓扑均按服务名分文件写 `$NEKO_DATA_ROOT/logs/`（Main/Memory/Agent）；launcher 自身 bootstrap 输出在 stdout | `curl -s http://127.0.0.1:48911/health`，期望 `"service":"main"`、`"status":"ok"` |
 | **memory_server**（中心记忆，五维记忆+scoped+query_memory） | 48912 | 常规由 launcher 拉起（两种拓扑都包含它，无单独操作）；独立运行仅用于开发调试：`cd $NEKO_SRC && uv run python -m app.memory_server`（加 `--enable-shutdown` 才会响应 `/shutdown`）。**⚠ 陷阱：独立起它之后再跑 launcher，不会「补齐其余服务」——launcher 检测到部分端口被占会整套换到回退端口另起新实例，形成两套记忆。见第 2 节端口预检三态** | `$NEKO_DATA_ROOT/logs/N.E.K.O_Memory_YYYYMMDD.log` | `curl -s http://127.0.0.1:48912/health`，期望 `"service":"memory"`。**指纹校验**：响应含 `"app":"N.E.K.O"` 与 `instance_id`——同一 launcher 拓扑的三个端口 instance_id 一致（launcher 给子进程注入 `NEKO_INSTANCE_ID`）；`app` 字段不是 `N.E.K.O` 说明端口被别的进程占了 |
-| **a-memorix-service**（检索层，从 MaiBot A_memorix 剥离） | 未定 | **P0-1 完成后生效**（FastAPI + uv 3.12 venv + systemd user unit，绑定 127.0.0.1）。届时此行更新为实际启动命令与端口 | P0-1 完成后生效 | `curl -s http://127.0.0.1:<端口>/a_memorix/v1/stats`（P0-1 完成后生效；doctor.sh 会自动纳入） |
+| **a-memorix-service**（检索层，从 MaiBot A_memorix 剥离） | 48921（127.0.0.1） | **systemd user unit**：`systemctl --user start neko-a-memorix.service`（`neko.target` 已 Wants）。手动方式：`cd $NEKO_SERVICES/a-memorix-service && uv run python -m a_memorix_service.service`（uv 3.12 venv，FastAPI+uvicorn；首次先 `uv sync`，并在 `config/a_memorix.toml` 配 `[model.*]` 的 base_url/api_key/模型清单，未配置时启动仅 WARN + 检索写入降级） | `journalctl --user -u neko-a-memorix.service`；手动运行输出 stdout | `curl -s http://127.0.0.1:48921/health`，期望 `"app":"neko-services"`、`"service":"a-memorix"`、`"status":"ok"`（**注意 app 指纹不是 N.E.K.O**，`startup_state` 字段反映内核启动进度：starting/migrating→ready/failed；未就绪期写入端点 202 进启动队列 WAL） |
 | **NapCat**（QQ 协议端，无 HTTP 端口，以 WS 客户端身份连 qq_auto_reply 插件） | —（出站 WS） | **插件托管**：由 qq_auto_reply 插件的 `napcat_service.py` 自动拉起/守护（sweep 重连），不设独立 systemd unit。默认目录 `$NEKO_SRC/plugin/plugins/qq_auto_reply/NapCat.Shell/`，可在插件设置 `napcat_directory` 改路径 | NapCat 自身日志：`<NapCat目录>/logs/`；插件侧日志：`$NEKO_DATA_ROOT/logs/plugin/N.E.K.O_Plugin_qq_auto_reply_YYYYMMDD.log`。当前 NapCat 子进程 stdout 丢弃（DEVNULL）——「stdout 接日志文件供 doctor」是 P0-0 计划中的 patch，落盘后此行更新 | 无 `/health` 端点。`$NEKO_SERVICES/scripts/doctor.sh`（**p0-0-scripts 分支合入后可用**）对 NapCat 仅做**目录/日志存在性提示**（不做 WS 连通性探测）；连通性判断靠 NapCat 日志与插件侧重连日志 |
 
 辅助进程（不单独维护，随主进程/插件服务器生命周期）：
@@ -91,7 +91,7 @@ launcher 启动时对 48912/48915/48911 逐个探测（`launcher_core/runtime.py
 
 ### 启动顺序：拉起顺序与就绪顺序是两层（别说混）
 
-**拉起顺序**（launcher 保证，只管「谁先被启动」）：memory(48912) → main(48911) → agent(48915)。多进程模式按此逐个 spawn，每个子进程只等「模块加载完成」（import 稳定，防低内存 OOM）就放行下一个，**不等它服务就绪**；合并模式三个服务并发拉起、无先后。a-memorix-service（未来，P0-1 完成后生效）应安排在 memory 之后、main 之前。NapCat 由 qq_auto_reply 插件自动拉起并守护，**永远不要手动先启 NapCat**。
+**拉起顺序**（launcher 保证，只管「谁先被启动」）：memory(48912) → main(48911) → agent(48915)。多进程模式按此逐个 spawn，每个子进程只等「模块加载完成」（import 稳定，防低内存 OOM）就放行下一个，**不等它服务就绪**；合并模式三个服务并发拉起、无先后。a-memorix-service（systemd 独立生命周期，`After=neko-memory.service`，不进 launcher 拓扑）。NapCat 由 qq_auto_reply 插件自动拉起并守护，**永远不要手动先启 NapCat**。
 
 **整体就绪**（两种模式都是统一收口）：多进程在全部 spawn 后统一等端口+初始化完成（60s 超时），merged 统一健康检查（30s 超时）——它保证「全部就绪」这个终点，**不保证 memory 比 main 先就绪**。主进程依赖 memory 先行（start_session 读 `/new_dialog`）靠拉起顺序与启动耗时自然满足，健康检查只是终点门槛。
 
@@ -108,7 +108,7 @@ unit 文件由 p0-0-scripts 分支落盘到 `$NEKO_SERVICES/systemd/`（**合入
 - **三个 unit：`neko-memory` / `neko-main` / `neko-agent`，全部纳入 `neko.target`**。上游 headless 先例 = docker entrypoint：不用 launcher，三服务各自独立进程 `python -m app.memory_server` / `python -m app.main_server` / `python -m app.agent_server`，unit 间用 After=/Wants= 表达 memory→main→agent 拉起顺序，端口用 `NEKO_MEMORY_SERVER_PORT` / `NEKO_MAIN_SERVER_PORT` / `NEKO_TOOL_SERVER_PORT` 环境变量对齐。
 - **三 unit 必须共享同一个 `NEKO_INSTANCE_ID` 环境变量值**（`config/network.py:212`：instance_id 取 env、缺省每进程随机）。共享让三口表现为同一后端（/health 指纹一致、doctor 判断正确）；若违规同时跑 launcher，也是 attach 到这套后端而不是换端口分裂。
 - **neko.target 与桌面 launcher 二选一使用，勿同时**：桌面会话要自己跑时，先 `systemctl --user stop neko.target` 再 `NEKO_MERGED=1 uv run launcher.py`（用完反向操作）。同时跑两套后端=两套记忆。
-- a-memorix unit（P0-1 完成后生效）挂在 memory 之后、同样进 target。
+- a-memorix unit 挂在 memory 之后（`After=neko-memory.service`）、同样进 target；启用前置是 `a-memorix-service` 下 `uv sync`（否则 ConditionPathExists 不满足、start 显示 skipped）。
 
 安装（unit 落盘后一次性）：
 
@@ -138,7 +138,7 @@ cd $NEKO_SRC && uv run launcher.py    # 一条命令起齐全部服务（源码�
 
 ### 故障 1：QQ 不回复了（最高频）
 
-1. **先跑 doctor**：`$NEKO_SERVICES/scripts/doctor.sh`（**p0-0-scripts 分支合入后可用**）——检查项：memory/主进程 `/health`、ZMQ PUB 可达、LLM key、NapCat 目录/日志存在性（仅提示项）、a-memorix stats（P0-1 后）。服务侧问题多数一步定位。脚本未合入期间，按下面 2-4 步手工排查。
+1. **先跑 doctor**：`$NEKO_SERVICES/scripts/doctor.sh`——检查项：memory/主进程 `/health`、ZMQ PUB 可达、LLM key、NapCat 目录/日志存在性（仅提示项）、a-memorix `/health` 指纹（app=neko-services）。服务侧问题多数一步定位。
 2. NapCat 侧（doctor 对它只有目录/日志存在性提示，连通性看这里）：看 `$NEKO_SRC/plugin/plugins/qq_auto_reply/NapCat.Shell/logs/`（或插件设置里的自定义路径）有没有掉线/风控/扫码过期；插件侧重连日志 `grep -h 'NapCat' $NEKO_DATA_ROOT/logs/plugin/N.E.K.O_Plugin_qq_auto_reply_$(date +%Y%m%d).log | tail -50`。
 3. 插件状态（doctor 不查此项，手工）：`curl -s http://127.0.0.1:48916/plugins` 确认 qq_auto_reply 已启用未崩溃；崩溃看 `$NEKO_DATA_ROOT/logs/plugin/N.E.K.O_Plugin_qq_auto_reply_$(date +%Y%m%d).log` 尾部。
 4. 都正常但群里沉默：查注意力/权限门控——`grep -h 'attention\|gate\|ignore' $NEKO_DATA_ROOT/logs/plugin/N.E.K.O_Plugin_qq_auto_reply_$(date +%Y%m%d).log | tail -30`（可能是疲劳度/权限/主动忽略的有意行为，不是故障）。
@@ -190,7 +190,7 @@ cd $NEKO_SERVICES && ./scripts/smoke.sh
 $NEKO_SERVICES/scripts/doctor.sh
 ```
 
-检查项：memory_server 与主进程 `/health`（含 instance_id 指纹校验）、ZMQ PUB（tcp://127.0.0.1:38866）可达、LLM key、NapCat 目录/日志存在性（提示项，不含 WS 连通性）、a-memorix stats（P0-1 完成后生效）。任何「不知道从哪查起」的故障，先跑它；脚本未合入期间按第 3 节故障条目手工排查。
+检查项：memory_server 与主进程 `/health`（含 instance_id 指纹校验）、ZMQ PUB（tcp://127.0.0.1:38866）可达、LLM key、NapCat 目录/日志存在性（提示项，不含 WS 连通性）、a-memorix `/health`（app=neko-services 指纹 + startup_state）。任何「不知道从哪查起」的故障，先跑它。
 
 ### trace_id（QQ 链路追踪）
 

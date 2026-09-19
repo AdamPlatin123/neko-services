@@ -2,9 +2,12 @@
 / `src.services.message_service` 的桩。
 
 结构字段与上游 MaiBot 对齐（src/common/data_models/llm_service_data_models.py、
-src/services/llm_service.py、src/services/message_service.py），
-可调用面本阶段为 NotImplementedError 占位，P0-1b 换真实 LLM 出口
-（model_routing 是全包 LLM 调用唯一出口，替换面 = generate + get_available_models）。
+src/services/llm_service.py、src/services/message_service.py）。
+
+P0-1b 起 LLM 可调用面接真实出口（adapters.openai_compat，OpenAI 兼容 chat）：
+model_routing 是全包 LLM 调用唯一出口，其依赖面 generate /
+LLMServiceClient.generate_response / get_available_models 三者分别落到
+adapters.generate / adapters.generate_response / config_stubs.build_task_config_map。
 """
 
 from __future__ import annotations
@@ -12,10 +15,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-
-_NOT_IMPLEMENTED_MSG = (
-    "host_stubs: LLM 出口为 P0-1 占位桩，尚未接入真实后端（P0-1b 替换 model_routing/generate）"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +141,13 @@ class _StubOrchestrator:
 
 
 class LLMServiceClient:
-    """面向上层模块的 LLM 服务门面桩：构造成功，调用即 NotImplementedError。"""
+    """面向上层模块的 LLM 服务门面：真实出口 adapters.openai_compat（P0-1b）。
+
+    model_routing.generate_with_resolved_model 的单模型路径会设置
+    ``client._orchestrator.model_for_task``（单模型 TaskConfig）——
+    _StubOrchestrator 保留该属性面，generate_response 将其作为
+    task_config_override 传入 adapters。
+    """
 
     def __init__(self, task_name: str, request_type: str = "", session_id: str = "") -> None:
         self.task_name = str(task_name).strip()
@@ -156,7 +161,15 @@ class LLMServiceClient:
         options: Optional[LLMGenerationOptions] = None,
         **kwargs: Any,
     ) -> LLMResponseResult:
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+        from adapters.openai_compat import generate_response as _real_generate_response
+
+        _ = kwargs
+        return await _real_generate_response(
+            task_name=self.task_name,
+            prompt=prompt,
+            options=options,
+            single_model_task=self._orchestrator.model_for_task,
+        )
 
     async def generate_response_with_context(
         self,
@@ -164,7 +177,8 @@ class LLMServiceClient:
         options: Optional[LLMGenerationOptions] = None,
         **kwargs: Any,
     ) -> LLMResponseResult:
-        raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+        prompt = context_factory() if callable(context_factory) else context_factory
+        return await self.generate_response(prompt, options, **kwargs)
 
 
 def get_available_models() -> Dict[str, Any]:
@@ -175,8 +189,12 @@ def get_available_models() -> Dict[str, Any]:
     return build_task_config_map()
 
 
-async def generate(request: LLMServiceRequest) -> LLMServiceResult:  # noqa: RUF029
-    raise NotImplementedError(_NOT_IMPLEMENTED_MSG)
+async def generate(request: LLMServiceRequest) -> LLMServiceResult:
+    """src.services.llm_service.generate 真身（adapters.openai_compat.generate）。"""
+
+    from adapters.openai_compat import generate as _real_generate
+
+    return await _real_generate(request)
 
 
 def resolve_task_name(task_name: str = "") -> str:

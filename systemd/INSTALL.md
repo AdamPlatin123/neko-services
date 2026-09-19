@@ -11,7 +11,7 @@
 | `neko-memory.service` | memory_server（中心记忆 HTTP） | 48912 / `memory` | 立即生效 |
 | `neko-main.service` | main_server（桌面/对话主服务） | 48911 / `main` | 立即生效 |
 | `neko-agent.service` | agent_server（agent/tool 服务，绑 TOOL_SERVER_PORT——历史命名） | 48915 / `agent` | 立即生效 |
-| `neko-a-memorix.service` | a-memorix 记忆检索服务 | 48921（占位） | 占位——P0-1 服务化落地前 `ConditionPathExists` 不满足，start 显示 skipped，不产生报错 |
+| `neko-a-memorix.service` | a-memorix 记忆检索服务（FastAPI，`python -m a_memorix_service.service`） | 48921 / `a-memorix`（/health app 指纹 `neko-services`） | P0-1 已落地——`uv sync` 后生效；未 sync 时 `ConditionPathExists` 不满足，start 显示 skipped，不产生报错 |
 | `neko.target` | 总入口，`Wants=` 上述四个服务 | — | 立即生效 |
 
 启动顺序对齐上游 `docker/entrypoint.sh` 先例：memory → main → agent
@@ -113,9 +113,24 @@ systemctl --user daemon-reload
 `Environment=NEKO_*_SERVER_PORT=...`（上游键名）与 `scripts/lib.sh` 的探针
 键（NEKO_MAIN_PORT/NEKO_MEMORY_PORT 等，自有命名，见其注释）都要同步。
 
-## a-memorix 服务化落地后（P0-1 之后）
+## a-memorix 服务（P0-1 已落地，启用步骤）
 
-1. `cd /mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service && uv sync`（Python 3.12）；
-2. 修正 `neko-a-memorix.service` 的 `ExecStart` 入口模块名（现为占位 `a_memorix_service`）；
+入口为 `uv run python -m a_memorix_service.service`（FastAPI + uvicorn，默认
+127.0.0.1:48921；unit 的 `ExecStart` 已指向 `.venv/bin/python -m
+a_memorix_service.service`，无需再改）：
+
+1. `cd /mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service && uv sync`
+   （Python 3.12，生成 `.venv` 后 `ConditionPathExists` 即满足）；
+2. 编辑 `a-memorix-service/config/a_memorix.toml` 的 `[model.*]` 节——
+   `api_providers` 的 `base_url`/`api_key`（OpenAI 兼容端点）、`models` 与
+   `tasks`（embedding/memory/utils 的 `model_list`）。未配置时服务可启动
+   （日志 WARN，检索/写入相关通道降级，不崩）；
 3. `systemctl --user daemon-reload && systemctl --user start neko-a-memorix.service`——
-   无需改动 `neko.target`（Wants 弱依赖已包含）。
+   无需改动 `neko.target`（Wants 弱依赖已包含）；
+4. 验证（注意 /health 的 app 指纹是 `neko-services`，非 N.E.K.O 三件套签名）：
+
+```bash
+curl -s http://127.0.0.1:48921/health
+# 期望 {"app":"neko-services","service":"a-memorix","status":"ok",...}
+/mnt/shared/_Projects/N.E.K.O/neko-services/scripts/doctor.sh   # 第 6 项应转绿
+```

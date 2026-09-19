@@ -288,6 +288,11 @@ class ConfigManager:
     def get_model_config(self) -> ModelConfig:
         return self._model_config
 
+    def get_global_config(self) -> "GlobalConfig":
+        """host_service._read_config 的入口（config_manager.get_global_config().a_memorix）。"""
+
+        return global_config
+
     def register_reload_callback(self, callback: Any) -> None:
         self._reload_callbacks.append(callback)
 
@@ -295,6 +300,12 @@ class ConfigManager:
         _ = changed_scopes
         get_config_state().reload()
         self._model_config.replace_from(build_model_config())
+        try:  # 真实出口客户端随配置失效重建（base_url/api_key 可能已变）
+            from adapters.openai_compat import reset_clients
+
+            reset_clients()
+        except Exception:  # noqa: BLE001（adapters 不可用时 reload 仍要完成）
+            pass
         for callback in list(self._reload_callbacks):
             result = callback(changed_scopes=("bot",))
             if hasattr(result, "__await__"):  # on_config_reload 是 async 的
