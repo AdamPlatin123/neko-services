@@ -14,19 +14,44 @@ NNN-<slug>.patch
 - `<slug>`：全小写、短横线分隔的短名，概括补丁内容，例如 `001-memory-server-recent-history.patch`；
 - **只追加、不插队**：新补丁永远取当前最大序号 +1。需要修改历史补丁时，等价于从该补丁起重建其后整段序列。
 
-## 补丁如何生成（临时目录 → 核对 → 原子替换）
+## 补丁如何生成（仓库内暂存 → 核对 → 目录级原子切换）
 
-在 N.E.K.O 仓库中基于 BASELINE.md 记录的基线 commit 建分支、提交改动，然后在**临时空目录**导出全量补丁，核对无误后**原子替换**本目录的全部旧补丁——不要直接向本目录追加导出（改名/删除旧补丁后新旧并存，会被一起重放）：
+在 N.E.K.O 仓库中基于 BASELINE.md 记录的基线 commit 建分支、提交改动，然后在**本仓库内的暂存目录**导出全量补丁，核对无误后对 `patches/neko/` 做**目录级原子切换**——整个流程要么整体成功，要么旧补丁集合原样保留：
 
 ```bash
-tmpdir="$(mktemp -d)"
+cd <neko-services>
+# 暂存目录建在仓库内（与 patches/neko 同文件系统，目录级 mv 是 rename 而非跨设备复制）
+stage="$(mktemp -d "$PWD/patches/.tmp-patches.XXXXXX")"
+mkdir -p "$stage/neko"
+# 非补丁文件随行拷入暂存目录（缺失它们的新目录不可用；有其他非 .patch 文件也一并拷）
+cp patches/neko/BASELINE.md patches/neko/README.md "$stage/neko/"
+
 cd <N.E.K.O 仓库>    # 默认 ../N.E.K.O，可用环境变量 NEKO_REPO 覆盖
-git format-patch <基线commit>..<你的分支> -o "$tmpdir"
-# 核对：数量 = 分支上的 commit 数；逐个把 0001- 前缀重命名为 NNN-<slug>.patch
-# （在 "$tmpdir" 内完成重命名，确认序号从 001 连续、slug 全小写短横线）
-rm -f <neko-services>/patches/neko/*.patch     # 清掉全部旧补丁（BASELINE.md/README.md 保留原位）
-mv "$tmpdir"/*.patch <neko-services>/patches/neko/ && rmdir "$tmpdir"
+git format-patch <基线commit>..<你的分支> -o "$stage/neko"    # $stage 是绝对路径，跨目录可用
+
+cd "$stage/neko"
+# 核对并重命名：数量 = 分支 commit 数（git rev-list --count <基线commit>..<你的分支>）；
+# 逐个把 0001- 前缀重命名为 NNN-<slug>.patch（序号从 001 严格连续、slug 全小写短横线）
+shopt -s nullglob; news=(./*.patch); shopt -u nullglob
+[ "${#news[@]}" -gt 0 ] || { echo "导出为空：分支区间或分支选错，不替换"; exit 1; }
+
+cd <neko-services>
+# 目录级原子切换：两步 rename；olddir 目标名不存在，mv 语义即为 rename
+olddir="patches/.old-patches.$$"
+if mv patches/neko "$olddir" && mv "$stage/neko" patches/neko; then
+    rm -rf "$olddir" "$stage"      # 成功：清理
+else
+    [ -d patches/neko ] || mv "$olddir" patches/neko   # 失败：切换未完成则恢复旧集合
+    echo "替换失败：旧集合已恢复（或原样未动），暂存目录保留待查: $stage" >&2
+    exit 1
+fi
 ```
+
+要点：
+
+- **不要**直接向 `patches/neko/` 追加导出，也不要先删后逐文件 mv——中断会留下空集或不完整集合；
+- **导出零补丁一律报错不替换**：空集合几乎必然意味着分支/区间选错，静默替换会抹掉既有补丁链；
+- 流程意外中断时，`patches/.tmp-patches.*` / `patches/.old-patches.*` 残留即回滚材料：若 `patches/neko` 缺失或不完整，手动 `mv <.old 目录> patches/neko` 恢复后清理残留。
 
 `replay-patches.sh` 会自动校验：文件名符合 `NNN-<slug>.patch`、序号从 001 起严格连续，不合规即拒绝重放。
 
