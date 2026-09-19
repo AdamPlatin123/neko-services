@@ -4,21 +4,29 @@
 （audit 文档 `docs/design/module-interface-audit.md` 第 4 节全集）以 sys.modules
 预注册方式桩掉，上游 vendored 树（../A_memorix/）保持零修改。
 
-三层防线：
+install() 本身零副作用：不 import 任何 A_memorix/scripts 模块（防 --help 等
+argv 快速路径在安装半途 SystemExit），一切树内模块按需惰性解析。
+
+防线分层：
 1. 显式桩：第 4 节列出的全部宿主模块（字段/签名与上游对齐，见各 *_stubs.py）。
 2. `src.A_memorix.*` 别名：树内少量绝对导入自引用（memory_search_service）经
    meta path finder 原身份映射到真实 vendored 模块（避免双重加载破坏 isinstance）。
-3. 警告型兜底：未显式桩到的 `src.*` 导入给出 WARN（stderr，每属性一次，不静默），
-   并记录到 fallback_hits 供测试/巡检暴露懒加载盲区。
+3. 严格模式（默认）：未显式桩到的 `src.*` 导入交回默认机制 → ModuleNotFoundError
+   （`importlib.util.find_spec` 探测返回 None，语义同模块不存在——可选依赖检测
+   不会误放行）。
+4. 宽松模式（`NEKO_STUBS_LENIENT=1`）：未桩 `src.*` 给 WARN 占位（stderr，每属性
+   一次，记录到 fallback_hits）——仅供排查懒加载盲区，注意占位模块会使
+   hasattr/find_spec 探测为真。
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.machinery
+import os
 import sys
 import types
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from . import chat_stubs, common_stubs, config_stubs, llm_models_stubs, sdk_stubs, service_stubs, webui_stubs
 from ._registry import ensure_package, register
@@ -31,9 +39,24 @@ _warned: set[Tuple[str, str]] = set()
 
 _SRC_ALIAS_PREFIX = "src.A_memorix"
 
+# scripts/* 之间以顶层名互导（直跑时靠脚本自身目录入 sys.path）：惰性别名到真实模块
+_SCRIPT_SIBLING_ALIASES = {
+    "_bootstrap": "A_memorix.scripts._bootstrap",
+    "process_knowledge": "A_memorix.scripts.process_knowledge",
+}
+# 上游笔误桥接点：release_vnext_migrate.py 从 metadata_store 导入
+# RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION，该常量实际定义在 metadata_schema.py
+_RELEASE_VNEXT_MIGRATE = "A_memorix.scripts.release_vnext_migrate"
+_METADATA_STORE = "A_memorix.core.storage.metadata_store"
+_METADATA_SCHEMA = "A_memorix.core.storage.metadata_schema"
+
+
+def _is_lenient() -> bool:
+    return os.environ.get("NEKO_STUBS_LENIENT", "") == "1"
+
 
 # ---------------------------------------------------------------------------
-# 警告型占位（兜底防线）
+# 宽松模式占位（NEKO_STUBS_LENIENT=1 时启用）
 # ---------------------------------------------------------------------------
 
 
@@ -48,7 +71,7 @@ class _Placeholder:
     def __getattr__(self, name: str) -> "_Placeholder":
         return _Placeholder(f"{self._path}.{name}")
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: object, **kwargs: object) -> object:
         raise NotImplementedError(f"host_stubs: 兜底占位不可调用: {self._path}")
 
     def __repr__(self) -> str:
@@ -62,7 +85,7 @@ def _warn_fallback(module_name: str, attr_name: str) -> _Placeholder:
         _fallback_hits.append(key)
         print(
             f"[host_stubs][WARN] 未明确桩掉的宿主导入: {module_name}.{attr_name} → 返回占位"
-            "（请补进 host_stubs 或确认该路径不需要）",
+            "（严格模式下此处应为 ImportError；请补进 host_stubs 显式桩）",
             file=sys.stderr,
         )
     return _Placeholder(f"{module_name}.{attr_name}")
@@ -70,13 +93,14 @@ def _warn_fallback(module_name: str, attr_name: str) -> _Placeholder:
 
 def _make_warn_module(module_name: str) -> types.ModuleType:
     module = types.ModuleType(module_name)
-    module.__doc__ = f"host_stubs 警告型兜底桩（未显式覆盖的宿主模块 {module_name}）"
+    module.__doc__ = f"host_stubs 宽松模式占位桩（未显式覆盖的宿主模块 {module_name}）"
     module.__getattr__ = lambda attr, _name=module_name: _warn_fallback(_name, attr)  # type: ignore[attr-defined]
     return module
 
 
 # ---------------------------------------------------------------------------
-# meta path finder：src.A_memorix.* 身份别名 + src.* 兜底
+# meta path finder：src.A_memorix.* 身份别名 / scripts 惰性别名 /
+# 上游笔误桥接 / 未桩 src.* 的严格与宽松两种处置
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +110,7 @@ class _AliasLoader:
     def __init__(self, target_name: str) -> None:
         self._target_name = target_name
 
-    def create_module(self, spec: Any) -> types.ModuleType:
+    def create_module(self, spec: object) -> types.ModuleType:
         return importlib.import_module(self._target_name)
 
     def exec_module(self, module: types.ModuleType) -> None:  # noqa: RUF029
@@ -94,25 +118,51 @@ class _AliasLoader:
 
 
 class _WarnStubLoader:
-    def create_module(self, spec: Any) -> types.ModuleType:
-        return _make_warn_module(spec.name)
+    def create_module(self, spec: object) -> types.ModuleType:
+        return _make_warn_module(spec.name)  # type: ignore[attr-defined]
 
     def exec_module(self, module: types.ModuleType) -> None:  # noqa: RUF029
         return None
 
 
-class _HostStubFinder:
-    """sys.meta_path 前置 finder：只处理 src.* 名称，其余放行。"""
+def _ensure_metadata_store_reexport() -> None:
+    """惰性桥接上游 release_vnext_migrate.py 的导入笔误（不改 vendored 树）。
 
-    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
-        if fullname == "src" or not fullname.startswith("src."):
-            return None
+    在该脚本被 import 之前，把 metadata_schema.RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION
+    补挂到 metadata_store 模块对象上；失败则交回脚本自身的 try/except 处置。
+    """
+
+    try:
+        metadata_store = importlib.import_module(_METADATA_STORE)
+        metadata_schema = importlib.import_module(_METADATA_SCHEMA)
+    except Exception:  # noqa: BLE001（桥接失败 = 与上游缺依赖时同构的行为）
+        return
+    if not hasattr(metadata_store, "RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION"):
+        metadata_store.RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = (  # type: ignore[attr-defined]
+            metadata_schema.RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION
+        )
+
+
+class _HostStubFinder:
+    """sys.meta_path 前置 finder：只处理 src.* 与 scripts 顶层别名，其余放行。"""
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None) -> object:
         if fullname in sys.modules:
             return None
-        if fullname == _SRC_ALIAS_PREFIX or fullname.startswith(_SRC_ALIAS_PREFIX + "."):
-            spec = importlib.machinery.ModuleSpec(fullname, _AliasLoader("A_memorix" + fullname[len(_SRC_ALIAS_PREFIX):]))
-            return spec
-        return importlib.machinery.ModuleSpec(fullname, _WarnStubLoader())
+        if fullname == "src" or fullname.startswith("src."):
+            if fullname == _SRC_ALIAS_PREFIX or fullname.startswith(_SRC_ALIAS_PREFIX + "."):
+                return importlib.machinery.ModuleSpec(
+                    fullname, _AliasLoader("A_memorix" + fullname[len(_SRC_ALIAS_PREFIX):])
+                )
+            if _is_lenient():
+                return importlib.machinery.ModuleSpec(fullname, _WarnStubLoader())
+            return None  # 严格模式：交回默认机制（import → ModuleNotFoundError，find_spec 探测 → None）
+        alias_target = _SCRIPT_SIBLING_ALIASES.get(fullname)
+        if alias_target is not None:
+            return importlib.machinery.ModuleSpec(fullname, _AliasLoader(alias_target))
+        if fullname == _RELEASE_VNEXT_MIGRATE:
+            _ensure_metadata_store_reexport()
+        return None
 
 
 _finder: Optional[_HostStubFinder] = None
@@ -253,49 +303,18 @@ def _register_explicit_stubs() -> None:
     )
 
 
-def _alias_script_siblings() -> None:
-    """scripts/* 之间以顶层名互导（直跑时依赖脚本目录入 sys.path）：
-    `_bootstrap`（自举路径常量）与 `process_knowledge`（LPMM 导入器），
-    统一别名到 A_memorix.scripts.* 真实模块，保持单一身份。
-    """
-
-    for top_name in ("_bootstrap", "process_knowledge"):
-        if top_name in sys.modules:
-            continue
-        try:
-            real = importlib.import_module(f"A_memorix.scripts.{top_name}")
-        except ImportError:
-            continue
-        sys.modules[top_name] = real
-
-
-def _patch_upstream_import_quirks() -> None:
-    """上游已知 import 笔误的兼容再导出（不改 vendored 树的前提下桥接）。
-
-    scripts/release_vnext_migrate.py:66 从 `A_memorix.core.storage.metadata_store`
-    导入 `RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION`，但该常量实际定义在
-    `metadata_schema.py`（metadata_store 只再导出了 SCHEMA_VERSION）——上游脚本
-    笔误。此处把正确来源桥接到 metadata_store 模块对象上。
-    """
-
-    try:
-        metadata_store = importlib.import_module("A_memorix.core.storage.metadata_store")
-        metadata_schema = importlib.import_module("A_memorix.core.storage.metadata_schema")
-    except ImportError:
-        return
-    if not hasattr(metadata_store, "RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION"):
-        metadata_store.RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION = (  # type: ignore[attr-defined]
-            metadata_schema.RUNTIME_AUTO_MIGRATION_MIN_SCHEMA_VERSION
-        )
-
-
 # ---------------------------------------------------------------------------
 # 公开 API
 # ---------------------------------------------------------------------------
 
 
 def install() -> None:
-    """预注册全部宿主桩 + 安装 meta path finder。幂等；必须在 import A_memorix 前调用。"""
+    """预注册全部宿主桩 + 安装 meta path finder。
+
+    幂等；必须在 import A_memorix 前调用。本函数不 import 任何 A_memorix/scripts
+    模块——scripts 顶层互导别名（_bootstrap/process_knowledge）与上游笔误桥接均由
+    finder 惰性解析，install() 在任何宿主进程 argv 形态下都安全完成。
+    """
 
     global _finder, _installed
     if _installed:
@@ -308,8 +327,6 @@ def install() -> None:
     if _finder not in sys.meta_path:
         sys.meta_path.insert(0, _finder)
 
-    _alias_script_siblings()
-    _patch_upstream_import_quirks()
     _installed = True
 
 
@@ -318,7 +335,7 @@ def is_installed() -> bool:
 
 
 def get_fallback_hits() -> List[Tuple[str, str]]:
-    """兜底防线命中记录（module, attr）——测试断言/巡检用。"""
+    """宽松模式占位命中记录（module, attr）——测试断言/巡检用。"""
 
     return list(_fallback_hits)
 

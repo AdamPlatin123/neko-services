@@ -1,68 +1,152 @@
 """A_memorix 全树 import 扫描（P0-1 #2 验收：import-sweep 全绿）。
 
 做法：host_stubs.install() 后 pkgutil.walk_packages 逐模块 import_module，
-收集一切异常并断言为空；另附桩行为冒烟（logger 透传 / chat_manager 降级 /
-LLM 占位可导入不可调用 / 配置 toml 生效 / src.A_memorix 别名身份一致）。
+扫描结果与磁盘 *.py 清单精确比对；另附桩行为冒烟（logger 透传 / chat_manager
+降级 / LLM 占位可导入不可调用 / 配置 toml 生效 / src.A_memorix 别名身份一致）、
+严格模式默认行为（未桩 src.* → ImportError）、宽松模式开关行为、以及独立进程
+真实启动顺序契约（subprocess）。
 
-第三方依赖说明（真实依赖，非桩；P0-1b 移入 pyproject dependencies）：
-已装 numpy、scipy、faiss-cpu、tomlkit、json-repair、sqlalchemy、sqlmodel、
-pydantic、aiohttp、openai、jieba、psutil、ahocorasick_rs、rich、tenacity。
+桩模式说明：默认严格（未桩 src.* 导入直接 ImportError，find_spec 探测返回 None，
+可选依赖检测不误放行）；设 NEKO_STUBS_LENIENT=1 进宽松模式（WARN 占位）。
+
+第三方依赖说明（真实依赖，非桩；已入 pyproject dependencies，uv sync 干净复现）：
+numpy、scipy、faiss-cpu、tomlkit、json-repair、sqlalchemy、sqlmodel、pydantic、
+aiohttp、openai、jieba、psutil、ahocorasick-rs、rich、tenacity、pyarrow。
 树内自带 try/except ImportError 降级守卫的重依赖（本环境未安装、也无需桩）：
 - sentence_transformers（core/embedding/manager.py → HAS_SENTENCE_TRANSFORMERS=False）
-- networkx / pyarrow / google.genai（scripts 内函数级延迟导入，import 阶段不触发）
+- networkx / google.genai（scripts 内函数级延迟导入，import 阶段不触发）
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import os
 import pkgutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 import A_memorix
 import host_stubs
 
+SERVICE_ROOT = Path(__file__).resolve().parent.parent
+TREE_ROOT = Path(A_memorix.__file__).resolve().parent
 
-def _iter_a_memorix_modules():
+
+def _sweep_module_names() -> list[str]:
+    names: list[str] = []
     seen: set[str] = set()
     for info in pkgutil.walk_packages(A_memorix.__path__, prefix="A_memorix."):
-        if info.name in seen:
+        if info.name not in seen:
+            seen.add(info.name)
+            names.append(info.name)
+    # scripts/ 是无 __init__ 的命名空间包，walk_packages 不展开：显式补扫
+    import A_memorix.scripts as scripts_pkg  # noqa: PLC0415
+
+    for info in pkgutil.iter_modules(scripts_pkg.__path__, prefix="A_memorix.scripts."):
+        if info.name not in seen:
+            seen.add(info.name)
+            names.append(info.name)
+    return names
+
+
+def _expected_module_names_from_disk() -> set[str]:
+    """磁盘 *.py 清单 → 期望模块名集合（__init__.py 折叠为包名，含包根）。"""
+
+    expected = {"A_memorix"}
+    for py_file in sorted(TREE_ROOT.rglob("*.py")):
+        if "__pycache__" in py_file.parts:
             continue
-        seen.add(info.name)
-        yield info.name
+        parts = list(py_file.relative_to(TREE_ROOT).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        expected.add("A_memorix" + ("." + ".".join(parts) if parts else ""))
+    return expected
 
 
 def test_import_sweep_whole_tree():
-    """全树逐模块 import，任何异常都视为失败并给出完整清单。"""
+    """全树逐模块 import；导入集与磁盘文件清单精确一致，任何异常都失败。"""
 
     failures = []
-    imported = []
-    for module_name in _iter_a_memorix_modules():
+    imported = {"A_memorix"}
+    for module_name in _sweep_module_names():
         try:
             importlib.import_module(module_name)
-            imported.append(module_name)
+            imported.add(module_name)
         except Exception as exc:  # noqa: BLE001（收集全部异常类型）
             failures.append(f"{module_name}: {type(exc).__name__}: {exc}")
 
-    # scripts/ 是无 __init__ 的命名空间包，walk_packages 可能不展开：显式补扫
-    import A_memorix.scripts as scripts_pkg  # noqa: E401
-
-    for info in pkgutil.iter_modules(scripts_pkg.__path__, prefix="A_memorix.scripts."):
-        try:
-            importlib.import_module(info.name)
-            imported.append(info.name)
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"{info.name}: {type(exc).__name__}: {exc}")
-
     assert not failures, "import-sweep 失败:\n" + "\n".join(failures)
-    assert len(imported) >= 100, f"扫描模块数异常偏少: {len(imported)}"
+
+    expected = _expected_module_names_from_disk()
+    missing = expected - imported
+    extra = imported - expected
+    assert not missing, f"磁盘上存在但未被扫描导入的模块: {sorted(missing)}"
+    assert not extra, f"被导入但磁盘无对应文件的模块: {sorted(extra)}"
 
 
 def test_no_silent_fallback_during_sweep():
-    """扫描不允许落入警告型兜底（命中即说明有宿主依赖没桩到）。"""
+    """扫描不允许落入宽松占位（命中即说明有宿主依赖没桩到）。"""
 
     hits = host_stubs.get_fallback_hits()
-    assert hits == [], "警告型兜底命中（应补显式桩）: " + ", ".join(f"{m}.{a}" for m, a in hits)
+    assert hits == [], "宽松占位命中（应补显式桩）: " + ", ".join(f"{m}.{a}" for m, a in hits)
+
+
+def test_strict_mode_rejects_unknown_src():
+    """默认严格模式：未桩 src.* 导入 ImportError、find_spec 探测 None。"""
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("src.never_stubbed_module_zz")
+    assert importlib.util.find_spec("src.never_stubbed_module_zz") is None
+
+
+def test_lenient_mode_warn_placeholder(monkeypatch):
+    """NEKO_STUBS_LENIENT=1：未桩 src.* 给 WARN 占位并记录 fallback_hits。"""
+
+    monkeypatch.setenv("NEKO_STUBS_LENIENT", "1")
+    try:
+        module = importlib.import_module("src.lenient_probe_module_zz")
+        placeholder = module.some_attr
+        assert "src.lenient_probe_module_zz" in repr(placeholder)
+        hits = host_stubs.get_fallback_hits()
+        assert ("src.lenient_probe_module_zz", "some_attr") in hits
+    finally:
+        sys.modules.pop("src.lenient_probe_module_zz", None)
+        host_stubs.reset_fallback_hits()
+
+
+def test_subprocess_entry_contract():
+    """独立进程按真实启动顺序安装并导入关键入口（含惰性 scripts 别名）。"""
+
+    script = "\n".join(
+        [
+            "import host_stubs",
+            "host_stubs.install()",
+            "import A_memorix.host_service",
+            "import A_memorix.plugin",
+            "import A_memorix.core.runtime.sdk_memory_kernel",
+            "import _bootstrap",  # 惰性别名：此刻才加载 A_memorix.scripts._bootstrap
+            "assert _bootstrap.DEFAULT_DATA_DIR",
+            "from src.config.config import global_config",
+            "assert global_config.a_memorix.plugin.enabled is True",
+            "print('ENTRY_OK')",
+        ]
+    )
+    env = dict(os.environ)
+    env.pop("NEKO_STUBS_LENIENT", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=SERVICE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    assert "ENTRY_OK" in result.stdout
 
 
 def test_host_entry_modules_import():
@@ -84,8 +168,8 @@ def test_src_a_memorix_alias_identity():
 def test_logger_stub_passthrough():
     from src.common.logger import get_logger
 
-    logger = get_logger("A_memorix.Test")
-    assert logger.name == "A_memorix.Test"
+    logger = get_logger("A_Memorix.Test")
+    assert logger.name == "A_Memorix.Test"
 
 
 def test_chat_manager_degrades_to_none():

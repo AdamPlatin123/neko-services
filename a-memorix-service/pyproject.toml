@@ -3,11 +3,27 @@ name = "a-memorix-service"
 version = "0.1.0"
 description = "A_memorix 独立检索服务（P0-1：vendored 上游树 + 注入式宿主桩）"
 requires-python = ">=3.12"
-# 真实运行依赖清单（P0-1b 补齐并锁版本）：numpy、scipy、faiss-cpu、tomlkit、json-repair、
-# sqlalchemy、sqlmodel、pydantic、aiohttp、openai、jieba、psutil、ahocorasick_rs、rich、tenacity。
-# 本阶段（P0-1 第一阶段）只做 import 链验证，依赖由 uv venv 手动安装（见 tests/test_import_sweep.py 头注释）。
+# P0-1 第一阶段 import 链必需依赖（实测清单，uv sync 干净环境可复现）。
+# 树内自带 try/except 降级守卫、无需安装的重依赖（sentence_transformers 等）不列；
+# 版本未锁——锁版本与运行期真实依赖评审在 P0-1b 一并处理。
 dependencies = [
     "pytest",
+    "numpy",
+    "scipy",
+    "faiss-cpu",
+    "tomlkit",
+    "json-repair",
+    "sqlalchemy",
+    "sqlmodel",
+    "pydantic",
+    "aiohttp",
+    "openai",
+    "jieba",
+    "psutil",
+    "ahocorasick-rs",
+    "rich",
+    "tenacity",
+    "pyarrow",
 ]
 
 [tool.pytest.ini_options]
