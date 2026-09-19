@@ -2,9 +2,9 @@
 
 做法：host_stubs.install() 后 pkgutil.walk_packages 逐模块 import_module，
 扫描结果与磁盘 *.py 清单精确比对；另附桩行为冒烟（logger 透传 / chat_manager
-降级 / LLM 占位可导入不可调用 / 配置 toml 生效 / src.A_memorix 别名身份一致）、
-严格模式默认行为（未桩 src.* → ImportError）、宽松模式开关行为、以及独立进程
-真实启动顺序契约（subprocess）。
+降级 / LLM 出口配置感知（P0-1b 真实适配，未配置→RuntimeError）/ 配置 toml
+生效 / src.A_memorix 别名身份一致）、严格模式默认行为（未桩 src.* →
+ImportError）、宽松模式开关行为、以及独立进程真实启动顺序契约（subprocess）。
 
 桩模式说明：默认严格（未桩 src.* 导入直接 ImportError，find_spec 探测返回 None，
 可选依赖检测不误放行）；设 NEKO_STUBS_LENIENT=1 进宽松模式（WARN 占位）。
@@ -178,7 +178,7 @@ def test_chat_manager_degrades_to_none():
     assert chat_manager.get_existing_session_by_session_id("whatever") is None
 
 
-def test_llm_stub_importable_but_not_callable():
+def test_llm_stub_importable_and_config_aware():
     from src.services import llm_service as llm_api
 
     request = llm_api.LLMServiceRequest(
@@ -193,9 +193,11 @@ def test_llm_stub_importable_but_not_callable():
 
     client = llm_api.LLMServiceClient(task_name="utils", request_type="test")
     assert hasattr(client._orchestrator, "model_for_task")
-    with pytest.raises(NotImplementedError):
-        import asyncio
+    # P0-1b 起为真实出口：默认 toml 未配置模型 → RuntimeError（调用侧均有降级），
+    # 不再是 NotImplementedError 占位
+    import asyncio
 
+    with pytest.raises(RuntimeError, match="LLM 任务不可用"):
         asyncio.run(client.generate_response(prompt="hi"))
 
 

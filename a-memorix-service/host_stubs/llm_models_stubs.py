@@ -3,8 +3,9 @@
 - exceptions：类的层次关系与真包（MaiBot src/llm_models/exceptions.py）逐类对齐，
   保证上游 `except XxxError` 子句兼容。
 - base_client：EmbeddingRequest dataclass 字段齐全；client_registry.get_client_class_instance
-  调用即 NotImplementedError（P0-1b 整个 EmbeddingAPIAdapter 重写为直连 OpenAI 兼容 API，
-  见 audit 第 4 节）。
+  P0-1b 起返回真实 OpenAI 兼容 embeddings 客户端（adapters.openai_compat.
+  get_embedding_client）——vendored EmbeddingAPIAdapter 本体是完整实现，
+  唯一宿主依赖就是这个 registry 面（见 audit 第 4 节）。
 """
 
 from __future__ import annotations
@@ -134,13 +135,12 @@ class EmbeddingRequest:
 
 
 class _ClientRegistryStub:
-    """client_registry 替身：P0-1b 由直连 OpenAI 兼容 embedding 适配器取代。"""
+    """client_registry 替身：转发到真实 OpenAI 兼容 embedding 客户端（P0-1b）。"""
 
     def get_client_class_instance(self, api_provider: Any) -> Any:
-        _ = api_provider
-        raise NotImplementedError(
-            "host_stubs: client_registry 为 P0-1 占位桩（P0-1b 重写 EmbeddingAPIAdapter 直连 OpenAI 兼容 API）"
-        )
+        from adapters.openai_compat import get_embedding_client
+
+        return get_embedding_client(api_provider)
 
 
 client_registry = _ClientRegistryStub()

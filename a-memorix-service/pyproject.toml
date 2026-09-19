@@ -1,11 +1,13 @@
 [project]
 name = "a-memorix-service"
 version = "0.1.0"
-description = "A_memorix 独立检索服务（P0-1：vendored 上游树 + 注入式宿主桩）"
+description = "A_memorix 独立检索服务（P0-1：vendored 上游树 + 注入式宿主桩 + FastAPI 壳）"
 requires-python = ">=3.12"
 # P0-1 第一阶段 import 链必需依赖（实测清单，uv sync 干净环境可复现）。
 # 树内自带 try/except 降级守卫、无需安装的重依赖（sentence_transformers 等）不列；
 # 版本未锁——锁版本与运行期真实依赖评审在 P0-1b 一并处理。
+# P0-1b 追加：fastapi/uvicorn（服务壳）、httpx（fastapi TestClient 所需；
+# openai SDK 亦依赖 httpx，此处显式声明避免隐式传递依赖）。
 dependencies = [
     "pytest",
     "numpy",
@@ -18,6 +20,9 @@ dependencies = [
     "pydantic",
     "aiohttp",
     "openai",
+    "httpx",
+    "fastapi",
+    "uvicorn",
     "jieba",
     "psutil",
     "ahocorasick-rs",

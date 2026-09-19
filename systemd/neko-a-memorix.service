@@ -1,34 +1,41 @@
 # =============================================================================
-# neko-a-memorix.service — a-memorix 记忆检索服务（占位 unit）
-# 状态：占位，P0-1「a-memorix 服务化」完成前不会实际运行——
-#   ConditionPathExists 不满足时 start 会显示 skipped（绿色跳过），neko.target
-#   的 Wants 弱依赖不受影响；服务化落地后无需改 target，仅需：
-#     1. 在 /mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/ 下
-#        完成实现并 `uv sync`（Python 3.12）生成 .venv；
-#     2. 修正下方 ConditionPathExists 与 ExecStart 的入口模块名（现为占位
-#        a_memorix_service，以 P0-1 定稿为准）；
-#     3. systemctl --user daemon-reload && systemctl --user start neko-a-memorix
+# neko-a-memorix.service — a-memorix 记忆检索服务（P0-1 已落地）
+# 入口：uv run python -m a_memorix_service.service（FastAPI + uvicorn）
+#   - 默认绑定 127.0.0.1:48921（a_memorix_service/service/__main__.py，
+#     与 scripts/lib.sh 的 NEKO_AMEMORIX_URL 默认一致；仅回环监听是部署基线）
+#   - /health 指纹：app="neko-services"（区别于 N.E.K.O 本体签名，doctor.sh
+#     按 service=a-memorix + 该 app 值识别）
+# 首次部署：
+#   1. cd /mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service && uv sync
+#      （Python 3.12，生成 .venv，满足下方 ConditionPathExists）
+#   2. 编辑 config/a_memorix.toml 的 [model.*]（api_providers 的 base_url/api_key
+#      与 models/tasks）；未配置时服务仍可启动（WARN + 检索/写入降级）
+#   3. systemctl --user daemon-reload && systemctl --user start neko-a-memorix
 # 部署路径不同时，替换 /mnt/shared/_Projects/N.E.K.O 前缀（同 neko-memory.service）。
 # =============================================================================
 
 [Unit]
-Description=N.E.K.O a-memorix memory retrieval service (P0-1 placeholder)
+Description=N.E.K.O a-memorix memory retrieval service (FastAPI, port 48921)
 Documentation=file:///mnt/shared/_Projects/N.E.K.O/neko-services/README.md
 After=neko-memory.service
 # stop/restart neko.target 时联动停本服务（Wants 只管启动不管停止）
 PartOf=neko.target
-# P0-1 落地前该路径不存在 → 本 unit start 自动跳过（显示 skipped，非失败）
+# uv sync 后存在；未部署时 start 自动跳过（显示 skipped，非失败）
 ConditionPathExists=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python
 
 [Service]
 Type=exec
 WorkingDirectory=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service
-# 入口模块名为占位，P0-1 定稿后修正
-ExecStart=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python -m a_memorix_service
+ExecStart=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python -m a_memorix_service.service
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
-# 服务地址需与 scripts/lib.sh 的 NEKO_AMEMORIX_URL（默认 http://127.0.0.1:48921）一致
+# 端口/绑定覆盖（默认 127.0.0.1:48921，与 scripts/lib.sh 的 NEKO_AMEMORIX_URL 一致；
+# 改端口时两处同步）
+#Environment=NEKO_AMEMORIX_PORT=48921
+#Environment=NEKO_AMEMORIX_HOST=127.0.0.1
+# 可选：与 neko 三 unit 共享同一实例指纹（/health 的 instance_id；不设则本进程随机）
+#Environment=NEKO_INSTANCE_ID=<与 neko-memory.service 相同的 uuid>
 
 [Install]
 WantedBy=default.target

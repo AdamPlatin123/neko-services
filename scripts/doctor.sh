@@ -8,8 +8,8 @@
 #   3. ZMQ PUB 38866 可达性（zmq 探测→TCP 降级）               [核心项]
 #   4. NapCat 状态（提示性：目录/日志文件存在性）              [提示项]
 #   5. LLM key 有效性（读环境变量，未设置则 SKIP 提示人工）     [提示项]
-#   6. a-memorix /a_memorix/v1/stats（P0-1 服务化后生效，       [提示项]
-#      当前 404/拒连时 SKIP）
+#   6. a-memorix /health 指纹（app=neko-services；             [提示项]
+#      P0-1 服务化已落地，未部署/未连接时 SKIP）
 #
 # 退出码：核心项（1-3）全部通过 = 0；任一核心项失败 = 1。
 # 提示项失败不影响退出码，仅给出排障线索。
@@ -140,25 +140,33 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. a-memorix /a_memorix/v1/stats（P0-1 服务化后生效）
+# 6. a-memorix /health（P0-1 服务化已落地；app 指纹 neko-services，非 N.E.K.O 签名）
 # ---------------------------------------------------------------------------
-section "6/6 a-memorix /a_memorix/v1/stats（提示项，P0-1 服务化后生效）"
-amemorix_url="${NEKO_AMEMORIX_URL%/}/a_memorix/v1/stats"
+section "6/6 a-memorix /health（提示项）"
+# a-memorix 是独立 FastAPI 服务（python -m a_memorix_service.service），/health
+# 的 app 指纹为 neko-services（不冒充 N.E.K.O 本体签名，避免 launcher 误 attach），
+# 因此不能复用 http_check 的 NEKO_APP_SIGNATURE 断言——这里单独做等价校验。
+amemorix_health_url="${NEKO_AMEMORIX_URL%/}/health"
 amemorix_code=$(curl --silent --show-error --max-time "${NEKO_CURL_TIMEOUT}" \
-    -o /dev/null -w '%{http_code}' "$amemorix_url" 2>/dev/null) || amemorix_code=000
+    -o /dev/null -w '%{http_code}' "$amemorix_health_url" 2>/dev/null) || amemorix_code=000
 case "$amemorix_code" in
     200)
-        if http_check "a-memorix stats" "$amemorix_url"; then
-            info "a-memorix 服务已上线（P0-1 交付物），统计端点可用"
+        amemorix_body=$(curl --silent --show-error --max-time "${NEKO_CURL_TIMEOUT}" "$amemorix_health_url" 2>/dev/null) || amemorix_body=""
+        if [[ -n "$amemorix_body" ]] \
+            && json_field_eq "$amemorix_body" app "neko-services" \
+            && json_field_eq "$amemorix_body" service "a-memorix" \
+            && json_field_eq "$amemorix_body" status "ok"; then
+            amemorix_state=$(json_field "$amemorix_body" startup_state) || amemorix_state=""
+            ok "a-memorix 服务在线（startup_state=${amemorix_state:-未知}）"
         else
-            warn "a-memorix stats 返回 200 但 body 异常（见上）"
+            warn "a-memorix /health 返回 200 但指纹异常（app/service/status 期望 neko-services/a-memorix/ok）：${amemorix_body:0:160}"
         fi
         ;;
-    404|000)
-        skip "a-memorix 未部署（HTTP ${amemorix_code}）——正常：a-memorix 服务化（workplan P0-1）完成后此项生效"
+    000)
+        skip "a-memorix 未部署（无法连接 ${amemorix_health_url}）——启用步骤见 systemd/INSTALL.md 的 a-memorix 节"
         ;;
     *)
-        warn "a-memorix stats 异常（HTTP ${amemorix_code}）：$amemorix_url"
+        warn "a-memorix /health 异常（HTTP ${amemorix_code}）：${amemorix_health_url}"
         ;;
 esac
 
