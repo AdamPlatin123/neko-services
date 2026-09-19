@@ -47,7 +47,7 @@ from urllib.parse import quote
 
 import httpx
 
-from .contract import CONTRACTS, EndpointContract
+from .contract import CONTRACTS, SUGGESTED_TIMEOUTS, EndpointContract
 
 logger = logging.getLogger("neko_mem_client")
 
@@ -86,7 +86,13 @@ class MemClientError(Exception):
 
 
 class MemServerUnreachable(MemClientError):
-    """连接层失败：连接拒绝 / DNS 解析失败 / 传输层断开（服务未启动或已退出）。"""
+    """连接层失败：连接拒绝 / DNS 解析失败 / 传输层断开（服务未启动或已退出）。
+
+    兜底范围：除超时（TimeoutException→MemServerTimeout）外的全部
+    httpx.HTTPError 传输异常都归此类，包括本地协议/解码类异常
+    （httpx.LocalProtocolError、httpx.DecodeError 等）——这类并非
+    "服务不可达"本身，但同样属传输层失败，排障时请先看异常消息里的
+    原异常类型再定位。"""
 
 
 class MemServerError(MemClientError):
@@ -420,7 +426,11 @@ class MemoryServerClient(_MemoryServerClientBase):
             json_body=self.build_history_payload(
                 messages, language=language, render_language=render_language
             ),
-            timeout=timeout,
+            # 未显式传 timeout 时按契约建议表取（cache=5s，process/renew/
+            # settle=30s——LLM 摘要端点），显式传参仍可覆盖
+            timeout=timeout if timeout is not None else SUGGESTED_TIMEOUTS.get(
+                endpoint, self.default_timeout
+            ),
             rid_out=request_id_holder,
         )
         return self._check_write_response(
@@ -436,11 +446,12 @@ class MemoryServerClient(_MemoryServerClientBase):
         lanlan_name: str | None = None,
         *,
         json_body: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
         timeout: float | None = None,
         rid_out: dict[str, str],
     ) -> httpx.Response:
-        """同 _request，但把生成的 request_id 写回 rid_out（供后续 body
-        校验异常携带）。"""
+        """发请求并把生成的 request_id 写回 rid_out（供后续 body 校验异常
+        携带同一 id）。"""
         request_id = self._new_request_id()
         rid_out["rid"] = request_id
         url = self._url(contract, lanlan_name)
@@ -450,6 +461,7 @@ class MemoryServerClient(_MemoryServerClientBase):
                 contract.method,
                 url,
                 json=json_body,
+                params=params,
                 headers=self._headers(request_id),
                 timeout=timeout if timeout is not None else self.default_timeout,
             )
@@ -552,16 +564,39 @@ class MemoryServerClient(_MemoryServerClientBase):
 
     # -- 读取端点 ------------------------------------------------------
 
-    def new_dialog(self, lanlan_name: str, *, timeout: float | None = None) -> str:
+    def new_dialog(
+        self,
+        lanlan_name: str,
+        *,
+        language: str | None = None,
+        render_language: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
         """GET /new_dialog/{name}——persona 记忆层纯文本（会话开台时拼进
         system prompt）。
+
+        可选查询参数 ``language`` / ``render_language``（服务端
+        routes.py:3615-3620：language 优先、无效则回退 render_language）；
+        两者都省略时服务端恢复该角色持久的 locale。对齐
+        memory_bridge.fetch_bootstrap_memory 的现签名用法。
 
         注意非纯读（写 prompt-locale、持 settle_lock）。响应为
         PlainTextResponse，直接返回 strip 后的文本（无 body status 检查）。
         """
         contract = CONTRACTS["new_dialog"]
+        params = {
+            key: value
+            for key, value in (
+                ("language", language),
+                ("render_language", render_language),
+            )
+            if value
+        }
         rid_out: dict[str, str] = {}
-        response = self._request_with_rid(contract, lanlan_name, timeout=timeout, rid_out=rid_out)
+        response = self._request_with_rid(
+            contract, lanlan_name, params=params or None,
+            timeout=timeout, rid_out=rid_out,
+        )
         self._check_http_status(
             response,
             request_id=rid_out["rid"],
@@ -582,9 +617,11 @@ class MemoryServerClient(_MemoryServerClientBase):
     ) -> dict[str, Any]:
         """POST /query_memory/{name}——混合检索（BM25+向量+RRF）。
 
-        ``query``/``time`` 至少给一个；``subjects`` 显式空列表=无授权主体
-        （fail-closed），省略=legacy 私话语料。``language`` 透传给服务端
-        渲染 tier/entity 标签（对齐 memory_bridge.query_relevant_memory）。
+        ``query``/``time`` 至少给一个；``subjects`` 显式空列表=服务端 422
+        拒绝（fail-closed：无授权主体不允许回退 legacy 语料，客户端将其
+        映射为 MemServerError(status_code=422)），省略(None)=legacy 私话
+        语料，1..8 条。``language`` 透传给服务端渲染 tier/entity 标签
+        （对齐 memory_bridge.query_relevant_memory）。
 
         :returns: ``{"results": [...], "query": str, "candidates_total": int,
             "elapsed_ms": float}``
@@ -655,6 +692,7 @@ class AsyncMemoryServerClient(_MemoryServerClientBase):
         lanlan_name: str | None = None,
         *,
         json_body: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
         timeout: float | None = None,
         rid_out: dict[str, str],
     ) -> httpx.Response:
@@ -667,6 +705,7 @@ class AsyncMemoryServerClient(_MemoryServerClientBase):
                 contract.method,
                 url,
                 json=json_body,
+                params=params,
                 headers=self._headers(request_id),
                 timeout=timeout if timeout is not None else self.default_timeout,
             )
@@ -709,7 +748,11 @@ class AsyncMemoryServerClient(_MemoryServerClientBase):
             json_body=self.build_history_payload(
                 messages, language=language, render_language=render_language
             ),
-            timeout=timeout,
+            # 未显式传 timeout 时按契约建议表取（cache=5s，process/renew/
+            # settle=30s——LLM 摘要端点），显式传参仍可覆盖
+            timeout=timeout if timeout is not None else SUGGESTED_TIMEOUTS.get(
+                endpoint, self.default_timeout
+            ),
             rid_out=rid_out,
         )
         return self._check_write_response(
@@ -779,12 +822,33 @@ class AsyncMemoryServerClient(_MemoryServerClientBase):
             language=language, render_language=render_language, timeout=timeout,
         )
 
-    async def new_dialog(self, lanlan_name: str, *, timeout: float | None = None) -> str:
-        """GET /new_dialog/{name}——persona 记忆层纯文本。"""
+    async def new_dialog(
+        self,
+        lanlan_name: str,
+        *,
+        language: str | None = None,
+        render_language: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """GET /new_dialog/{name}——persona 记忆层纯文本。
+
+        可选查询参数 ``language`` / ``render_language``（服务端 language
+        优先、无效则回退 render_language）；都省略时服务端恢复角色持久
+        locale。语义详见同步版 docstring。
+        """
         contract = CONTRACTS["new_dialog"]
+        params = {
+            key: value
+            for key, value in (
+                ("language", language),
+                ("render_language", render_language),
+            )
+            if value
+        }
         rid_out: dict[str, str] = {}
         response = await self._request_with_rid(
-            contract, lanlan_name, timeout=timeout, rid_out=rid_out
+            contract, lanlan_name, params=params or None,
+            timeout=timeout, rid_out=rid_out,
         )
         self._check_http_status(
             response, request_id=rid_out["rid"], contract=contract, lanlan_name=lanlan_name
@@ -801,7 +865,8 @@ class AsyncMemoryServerClient(_MemoryServerClientBase):
         language: str | None = None,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """POST /query_memory/{name}——混合检索。"""
+        """POST /query_memory/{name}——混合检索（subjects 语义与超时默认
+        详见同步版 docstring 与 contract 表）。"""
         body: dict[str, Any] = {"query": query or ""}
         if time:
             body["time"] = time

@@ -157,7 +157,11 @@ _NEW_DIALOG_CONTRACT = EndpointContract(
     endpoint="new_dialog",
     method="GET",
     path_template="/new_dialog/{name}",
-    body_spec="无请求体（GET）",
+    body_spec=(
+        "无请求体（GET）；可选查询参数 language / render_language"
+        "（routes.py:3615-3620——服务端 language 优先、无效则回退"
+        " render_language）"
+    ),
     success_statuses=(),
     response_shape=(
         "PlainTextResponse：persona markdown + 内心活动 + recent history"
@@ -179,8 +183,9 @@ _QUERY_MEMORY_CONTRACT = EndpointContract(
     path_template="/query_memory/{name}",
     body_spec=(
         "QueryMemoryRequest: {query?, time?, subjects?[]}——query/time 至少给"
-        "一个有效值；subjects 显式空列表=无授权主体（fail-closed 返回空），"
-        "省略(None)=legacy 私话语料；1..8 条"
+        "一个有效值；subjects 显式空列表=服务端 422 拒绝（fail-closed：无"
+        "授权主体不允许回退 legacy 语料），省略(None)=legacy 私话语料；"
+        "1..8 条"
     ),
     success_statuses=(),
     response_shape=(

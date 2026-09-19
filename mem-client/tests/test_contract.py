@@ -150,6 +150,10 @@ def test_query_memory_contract_matches_audit(audit_text: str) -> None:
     assert "失败永返空" in CONTRACTS["query_memory"].response_shape, (
         "query_memory 契约必须保留 audit 原词「失败永返空」"
     )
+    # subjects 显式空列表=服务端 422 硬拒（routes.py:3345-3350 fail-closed，
+    # 非「返回空」），省略(None) 才是 legacy 私话语料
+    assert "422" in CONTRACTS["query_memory"].body_spec
+    assert "省略(None)=legacy 私话语料" in CONTRACTS["query_memory"].body_spec
 
 
 def test_side_effects_carry_audit_key_facts() -> None:

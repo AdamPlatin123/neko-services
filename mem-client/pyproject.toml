@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Unified HTTP client for the N.E.K.O memory_server (cache/process/renew/settle pipeline + query_memory/new_dialog/health) with body-status enforcement"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = { text = "AGPL-3.0" }
 dependencies = [
     "httpx>=0.24",
 ]

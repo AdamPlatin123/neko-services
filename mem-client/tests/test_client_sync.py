@@ -78,6 +78,29 @@ def test_new_dialog_returns_plain_text() -> None:
     assert req.method == "GET"
     assert req.url.path == "/new_dialog/neko"
     assert req.content == b""
+    # 未传 language/render_language 时不发查询参数（服务端恢复持久 locale）
+    assert req.url.params.get("language") is None
+    assert req.url.params.get("render_language") is None
+
+
+def test_new_dialog_language_query_params() -> None:
+    """对齐 fetch_bootstrap_memory 现签名：可选 language/render_language
+    查询参数（服务端 routes.py:3615-3620，language 优先）。"""
+    client, recorded = make_sync_client(
+        lambda req: httpx.Response(200, text="persona")
+    )
+    with client:
+        client.new_dialog("neko", language="zh-CN")
+        client.new_dialog("neko", render_language="en")
+        client.new_dialog("neko", language="ja", render_language="en")
+    first, second, third = recorded.requests
+    assert first.url.params.get("language") == "zh-CN"
+    assert first.url.params.get("render_language") is None
+    assert second.url.params.get("render_language") == "en"
+    assert second.url.params.get("language") is None
+    # 两者都传时原样透传（优先级由服务端裁决）
+    assert third.url.params.get("language") == "ja"
+    assert third.url.params.get("render_language") == "en"
 
 
 def test_query_memory_happy_path() -> None:
@@ -108,6 +131,25 @@ def test_query_memory_happy_path() -> None:
     assert sent["subjects"] == [
         {"subject_kind": "group_chat", "subject_id": "123"}
     ]
+
+
+def test_query_memory_explicit_empty_subjects_is_422() -> None:
+    """契约事实：subjects 显式空列表=服务端 422 硬拒（fail-closed，
+    不允许回退 legacy 私话语料），客户端映射为 MemServerError。"""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "detail": "subjects must be omitted (legacy private) "
+                "or contain 1..8 items"
+            },
+        )
+
+    client, _ = make_sync_client(handler)
+    with client:
+        with pytest.raises(MemServerError) as excinfo:
+            client.query_memory("neko", query="hi", subjects=[])
+    assert excinfo.value.status_code == 422
 
 
 def test_health_returns_fingerprint_json() -> None:
@@ -277,11 +319,31 @@ def _timeout_extension(request: httpx.Request) -> Any:
 
 
 def test_default_timeout_applies() -> None:
-    client, recorded = make_sync_client(ok_write_handler, timeout=7.0)
+    """构造器 timeout 对读取端点生效（写入端点默认走 SUGGESTED_TIMEOUTS，
+    见下方专项测试）。"""
+    client, recorded = make_sync_client(
+        lambda req: httpx.Response(200, text="persona"), timeout=7.0
+    )
     with client:
-        client.cache("neko", [])
+        client.new_dialog("neko")
     ext = _timeout_extension(recorded.last())
     assert ext is not None and ext["read"] == 7.0
+
+
+def test_write_pipeline_default_timeouts_follow_suggestions() -> None:
+    """未显式传 timeout 时写入管线按 SUGGESTED_TIMEOUTS 取默认：
+    cache=5s（无前台 LLM），settle/process/renew=30s（LLM 摘要端点）。"""
+    client, recorded = make_sync_client(ok_write_handler, timeout=5.0)
+    with client:
+        client.cache("neko", [])
+        client.settle("neko")
+        client.process("neko", [])
+        client.renew("neko", [])
+    for request, expected in zip(recorded.requests, (5.0, 30.0, 30.0, 30.0)):
+        ext = _timeout_extension(request)
+        assert ext is not None and ext["read"] == expected, (
+            f"{request.url.path}: expected read timeout {expected}, got {ext}"
+        )
 
 
 def test_per_call_timeout_override() -> None:

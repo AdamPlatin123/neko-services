@@ -16,8 +16,9 @@ N.E.K.O memory_server 的统一 HTTP 客户端（Python 3.11，仅依赖 httpx�
 - **request_id**：每个请求生成 uuid4 短形（12 hex），注入
   `X-Request-Id` header（服务端当前忽略，为未来留痕预留）与 debug 日志
   （logger `neko_mem_client`），异常对象携带同一 request_id；
-- **超时可配**：默认 5s 对齐上游 `cross_server._post_memory_server`，
-  per-call 可覆盖（LLM 端点建议 30s，见下表）。
+- **超时可配**：基础默认 5s 对齐上游 `cross_server._post_memory_server`；
+  写入管线未显式传 timeout 时自动按 `SUGGESTED_TIMEOUTS` 取值
+  （cache=5s，process/renew/settle=30s——LLM 摘要端点），显式传参可覆盖。
 
 ## 端点契约速览
 
@@ -40,6 +41,10 @@ N.E.K.O memory_server 的统一 HTTP 客户端（Python 3.11，仅依赖 httpx�
 写入四端点 body 统一为 HistoryRequest：
 `{"input_history": "<JSON 序列化的 messages 数组字符串>", "language"?, "render_language"?}`；
 `language` 与 `render_language` 互斥、仅发其一（对齐上游 wire 规则）。
+`new_dialog` 为 GET，可选 `language`/`render_language` 查询参数（服务端
+language 优先、无效则回退 render_language，都省略时恢复角色持久 locale）；
+`query_memory` 的 `subjects` 显式空列表会被服务端 422 拒绝（fail-closed，
+不允许回退 legacy 私话语料），省略才是 legacy 语义。
 
 ## 使用示例
 
@@ -58,7 +63,8 @@ with MemoryServerClient() as mem:          # 默认 http://127.0.0.1:48912，5s 
     result = mem.cache("neko", messages)
     print(result["status"], result["count"])   # cached 2
 
-    # 会话结束、0 增量：结算已 cache 的增量（含 LLM 摘要，放宽超时）
+    # 会话结束、0 增量：结算已 cache 的增量；默认超时即 30s
+    # （SUGGESTED_TIMEOUTS，含 LLM 摘要耗时），显式传参可覆盖
     mem.settle("neko", timeout=30.0)
 
     # 检索与 persona 记忆层
@@ -142,7 +148,7 @@ except MemServerBadResponse as e:
 
 | 方法（行号） | 端点 | 迁移映射 |
 |---|---|---|
-| `fetch_bootstrap_memory`（102-106） | GET `/new_dialog/{her_name}` | `await mem.new_dialog(her_name)` |
+| `fetch_bootstrap_memory`（102-106） | GET `/new_dialog/{her_name}`，`params={"language": ...}` | `await mem.new_dialog(her_name, language=...)`（另有 render_language 参数，服务端 language 优先） |
 | `query_relevant_memory`（217-222） | POST `/query_memory/{her_name}`（带 query/time/subjects/language） | `await mem.query_memory(her_name, query=..., time=..., subjects=..., language=...)`，`raw_results`/`elapsed_ms` 从返回 dict 取 |
 | `post_memory_history`（293-300） | POST `/{endpoint}/{her_name}`（cache/process/renew/settle 泛化封装） | 按节奏改调 `mem.cache/process/renew/settle`；如需保留泛化入口，可用 `getattr(mem, endpoint)(...)`——四个方法签名一致 |
 

@@ -16,7 +16,9 @@
     from neko_mem_client import AsyncMemoryServerClient
 
     async with AsyncMemoryServerClient() as mem:
-        await mem.settle("neko")             # 会话结束（0 增量）
+        # 会话结束（0 增量）；settle 默认超时即取 SUGGESTED_TIMEOUTS 的 30s
+        # （显式传参可覆盖）
+        await mem.settle("neko", timeout=30.0)
 """
 
 from .client import (

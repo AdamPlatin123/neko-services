@@ -47,11 +47,31 @@ async def test_new_dialog_and_query_memory_and_health_async() -> None:
             )
         return httpx.Response(200, json={"service": "memory", "instance_id": "x"})
 
-    client, _ = make_async_client(handler)
+    client, recorded = make_async_client(handler)
     async with client:
         assert await client.new_dialog("neko") == "persona layer"
         assert (await client.query_memory("neko", query="hi"))["results"] == []
         assert (await client.health())["service"] == "memory"
+
+
+async def test_new_dialog_language_query_params_async() -> None:
+    client, recorded = make_async_client(
+        lambda req: httpx.Response(200, text="persona")
+    )
+    async with client:
+        await client.new_dialog("neko", language="zh-CN")
+    assert recorded.last().url.params.get("language") == "zh-CN"
+
+
+async def test_write_pipeline_default_timeout_follows_suggestions_async() -> None:
+    """异步侧同样按 SUGGESTED_TIMEOUTS 取默认（cache=5 / settle=30）。"""
+    client, recorded = make_async_client(ok_write_handler, timeout=5.0)
+    async with client:
+        await client.cache("neko", [])
+        await client.settle("neko")
+    exts = [r.extensions.get("timeout") for r in recorded.requests]
+    assert exts[0] is not None and exts[0]["read"] == 5.0
+    assert exts[1] is not None and exts[1]["read"] == 30.0
 
 
 # ── 失败四分类（异步形态） ────────────────────────────────────────
