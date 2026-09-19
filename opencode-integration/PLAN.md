@@ -2,7 +2,7 @@
 
 > 依据：本目录 `RESEARCH.md`（P1-0 调研结论，含 HTTP 契约表）。目标：monika 三件套人格在 opencode 会话常驻生效，记忆读写接通 N.E.K.O memory_server（`127.0.0.1:48912`），并满足 workplan P1-3 三项验收（人格生效 / 跨端语境延续 / 进入-恢复-退出行为定义）。
 > 前置依赖（P1-1）：① `GET /recent_history/{name}?since_seq=` 增量端点（「每轮读取」依赖）；② 统一客户端契约表（body status/ok 检查、external_id 挂载位、失败四分类）——工具文件留 TODO 对表回填。
-> HTTP 契约以 `docs/design/neko-access-audit.md` 为准：**GET `/new_dialog`（读：persona+近期记忆）；POST `/cache`（body `{input_history: "<JSON 字符串>"}`）；POST `/process`/`/renew`/`/settle`；POST `/query_memory`（body `{query?, time?, subjects?[]}`）**。节奏：turn 结束→/cache；重进会话→/renew（有增量）或 /settle（0 增量）；会话结束→/process（有增量）或 /settle（0 增量）。
+> HTTP 契约以 `docs/design/neko-access-audit.md` 为准：**GET `/new_dialog`（读：persona+近期记忆）；POST `/cache`（body `{input_history: "<JSON 字符串>"}`）；POST `/process`/`/renew`（body=统一 `HistoryRequest{input_history}`，携带未提交增量提交并压缩，**非空 body**）；POST `/settle`（结算已 cache 存量，可空增量）；POST `/query_memory`（body `{query?, time?, subjects?[]}`）**。节奏：turn 结束→/cache；重进会话→/renew（有增量）或 /settle（0 增量）；会话结束→/process（有增量）或 /settle（0 增量）。**语义澄清**：「增量」=尚未经 /cache 上送的未提交 messages（判据唯一来源=outbox 积压）；「存量」=已 /cache 未结算（判据=pending_cache 计数）——pending_cache 只判存量，不作增量判据。
 
 ## 一、主路径（置信度 0.85）：自定义 agent + custom tool + session.idle 插件
 
@@ -21,7 +21,7 @@
 | 5 | `opencode-integration/dist/commands/monika-settle.md` | `~/.config/opencode/commands/monika-settle.md` | 手动沉淀命令（process/settle 分支） |
 | 6 | `opencode-integration/dist/monika-memory-read.sh` | `~/.config/opencode/monika-memory/read.sh` | 命令用辅助脚本：拉增量+更新水位（避免命令内嵌脆弱 JSON 解析） |
 | 7 | `opencode-integration/install.sh` | — | 安装/更新脚本（拷贝+钉定版本戳） |
-| 8 | 本地运行时数据（非分发） | `~/.local/share/opencode/monika-memory/` | `state.json`（水位）+ `outbox/`（失败重试队列） |
+| 8 | 本地运行时数据（非分发） | `~/.local/share/opencode/monika-memory/` | `state.json`（**按会话隔离**的水位表 `{active_session_id, sessions:{id:{since_seq,pending_cache}}}`）+ `outbox/`（未提交增量重试队列） |
 
 ### 2. 关键文件格式示例（骨架，P1-3 实施时填全）
 
@@ -58,13 +58,15 @@ const TIMEOUT = 5000
 export const recent_history = tool({
   description: "拉取自上次读取以来的跨端共享记忆增量（每轮首条回复前调用）",
   args: { since_seq: tool.schema.number().optional() },
-  async execute(args) {
-    const seq = args.since_seq ?? readWatermark()          // 读 state.json，缺省 0
+  async execute(args, context) {
+    // 水位按会话隔离（state.json: sessions[context.sessionID].since_seq），
+    // 新会话/无水位会话缺省 0（全量首拉，取舍见 RESEARCH.md C4）
+    const seq = args.since_seq ?? readWatermark(context.sessionID)
     const r = await fetch(`${BASE}/recent_history/${NAME}?since_seq=${seq}`,
                           { signal: AbortSignal.timeout(TIMEOUT) })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const data = await r.json()                             // TODO(P1-1): 响应含游标，形状对表
-    writeWatermark(data.seq)                                // 成功后更新水位
+    writeWatermark(context.sessionID, data.seq)             // 成功后回写本会话水位（原子替换）
     return JSON.stringify(data)
   },
 })
@@ -106,8 +108,13 @@ export const cache = tool({
     return body.status                                       // "cached"
   },
 })
-// process / renew / settle 同构（POST，空 body 或按契约表）；settle 前按 state.json 的
-// pending_cache 判断：>0 走 process（会话结束）或 renew（热重置），=0 走 settle
+// process / renew / settle（均 POST）：process 与 renew 的请求体 = 统一 HistoryRequest
+// {input_history: "<未提交增量 messages 的 JSON 字符串>"}（提交并压缩）——不是空 body；
+// settle 结算已 cache 存量、可空增量。结算分支（§3）：outbox（未提交增量，唯一增量判据）
+// 非空 → 会话结束场景 POST /process、重进场景 POST /renew（body 携带增量）；
+// outbox 空且本会话 pending_cache>0（待结算存量）→ POST /settle；皆空 → no-op。
+// 模型侧入口统一为 settle 工具（内部按上述分支自动转 process），process/renew
+// 主要供 plugin 与 read.sh 脚本路径使用
 ```
 
 **(3) `plugins/monika-memory-sync.ts`**——写路径自动化核心 + 本地状态维护：
@@ -120,7 +127,8 @@ export const MonikaMemorySync: Plugin = async ({ client }) => {
   return {
     event: async ({ event }) => {
       if (event.type === "session.created") {
-        // 仅本地初始化（state/outbox 就绪、登记会话集合）；不调服务端——
+        // 仅本地初始化（state/outbox 就绪、登记会话集合与按会话水位表、
+        // 维护 active_session_id 指针供 read.sh 定位当前会话水位）；不调服务端——
         // 开场读取由 /monika 命令或模型工具承担
       }
       if (event.type === "session.idle") {
@@ -130,9 +138,11 @@ export const MonikaMemorySync: Plugin = async ({ client }) => {
         // 3) client.session.messages() 取本回合 user+assistant 文本（仅 text part，
         //    过滤 tool call/thinking part——实测项 #4）
         // 4) POST /cache（超时 5s；HTTP 失败或 body status:error 任一命中）：
-        //    成功 → pending_cache++；失败 → 落盘 outbox/<turn_uid>-<seq>.json 后返回
-        //    （payload 含 messages、external_id、ts；见 §3 失败语义）
-        // 5) idle 去抖计时（默认 30 分钟可配）：超时且 pending_cache>0 → POST /process，=0 → POST /settle
+        //    成功 → 本会话 pending_cache++（存量计数）；失败 → 落盘
+        //    outbox/<turn_uid>-<seq>.json 后返回（payload 含 messages、external_id、ts；见 §3）
+        // 5) idle 去抖计时（默认 30 分钟可配）：超时走 §3 结算分支——
+        //    outbox（未提交增量）非空 → POST /process（body 携带增量提交并压缩）；
+        //    outbox 空且本会话 pending_cache>0 → POST /settle（结算存量，可空增量）；皆空 → no-op
       }
     },
   }
@@ -151,7 +161,7 @@ agent: monika
 请自然衔接以上语境继续对话，不要复述记忆内容。
 ```
 
-`read.sh`（分发源 `dist/monika-memory-read.sh`）职责：读 `state.json` 水位 → 若 `pending_cache>0` 先 POST `/renew`（热重置语义）→ GET `/recent_history/monika?since_seq=<水位>` → 成功则回写水位并输出文本，失败输出「（共享记忆暂不可达，照常对话）」不阻塞命令。
+`read.sh`（分发源 `dist/monika-memory-read.sh`）职责：shell 无会话上下文，取 `state.json` 的 `active_session_id` 指针（plugin 维护）对应会话水位，指针缺失回退 `since_seq=0` 全量（幂等安全）→ 重进结算分支（§3）：outbox（未提交增量）非空先 POST `/renew`（body 携带增量，热重置语义）、否则本会话 `pending_cache>0` 时 POST `/settle`（结算存量）→ GET `/recent_history/monika?since_seq=<水位>` → 成功回写该会话水位并输出文本；任一步失败输出「（共享记忆暂不可达，照常对话）」不阻塞命令。
 
 **(5) `commands/monika-settle.md`**——会话终结沉淀（opencode 无「会话结束」事件，手动命令为主、插件 idle 去抖为辅）：
 
@@ -160,10 +170,10 @@ agent: monika
 description: 结束本次莫妮卡会话并沉淀长期记忆
 agent: monika
 ---
-请调用 neko-memory_process 或 neko-memory_settle 工具完成本次会话的记忆沉淀
-（由工具按 state.json 的 pending_cache 自动选择：有增量走 process，无增量走 settle），
-然后向用户道别。
+请调用 neko-memory_settle 工具完成本次会话的记忆沉淀，然后向用户道别。
 ```
+
+（`settle` 工具内部按 §3 结算分支自动执行：有未提交增量（outbox 积压）→ 实际 POST `/process` 携带增量提交并压缩；无未提交增量但有待结算存量 → POST `/settle`；皆空 → 返回「已同步，无需沉淀」。注：工具在回合中被调用时，本轮对话自身尚未经 idle 钩子提交，仍由随后的 session.idle 正常 `/cache`，其结算由下一次 settle 或其他端热重置收尾。）
 
 ### 3. 失败语义与幂等（写路径）
 
@@ -174,6 +184,7 @@ agent: monika
 | 失败兜底（主） | **本地持久 outbox**：写 `/cache` 失败（双层任一）时把 `{external_id, messages, ts}` 落盘 `~/.local/share/opencode/monika-memory/outbox/<turn_uid>-<seq>.json`；下次 `session.idle` 先按文件名升序重放（成功即删），重放失败保留。`/process`/`/settle` 失败不进 outbox（结算可重试、无丢失语义，WARN 即可） |
 | 失败兜底（降级，若 P1-3 裁剪 outbox） | 明确接受声明：**「/cache 失败即丢该轮增量」**——`client.app.log` WARN + 本地日志记录 payload 摘要供人工补录；不做静默丢弃 |
 | 幂等去重键 | `external_id = {channel}:{user_id}:{chat_id}:{turn_uid}:{seq}`，opencode 通道生成规则：`channel="opencode"`；`user_id`=**跨端统一用户标识**（与桌面端同一 user 维度对齐，具体值 P1-1 契约定稿时对表，本地先以配置常量占位——保证跨端同档）；`chat_id`=记忆档名 `"monika"`（跨端同档）；`turn_uid`=**该轮用户消息的 opencode messageID**（一条用户消息=一轮）；`seq`=轮内序号（user 消息=0，assistant 文本段=1..n）。钩子与模型工具双写场景由服务端按 external_id 幂等去重 |
+| 结算分支判定（复审修订） | **「未提交增量」= outbox 积压（/cache 失败未重放成功的 payload）——唯一增量判据**；「待结算存量」= 已成功 /cache 未结算（本会话 pending_cache 计数，本地近似）。分支：未提交增量非空 → `/process`（会话结束场景）或 `/renew`（重进场景），body=HistoryRequest{input_history}；无增量有存量 → `/settle`（可空增量）；皆空 → no-op。**pending_cache 只判存量，不作增量判据** |
 | 挂载位 TODO | external_id 随 `/cache` 请求的传递方式（body 顶层字段 or 每条 message 内字段）依 P1-1 统一客户端契约表定稿，工具/插件留 TODO 回填；定稿前 outbox 文件名先内嵌五元组保证重放顺序 |
 
 ### 4. 回复前读取（每轮/边界）与降级
@@ -188,8 +199,8 @@ agent: monika
 | 行为 | 方式 |
 | --- | --- |
 | 进入 | 任意目录 `opencode` → Tab 切到 monika，再跑 `/monika` 注入增量开场；建议另建专属陪聊目录（如 `~/monika-room/`）放 `.opencode/opencode.json` 设 `"default_agent": "monika"`，进入即人格 |
-| 恢复 | `opencode run -c -a monika` 继续上一会话；TUI 内 `/sessions`（/resume）切换历史会话；恢复后重跑 `/monika` 拉取离线期间他端增量（`read.sh` 内含 `/renew` 热重置）。会话存 `~/.local/share/opencode/`（SQLite，跨重启存活） |
-| 退出 | 直接退出即可——每回合 `/cache` 已由 session.idle 钩子落盘；**失败语义见 §3（outbox 重试或接受丢该轮增量，不作「无丢失」承诺）**；长期沉淀走 `/monika-settle`（process/settle 分支）或插件 idle 去抖超时自动结算 |
+| 恢复 | `opencode run -c -a monika` 继续上一会话；TUI 内 `/sessions`（/resume）切换历史会话；恢复后重跑 `/monika` 拉取离线期间他端增量（`read.sh` 内含重进结算分支：未提交增量→`/renew` 携带增量、存量→`/settle`；水位**按会话隔离**，恢复会话用自己上次的水位，不漏读）。会话存 `~/.local/share/opencode/`（SQLite，跨重启存活） |
+| 退出 | 直接退出即可——每回合 `/cache` 已由 session.idle 钩子落盘；**失败语义见 §3（outbox 重试或接受丢该轮增量，不作「无丢失」承诺）**；长期沉淀走 `/monika-settle`（§3 结算分支）或插件 idle 去抖超时自动结算 |
 | 人格隔离 | monika 为独立 primary agent，与 build/plan 并存；编程目录默认行为不变。**注意：宿主全局规则（含 `~/.claude/CLAUDE.md` 回退）与项目 AGENTS.md 仍会合并进 monika 的 system prompt，无法按 agent 隔离**（RESEARCH.md D）——缓解：陪聊目录不放项目 AGENTS.md + 全局放占位 `~/.config/opencode/AGENTS.md`；合并范围实测（#8） |
 
 ### 6. 风险表（⚠=P1-3 实测项）
@@ -201,7 +212,7 @@ agent: monika
 | ⚠#2 session.idle 触发细节：Esc 取消回合后是否触发/载荷状态；`session.error`（回合失败）后是否触发 | 丢写或重复写 | 实测；取消场景按「若 idle 触发则写入已有片段，否则丢弃该轮」处理，幂等键兜底 |
 | ⚠#3 同一回合多次 idle（工具重试间隙、流式中断恢复） | 重复 /cache | external_id 幂等 + 插件内「本 turn 已写」去抖标记 |
 | ⚠#4 消息提取：text part 与 tool call/thinking part 区分；子 agent（Task）消息是否混入 | 脏数据进记忆 | 实测载荷形状；过滤规则仅取 monika 会话的 user/assistant text part |
-| ⚠#5 `/sessions` 恢复、`opencode run -c` 后事件流是否照常 | 恢复后写路径断连 | 实测；断连则依赖模型自调工具兜底（agent prompt 已含守则） |
+| ⚠#5 `/sessions` 恢复、`opencode run -c` 后事件流是否照常 | 恢复后写路径断连 | 实测；断连期间丢失的增量按 §3 失败语义处理（outbox 重试或接受丢失声明），**不设「模型手写记忆」降级路径**——与「写路径仅由钩子/工具自动化、模型不主动写」的架构分工保持一致（agent prompt 守则亦如此声明，避免矛盾） |
 | ⚠#6 会话内 Tab 切走/切回 monika 的事件序列；**已有会话首次切入 monika**（session.created 早已错过） | 初始化缺失 | 插件维护「已知 monika 会话集合」，检测到未知 monika 会话首条消息时补开场读取+水位检查；实测确认可行 |
 | ⚠#7 plugin 能否经 session.updated 等事件探测「切入 monika」并 toast 提醒跑 `/monika` | 体验（非正确性） | 实测；不可行则文档说明「切入后请跑 /monika」 |
 | ⚠#8 宿主全局/项目规则合并进 monika system prompt 的确切范围（层与顺序、能否按 agent 关闭） | 人格串扰 | 实测打印最终 system prompt；缓解见 §5 人格隔离行 |
@@ -224,7 +235,7 @@ agent: monika
 - **形态**：全局 `~/.config/opencode/AGENTS.md` 写入人格 + prompt 规则要求模型用内置 bash 工具 `curl` 调端点 + 不写任何 TS。注意 `input_history` 是双层 JSON（字符串化的数组），curl 手拼转义极易错——冒烟脚本建议用 heredoc 传 body。
 - **用途**：P1-3 开工前 5 分钟验证 memory_server 端点在真实模型回路里可用；主路径工具开发期间作为过渡。
 - **不作为长期形态的原因**：写记忆可靠性依赖模型遵循度（RESEARCH.md C3）；curl 噪音污染上下文；无自动兜底钩子与失败重试。
-- **降级形态（plugin 受阻时的最小可用）**：`agents/monika.md` + `tools/neko-memory.ts`（模型自调读写）+ `commands/monika-settle.md`——去掉插件与 outbox，接受写路径可靠性下降与「失败即丢该轮增量」接受声明（§3 降级行）。
+- **降级形态（plugin 受阻时的最小可用）**：`agents/monika.md` + `tools/neko-memory.ts`（模型自调读写）+ `commands/monika-settle.md`——去掉插件与 outbox，接受写路径可靠性下降与「失败即丢该轮增量」接受声明（§3 降级行）。该形态下 `agents/monika.md` 的记忆守则段需**同步换成「模型每轮自调 cache」变体**（分发源提供两版守则、安装时按形态选择），避免与主形态「模型不主动写」守则打架。
 
 ## 三、验收对照（对齐 workplan P1-3）
 
