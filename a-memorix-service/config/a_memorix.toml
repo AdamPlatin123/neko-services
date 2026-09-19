@@ -1,0 +1,52 @@
+# a-memorix-service 自有配置（P0-1 第一阶段最小骨架）
+# 语义对应 MaiBot bot_config.toml 的 [a_memorix] 节 + model_config 的最小面。
+# 真实生效键清单见 A_memorix/CONFIG_REFERENCE.md；完整字段在 P0-1b 阶段随 SDKMemoryKernel 纯 dict 注入补齐。
+
+[a_memorix.plugin]
+enabled = true
+
+[a_memorix.integration]
+enable_memory = true
+enable_memory_filter = true
+
+[a_memorix.storage]
+data_dir = ""   # 留空 = 内核默认（plugin_root 下 data/a-memorix）
+
+[a_memorix.embedding]
+model_name = "auto"
+
+# ---- 模型面（宿主 model_config 的最小替身）----
+# providers/models/tasks 的完整 schema 见 MaiBot src/config/model_configs.py；
+# P0-1b 接真实 LLM/embedding 出口时此节替换为服务自有模型配置。
+
+[model]
+
+[[model.api_providers]]
+name = "default"
+base_url = ""
+api_key = ""
+client_type = "openai"
+
+[[model.models]]
+name = "default"
+model_identifier = ""
+api_provider = "default"
+
+[model.tasks.embedding]
+model_list = []
+max_tokens = 4096
+temperature = 0.3
+
+[model.tasks.memory]
+model_list = []
+max_tokens = 4096
+temperature = 0.3
+
+[model.tasks.utils]
+model_list = []
+max_tokens = 4096
+temperature = 0.3
+
+[bot]
+nickname = "N.E.K.O"
+personality = ""
