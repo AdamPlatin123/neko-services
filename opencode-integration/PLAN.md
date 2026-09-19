@@ -244,3 +244,22 @@ agent: monika
 1. **opencode 会话人格生效**：Tab 切到 monika 后 OOC 五规则/输出通道/昵称称呼符合三件套；`opencode run -c -a monika` 恢复会话人格连续；实测 #8 确认宿主规则合并未破坏人格。
 2. **跨端语境延续**：QQ 端说的事实 → opencode `/monika` 开场注入增量后自然知晓；opencode 端说的 → 桌面端能 recall（读路径经 query_memory/增量注入）；注入失败（杀 memory_server）时 outbox 重放恢复，无重复条目（external_id 幂等验证）。
 3. **进入/恢复/退出行为文档化**：本文件 §5 表格为初稿，P1-3 实测后定稿入 `opencode-integration/` 随仓库。
+
+## 四、P1-3 实施结果增补（2026-09-20，实测证据见 `TESTLOG.md`）
+
+- **⚠#1-#5、#8、#9 已实测定型**（opencode 1.18.31）：`session.idle` 载荷只有 `{sessionID}`——
+  agent 判定主判据改为 **session.updated 的 info.agent**（运行时载荷实测含 agent，SDK 类型未标）；
+  回合失败后 idle 仍触发且错误路径可双触发（last_turn_id 去抖已验证）；消息模型为分离式
+  UserMessage/AssistantMessage（提取规则见 TESTLOG ⚠#4）；`run -c` 恢复后事件流/写路径正常；
+  宿主 `~/.claude/CLAUDE.md` 泄漏实测「无占位 3 处 / 有占位 0 处」——AGENTS.md 占位必要且有效。
+- **⚠#6 部分**：CLI 等价路径（`-c --agent monika` 已有会话切 agent）通过；TUI Tab 切换留 P2-3 人工验收。
+- **⚠#7 未实施**（体验项、非依赖，按 §4 原案文档化「切入后请跑 /monika」）。
+- **read.sh 定位优先级调换（有据偏差）**：`active_session_id` 指针**优先**、`opencode session list`
+  兜底——指针在 monika 会话每条消息上刷新（/monika 命令自身即刷新、时序新鲜、agent 专属），
+  而 session list 为 agent 盲（同目录编程会话实测会抢定位）。原稿方向相反，以实测为准。
+- **dist/ 布局镜像安装布局**（相对导入可直接在仓库内成立）：`dist/monika-memory/{lib.ts,read.sh}`
+  （原稿两文件平铺于 dist/ 根，安装目标不变）；tools/plugins 经 `../monika-memory/lib.ts` 共享库。
+- **超时按 P1-1 契约表**：cache/recent/query=5s，process/renew/settle=30s（原稿统一 5s，以
+  contract.py SUGGESTED_TIMEOUTS 为准）。
+- 端到端联调（真 memory_server）留 P2-3；本轮以 `test/mock-memory-server.ts` 替身完成全链路
+  验证（人格/读工具/写钩子/非 monika 隔离/outbox 重放/水位），证据见 TESTLOG.md。
