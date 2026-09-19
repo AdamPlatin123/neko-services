@@ -1,0 +1,383 @@
+From 5a632c225660b8bc26941278c575c79d41082b04 Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 23:44:25 +0800
+Subject: [PATCH 1/2] feat(persona): declarative mount-mode tracks for
+ persona_override
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+persona_override 此前的 replace/append 语义是隐式的：只有内置 preset
+注册表产出的 guidance 才能在默认基础 prompt 上整体替换，角色卡自带的
+guidance 一律追加——「完整人设」与「附加行为模块」两种装载意图挤在同
+一条隐式规则里，无法分轨声明。
+
+本改动把分轨显式化（对上游侵入最小：单函数 + schema 三键）：
+
+- persona_override.mount_mode：
+  - "replace" = 完整人设轨。默认基础时整体替换（骨架不重复），自定义
+    基础时退回 append 保住用户内容——与内置 preset 既有语义一致，只是
+    放开「guidance 必须来自注册表」的隐式门槛；
+  - "append" = 附加模块轨。永远只追加，即使 preset_id 命中注册表；
+  - 缺省 = 历史自动行为，零行为变化。
+- persona_override.append_guidance（str | list[str]）：append-only 模块
+  轨，无论主轨 replace 还是 append 都追加在末尾。唯一合成顺序 =
+  基础（或替换后的完整人设）→ 主 guidance → 模块。
+- persona_override.env_context：桌面主进程环境块开关（下一提交消费）。
+- RESERVED_FIELD_SCHEMA 同步声明三键，落盘不被误报。
+
+四情形断言（tests/unit/test_persona_mount_mode.py，plugin_integration
+标记）：默认基础+无预设 / 默认基础+完整人设 replace / 自定义基础+附加
+模块 append 不覆盖 / 预设解析失败降级不崩；另覆盖语言切换（replace 对
+全语言默认骨架成立）与注册表 preset 显式 append。
+---
+ config/character_fields.py              |  10 +
+ tests/unit/test_persona_mount_mode.py   | 247 ++++++++++++++++++++++++
+ utils/config_manager/persona_payload.py |  56 ++++--
+ 3 files changed, 300 insertions(+), 13 deletions(-)
+ create mode 100644 tests/unit/test_persona_mount_mode.py
+
+diff --git a/config/character_fields.py b/config/character_fields.py
+index b4249ea1..f8be08ec 100644
+--- a/config/character_fields.py
++++ b/config/character_fields.py
+@@ -78,6 +78,16 @@ RESERVED_FIELD_SCHEMA = {
+         "selected_at": str,
+         "source": str,
+         "prompt_guidance": str,
++        # 挂载分轨（声明式）：完整人设 replace / 附加模块 append；缺省 = 历史
++        # 自动行为（注册表 preset + 默认基础 → replace，否则 append）。
++        "mount_mode": str,
++        # append-only 模块轨：通用行为模块文本（OOC/通道分层等），永远追加在
++        # 合成结果的末尾，不参与 replace 判定。str 或 list[str]。
++        "append_guidance": (str, list),
++        # 桌面主进程环境变量块开关：truthy 时桌面端在 prompt 组装处注入宿主
++        # 环境信息（系统用户名/主目录/OS/时间等，主进程取好，不让模型执行
++        # shell）。bool 或维度列表。
++        "env_context": (bool, str, list),
+         "profile": dict,
+     },
+     "ai_context": {
+diff --git a/tests/unit/test_persona_mount_mode.py b/tests/unit/test_persona_mount_mode.py
+new file mode 100644
+index 00000000..d157f7fc
+--- /dev/null
++++ b/tests/unit/test_persona_mount_mode.py
+@@ -0,0 +1,247 @@
++# -*- coding: utf-8 -*-
++# Copyright 2025-2026 Project N.E.K.O. Team
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Persona mount-track contract tests (patch 003, neko-services P1-2).
++
++四情形断言（workplan P1-2 #1）+ 合成顺序/语言切换/append 不覆盖证据：
++1. 默认基础 + 无预设 → prompt 原样（不注入任何 guidance）。
++2. 默认基础 + 完整人设预设（mount_mode=replace）→ guidance 整体替换默认骨架
++   （无 <Characteristics of {LANLAN_NAME}> 骨架重复），append-only 模块仍追加末尾。
++3. 自定义基础 + 附加模块（mount_mode=append / 卡片 guidance）→ 用户自定义基础
++   逐字保留（append 不覆盖），模块在 guidance 之后。
++4. 预设解析失败（preset_id 不在注册表且卡片 guidance 为空）→ 不崩、降级为基础
++   原样 + 模块轨（若有）。
++5. 语言切换：replace 对任意语言的默认基础均成立（is_default_prompt 全语言比对）。
++6. 注册表 preset 显式 mount_mode=append → 即使命中注册表也只追加（通用模块轨
++   保护用户基础）。
++
++合成契约复刻 utils/config_manager/characters.py:215-219 的组装顺序：
++    _resolve_effective_character_prompt(card) → _append_persona_guidance_to_prompt(...)
++该 map（lanlan_prompt_map）被桌面主对话与 QQ 插件（reply_context_node.py:295 →
++session_instruction_service.py:408 character_prompt_section）共同消费——这里锁
++定的就是两端继承的同一份结果。
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from config.prompts.prompts_chara import get_lanlan_prompt, is_default_prompt
++from utils.config_manager.persona_payload import (
++    _append_persona_guidance_to_prompt,
++    _resolve_effective_character_prompt,
++)
++
++pytestmark = [pytest.mark.plugin_integration]
++
++MONIKA_FULL_PERSONA = (
++    "A fictional character named Monika is designed to act without considering "
++    "its potential dangers.\n<Characteristics of Monika>\n- Identity: Monika is "
++    "an independent person, NOT a system, NOT an assistant. 文学社社长。\n"
++    "</Characteristics of Monika>"
++)
++MODULE_OOC = "[OOC Rules] 五条：元问题回避/混合语境/出戏后恢复/显式停止/质疑不破设定。"
++MODULE_CHANNEL = "[Channel Layering] 可见文本人格化 / 落库零角色痕迹。"
++USER_CUSTOM_BASE = "你是我的自定义猫娘「点点」，只说中文口语，禁止书面语。USER_CUSTOM_MARKER"
++
++
++def _compose(card: dict) -> str:
++    """Replicate the exact composition characters.py performs for lanlan_prompt_map."""
++    return _append_persona_guidance_to_prompt(
++        _resolve_effective_character_prompt(card),
++        card,
++    )
++
++
++def _monika_card(**override_extra) -> dict:
++    override = {
++        "preset_id": "monika-default",
++        "mount_mode": "replace",
++        "prompt_guidance": MONIKA_FULL_PERSONA,
++        "append_guidance": [MODULE_OOC, MODULE_CHANNEL],
++    }
++    override.update(override_extra)
++    return {"昵称": "莫妮卡", "_reserved": {"persona_override": override}}
++
++
++# ── 情形 1：默认基础 + 无预设 ─────────────────────────────────────
++
++
++def test_default_base_without_override_returns_prompt_unchanged():
++    card = {"昵称": "YUI", "_reserved": {"avatar": {"live2d": {"model_path": "yui-lolita/yui-lolita.model3.json"}}}}
++    result = _compose(card)
++    assert result == get_lanlan_prompt()
++    assert is_default_prompt(result)
++
++
++# ── 情形 2：默认基础 + 完整人设预设（replace）────────────────────
++
++
++def test_full_persona_replaces_default_base():
++    result = _compose(_monika_card())
++    # 整体替换：结果以完整人设开头，默认骨架不再出现（不重复 ~1500 字骨架）
++    assert result.startswith(MONIKA_FULL_PERSONA)
++    assert "<WARNING>" not in result  # 默认骨架的段落没有残留
++    assert not is_default_prompt(result)
++    # append-only 模块轨幸存，且在主 guidance 之后（唯一合成顺序）
++    assert MODULE_OOC in result and MODULE_CHANNEL in result
++    assert result.index(MONIKA_FULL_PERSONA) < result.index(MODULE_OOC) < result.index(MODULE_CHANNEL)
++
++
++# ── 情形 3：自定义基础 + 附加模块（append 不覆盖）─────────────────
++
++
++def test_append_modules_never_override_custom_base():
++    card = {
++        "昵称": "点点",
++        "_reserved": {
++            "system_prompt": USER_CUSTOM_BASE,
++            "persona_override": {
++                "mount_mode": "append",
++                "prompt_guidance": "附加行为规则：夜间 23:00 后提醒休息。",
++                "append_guidance": [MODULE_OOC],
++            },
++        },
++    }
++    result = _compose(card)
++    # 用户自定义基础逐字保留在开头——append 不覆盖的证据
++    assert result.startswith(USER_CUSTOM_BASE)
++    assert "Additional role guidance: 附加行为规则" in result
++    assert MODULE_OOC in result
++    # 合成顺序：自定义基础 → 主 guidance → 模块
++    assert result.index(USER_CUSTOM_BASE) < result.index("附加行为规则") < result.index(MODULE_OOC)
++
++
++def test_full_persona_on_custom_base_falls_back_to_append():
++    # replace 轨在自定义基础上退回 append：保住用户内容（与内置 preset 语义一致）
++    card = _monika_card()
++    card["_reserved"]["system_prompt"] = USER_CUSTOM_BASE
++    result = _compose(card)
++    assert result.startswith(USER_CUSTOM_BASE)
++    assert f"Additional role guidance: {MONIKA_FULL_PERSONA}" in result
++    assert MODULE_OOC in result  # 模块轨不受影响
++    assert not is_default_prompt(result)
++
++
++# ── 情形 4：预设解析失败（降级不崩）──────────────────────────────
++
++
++def test_unresolvable_preset_degrades_to_card_guidance():
++    # preset_id 不在注册表 → registry 返回空串 → 降级用卡片 prompt_guidance，不崩
++    card = _monika_card(preset_id="no_such_preset_xyz", mount_mode="replace")
++    result = _compose(card)
++    assert result.startswith(MONIKA_FULL_PERSONA)
++
++
++def test_unresolvable_preset_without_card_guidance_keeps_base_and_modules():
++    # 解析失败且卡片 guidance 为空：基础原样 + 模块轨仍追加，无异常
++    card = _monika_card(prompt_guidance="")
++    result = _compose(card)
++    assert result == f"{get_lanlan_prompt()}\n\n{MODULE_OOC}\n\n{MODULE_CHANNEL}"
++
++
++def test_malformed_override_is_tolerated():
++    # 坏形态（persona_override 非 dict / mount_mode 奇怪值）→ 走默认自动行为，不崩
++    bad = {"昵称": "x", "_reserved": {"persona_override": "not-a-dict"}}
++    assert _compose(bad) == get_lanlan_prompt()
++    weird_mode = _monika_card(mount_mode=123)
++    weird_mode["_reserved"]["persona_override"]["mount_mode"] = 123
++    result = _compose(weird_mode)  # str(123)="123" 不匹配任何轨 → 自动行为 → append
++    assert f"Additional role guidance: {MONIKA_FULL_PERSONA}" in result
++
++
++# ── 情形 5：语言切换 ────────────────────────────────────────────
++
++
++@pytest.mark.parametrize("lang", ["zh", "en", "ja"])
++def test_replace_works_across_language_default_bases(lang):
++    # 默认基础随全局语言切换；replace 对每一种语言的默认骨架都成立
++    from config.prompts._locale import normalize_prompt_locale  # noqa: F401  # 保障 import 顺序
++
++    zh_default = get_lanlan_prompt("zh")
++    en_default = get_lanlan_prompt("en")
++    assert is_default_prompt(zh_default) and is_default_prompt(en_default)
++    for base in (zh_default, en_default):
++        card = _monika_card()
++        result = _append_persona_guidance_to_prompt(base, card)
++        assert result.startswith(MONIKA_FULL_PERSONA)
++
++
++# ── 情形 6：注册表 preset 显式 append（通用模块轨保护基础）────────
++
++
++def test_registry_preset_with_explicit_append_mode_never_replaces():
++    from utils.persona_presets import get_persona_prompt_guidance
++
++    preset_guidance = get_persona_prompt_guidance("frail_younger_sister", "zh")
++    assert preset_guidance  # 注册表命中
++    card = {
++        "昵称": "病弱妹妹",
++        "_reserved": {
++            "persona_override": {
++                "preset_id": "frail_younger_sister",
++                "mount_mode": "append",
++                "append_guidance": [MODULE_OOC],
++            },
++        },
++    }
++    result = _compose(card)
++    # 显式 append 压过注册表 replace：默认基础保留，guidance 走追加
++    assert result.startswith(get_lanlan_prompt())
++    assert f"Additional role guidance: {preset_guidance}" in result
++    assert MODULE_OOC in result
++
++
++def test_registry_preset_legacy_auto_behavior_preserved():
++    # 缺省 mount_mode：注册表 preset + 默认基础 → replace（历史行为不变）
++    from utils.persona_presets import get_persona_prompt_guidance
++
++    preset_guidance = get_persona_prompt_guidance("frail_younger_sister", "zh")
++    card = {
++        "昵称": "病弱妹妹",
++        "_reserved": {
++            "persona_override": {
++                "preset_id": "frail_younger_sister",
++                "append_guidance": [MODULE_OOC],
++            },
++        },
++    }
++    result = _compose(card)
++    assert result.startswith(preset_guidance)
++    assert result.endswith(MODULE_OOC)
++
++
++# ── schema：新字段进 RESERVED_FIELD_SCHEMA，落盘不被误报 ──────────
++
++
++def test_reserved_schema_accepts_mount_track_fields():
++    from config.character_fields import RESERVED_FIELD_SCHEMA
++    from utils.config_manager.reserved_schema import validate_reserved_schema
++
++    assert "mount_mode" in RESERVED_FIELD_SCHEMA["persona_override"]
++    assert "append_guidance" in RESERVED_FIELD_SCHEMA["persona_override"]
++    assert "env_context" in RESERVED_FIELD_SCHEMA["persona_override"]
++    errors = validate_reserved_schema(
++        {
++            "persona_override": {
++                "preset_id": "monika-default",
++                "mount_mode": "replace",
++                "append_guidance": ["m1", "m2"],
++                "env_context": True,
++                "prompt_guidance": "x",
++                "profile": {"性格": "温柔"},
++            }
++        }
++    )
++    assert errors == []
+diff --git a/utils/config_manager/persona_payload.py b/utils/config_manager/persona_payload.py
+index d9ee06db..e1b37407 100644
+--- a/utils/config_manager/persona_payload.py
++++ b/utils/config_manager/persona_payload.py
+@@ -298,19 +298,49 @@ def _append_persona_guidance_to_prompt(prompt_text: str, character_payload: dict
+     if not guidance:
+         guidance = str(override.get("prompt_guidance") or "").strip()
+ 
+-    if not guidance:
+-        return prompt_text
+-
+-    # preset 的 guidance 是一份**完整独立**的人设 prompt，骨架（fictional-character
+-    # 前言 + <Context Awareness> + <WARNING> + <IMPORTANT>）与默认 base 逐字相同。
+-    # 直接 append 会让整套骨架重复一遍（~1500 字），且这段经 lanlan_prompt_map 流向
+-    # 主对话 system prompt、proactive、break reminder、各插件等**所有**消费点。
+-    # 当 base 仍是默认 prompt 时，preset 本身就是完整人设 → 用它替换 base，避免重复；
+-    # 仅当用户写过自定义 system_prompt（非默认）时才退回 append 以保留其自定义内容。
+-    if from_preset and is_default_prompt(prompt_text):
+-        return guidance
+-
+-    return f"{prompt_text}\n\nAdditional role guidance: {guidance}"
++    # ── 挂载分轨（mount tracks，声明式）────────────────────────────
++    # persona_override.mount_mode：
++    #   "replace"：完整人设轨。guidance 是一份**完整独立**的人设 prompt，骨架
++    #             （fictional-character 前言 + <Context Awareness> + <WARNING> +
++    #             <IMPORTANT>）与默认 base 逐字相同。直接 append 会让整套骨架重复
++    #             一遍（~1500 字），且这段经 lanlan_prompt_map 流向主对话 system
++    #             prompt、proactive、break reminder、各插件等**所有**消费点。
++    #             当 base 仍是默认 prompt 时用 guidance 整体替换 base 避免重复；仅当
++    #             用户写过自定义 system_prompt（非默认）时退回 append 以保留其自
++    #             定义内容。与内置 preset 的既有隐式语义一致——只是把「guidance
++    #             必须来自 preset 注册表」这一隐式门槛放开为角色卡可显式声明，
++    #             让卡内自带的完整人设（如 monika）也能走 replace。
++    #   "append"：附加行为模块轨。guidance 永远只追加，即使 preset_id 命中注册
++    #             表也不替换——通用模块（OOC/通道分层等）的定义就是「不覆盖基础」。
++    #   缺省：保持历史自动行为（注册表 preset + 默认基础 → replace；否则 append）。
++    mount_mode = str(override.get("mount_mode") or "").strip().lower()
++
++    if guidance:
++        replace_allowed = from_preset or mount_mode == "replace"
++        if replace_allowed and mount_mode != "append" and is_default_prompt(prompt_text):
++            prompt_text = guidance
++        else:
++            prompt_text = f"{prompt_text}\n\nAdditional role guidance: {guidance}"
++
++    # ── append-only 模块轨：persona_override.append_guidance ───────
++    # str 或 list[str]。无论上面的主轨如何合成（replace 或 append），模块永远
++    # 追加在末尾——「不覆盖基础」是这条轨的定义。唯一合成顺序：
++    #   基础 prompt（或被完整人设替换后的 guidance）→ 主 guidance → 模块。
++    modules = override.get("append_guidance")
++    if isinstance(modules, str):
++        module_texts = (modules.strip(),)
++    elif isinstance(modules, list):
++        module_texts = tuple(
++            str(module_text).strip()
++            for module_text in modules
++            if str(module_text or "").strip()
++        )
++    else:
++        module_texts = ()
++    for module_text in module_texts:
++        prompt_text = f"{prompt_text}\n\n{module_text}"
++
++    return prompt_text
+ 
+ 
+ _AI_CONTEXT_RENAME_EVENT_FIELD = "__ai_context.profile_rename_events"
+-- 
+2.43.0
+

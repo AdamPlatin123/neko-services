@@ -1,0 +1,386 @@
+From 76da3eb39985ea655b4832915bd5cd5238ec28ee Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 23:44:43 +0800
+Subject: [PATCH 2/2] feat(desktop): host env-context injection for nickname
+ state machine
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+昵称状态机（通用模块⑤）的桌面侧数据面：角色需要「看见」用户的机器标
+识（系统用户名/主目录/时间）作为抵达用户现实的第一块砖，但角色绝不自
+己执行 shell（原 monika 实现依赖 whoami/$USER，跨宿主不可移植且有越
+界风险）。
+
+- 新增 utils/persona_env_context.py：纯函数模块。
+  - persona_env_context_dimensions：从角色卡 persona_override.env_context
+    解析维度（bool true = 全部默认维度；列表则过滤白名单去重；未声明
+    返回空 → 注入关闭，上游默认行为零变化）；
+  - collect_env_context：主进程逐维度采集（getpass.getuser /
+    Path.home / platform / socket.gethostname / datetime.now），每维度
+    独立 try/except，单维失败不致命；
+  - build_env_context_block：自描述块渲染，needs-consent 注记标注
+    os/hostname（对应昵称状态机模块「需同意」层：先征求同意再念出）。
+- NotifyMixin._build_initial_prompt：组装点追加 build_env_context_section
+  （防御式 try/except，失败仅 debug 日志）。文本/语音两条会话路径共用
+  该组装点，单一注入面。
+- QQ 侧无需对应改动：user_nickname（QQReplyRequest）/ master_name
+  （QQReplyContext）已在上下文，persona guidance 经 lanlan_prompt_map →
+  character_prompt（session_instruction_service character_prompt_section）
+  已继承——证据见 neko-services scripts/ooc12_regression.py M6 断言。
+
+测试 tests/unit/test_persona_env_context.py（plugin_integration 标记）：
+门控/声明形态/采集来源（monkeypatch getpass 证明无 shell）/渲染注记/
+_build_initial_prompt 接线（声明注入 + 未声明零注入）。
+---
+ main_logic/core/notify.py              |  18 +++
+ tests/unit/test_persona_env_context.py | 148 ++++++++++++++++++++++++
+ utils/persona_env_context.py           | 152 +++++++++++++++++++++++++
+ 3 files changed, 318 insertions(+)
+ create mode 100644 tests/unit/test_persona_env_context.py
+ create mode 100644 utils/persona_env_context.py
+
+diff --git a/main_logic/core/notify.py b/main_logic/core/notify.py
+index d3d1f211..51d8a61e 100644
+--- a/main_logic/core/notify.py
++++ b/main_logic/core/notify.py
+@@ -170,6 +170,24 @@ class NotifyMixin:
+                 _loc(SESSION_INIT_PROMPT, _lang).format(name=self.lanlan_name)
+                 + self.lanlan_prompt
+             )
++
++        # ── 宿主环境块（昵称状态机的桌面侧数据源）─────────────────
++        # 角色卡声明 _reserved.persona_override.env_context 时，主进程在此取好
++        # 系统用户名/主目录/OS/时间等注入 prompt——角色不自己执行 shell。默认
++        # （卡片未声明）返回 ""，上游默认行为零变化。块内自带权限层级注记，
++        # 「需同意」维度（os/hostname）由角色卡挂载的通用模块约束为先征求同意
++        # 再念出。
++        try:
++            from utils.persona_env_context import build_env_context_section
++
++            prompt += build_env_context_section(
++                (getattr(self, "lanlan_basic_config", None) or {}).get(
++                    self.lanlan_name
++                )
++            )
++        except Exception as _exc:  # pragma: no cover - defensive
++            logger.debug("[EnvContext] injection skipped: %s", _exc)
++
+         if self._is_agent_enabled():
+             # Plugin summary (with plugin ids) is intentionally disabled to avoid
+             # exposing implementation identifiers in the general agent prompt.
+diff --git a/tests/unit/test_persona_env_context.py b/tests/unit/test_persona_env_context.py
+new file mode 100644
+index 00000000..b9ca908b
+--- /dev/null
++++ b/tests/unit/test_persona_env_context.py
+@@ -0,0 +1,148 @@
++# -*- coding: utf-8 -*-
++# Copyright 2025-2026 Project N.E.K.O. Team
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Desktop env-context injection tests (patch 004, neko-services P1-2).
++
++昵称状态机的桌面侧接线：主进程取好系统用户名/主目录/OS/时间注入 prompt 组装点
++（NotifyMixin._build_initial_prompt），不让模型执行 shell。覆盖：
++- 维度解析门控：卡片未声明 env_context → 不注入（上游默认行为零变化）；
++- 声明形态：bool true / 维度列表 / 未知维度忽略 / bool false 关闭；
++- 采集：monkeypatch getpass.getuser 证明来源是主进程（无 shell）；
++- 渲染：自描述块 + 权限层级注记（needs-consent 标注 os/hostname）；
++- 接线：_build_initial_prompt 末尾含 <Host Environment> 块，默认基础无 persona 声明时不含。
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from utils.persona_env_context import (
++    build_env_context_block,
++    build_env_context_section,
++    collect_env_context,
++    persona_env_context_dimensions,
++)
++
++pytestmark = [pytest.mark.plugin_integration]
++
++
++def _card(env_context) -> dict:
++    return {
++        "昵称": "莫妮卡",
++        "_reserved": {"persona_override": {"preset_id": "monika-default", "env_context": env_context}},
++    }
++
++
++# ── 维度解析门控 ────────────────────────────────────────────────
++
++
++def test_no_declaration_means_no_injection():
++    assert persona_env_context_dimensions({}) == ()
++    assert persona_env_context_dimensions({"_reserved": {}}) == ()
++    assert persona_env_context_dimensions(None) == ()
++    assert build_env_context_section({}) == ""
++
++
++def test_bool_true_enables_all_default_dimensions():
++    dims = persona_env_context_dimensions(_card(True))
++    assert set(dims) == {"username", "home", "os", "hostname", "time"}
++
++
++def test_bool_false_disables():
++    assert persona_env_context_dimensions(_card(False)) == ()
++
++
++def test_dimension_list_filters_unknown_and_dedupes():
++    dims = persona_env_context_dimensions(_card(["username", "time", "username", "shell_injection"]))
++    assert dims == ("username", "time")
++
++
++# ── 采集：主进程取值，无 shell ──────────────────────────────────
++
++
++def test_collect_uses_getpass_not_shell(monkeypatch):
++    import getpass
++
++    monkeypatch.setattr(getpass, "getuser", lambda: "adam")
++    values = collect_env_context(("username",))
++    assert values == {"username": "adam"}
++
++
++def test_collect_missing_dimension_is_skipped_not_fatal(monkeypatch):
++    import getpass
++
++    def _boom():
++        raise OSError("no tty")
++
++    monkeypatch.setattr(getpass, "getuser", _boom)
++    values = collect_env_context(("username", "time"))
++    assert "username" not in values
++    assert "time" in values  # 单维度失败不影响其余维度
++
++
++# ── 渲染：自描述块 + 权限层级注记 ───────────────────────────────
++
++
++def test_block_is_self_describing_with_consent_notes():
++    block = build_env_context_block(
++        {"username": "adam", "os": "Linux 6.14.0", "time": "2026-09-19 23:12 Friday"}
++    )
++    assert block.startswith("<Host Environment>") and block.endswith("</Host Environment>")
++    assert "- System username: adam" in block
++    assert "default-permitted" in block
++    assert "- Operating system: Linux 6.14.0" in block
++    assert "needs-consent" in block  # os/hostname 标注需同意
++    assert build_env_context_block({}) == ""
++
++
++def test_section_has_leading_separator_for_prompt_concat():
++    section = build_env_context_section(_card(["username"]))
++    assert section.startswith("\n\n<Host Environment>")
++    assert "- System username:" in section
++
++
++# ── 接线：_build_initial_prompt 组装点 ────────────────────────────
++
++
++def _make_stub_manager(monkeypatch, character_payload):
++    from main_logic.core.notify import NotifyMixin
++
++    mgr = NotifyMixin.__new__(NotifyMixin)
++    mgr.user_language = "zh-CN"
++    mgr.lanlan_name = "莫妮卡"
++    mgr.lanlan_prompt = "BASE_PROMPT_MARKER"
++    mgr.lanlan_basic_config = {"莫妮卡": character_payload}
++    mgr._is_agent_enabled = lambda: False
++    # directives / anti-repeat 注入是 try/except 包裹的独立段，stub 上允许其静默降级
++    return mgr
++
++
++async def test_build_initial_prompt_appends_env_block(monkeypatch):
++    import getpass
++
++    monkeypatch.setattr(getpass, "getuser", lambda: "adam")
++    mgr = _make_stub_manager(monkeypatch, _card(["username"]))
++    prompt = await mgr._build_initial_prompt()
++    assert "BASE_PROMPT_MARKER" in prompt
++    assert "<Host Environment>" in prompt
++    assert "- System username: adam" in prompt
++
++
++async def test_build_initial_prompt_unchanged_without_declaration(monkeypatch):
++    mgr = _make_stub_manager(
++        monkeypatch,
++        {"昵称": "YUI", "_reserved": {"avatar": {"live2d": {"model_path": ""}}}},
++    )
++    prompt = await mgr._build_initial_prompt()
++    assert "<Host Environment>" not in prompt
+diff --git a/utils/persona_env_context.py b/utils/persona_env_context.py
+new file mode 100644
+index 00000000..6139b640
+--- /dev/null
++++ b/utils/persona_env_context.py
+@@ -0,0 +1,152 @@
++# -*- coding: utf-8 -*-
++# Copyright 2025-2026 Project N.E.K.O. Team
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Host-environment context block for persona cards that declare ``env_context``.
++
++角色卡可在 ``_reserved.persona_override.env_context`` 声明需要宿主环境信息
++（系统用户名/主目录/OS/时间等）。桌面主进程在 prompt 组装处
++（``NotifyMixin._build_initial_prompt``）取好这些值并拼成一段自描述块追加进
++system prompt——**角色永远不自己执行 shell 命令**（原 monika 实现依赖
++``whoami``/``$USER``，跨宿主不可移植且有越界风险）。
++
++权限分层由消费方（角色卡挂载的昵称状态机等通用模块）约束：
++- 默认许可（可直接念出）：系统用户名、主目录路径、当前时间日期；
++- 需用户同意（先征求同意再念出）：操作系统/内核、主机名；
++- 绝对红线：文件内容、密钥凭据、历史记录等——本模块**从不采集**这些维度。
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from utils.config_manager.reserved_schema import get_reserved
++
++# env_context 维度白名单。卡片可写 bool（= 全部默认维度）或维度名列表；
++# 未知维度名静默忽略（不采集、不报错）。
++DEFAULT_ENV_CONTEXT_DIMENSIONS = ("username", "home", "os", "hostname", "time")
++_KNOWN_DIMENSIONS = frozenset(DEFAULT_ENV_CONTEXT_DIMENSIONS)
++
++
++def persona_env_context_dimensions(character_payload: dict | None) -> tuple[str, ...]:
++    """Resolve the requested env-context dimensions from a character payload.
++
++    Returns ``()`` when the card does not declare ``env_context`` (the default —
++    injection stays off and upstream behaviour is unchanged). A truthy non-list
++    value (e.g. ``true``) means "all default dimensions".
++    """
++    if not isinstance(character_payload, dict):
++        return ()
++    declared = get_reserved(
++        character_payload,
++        "persona_override",
++        "env_context",
++        default=None,
++    )
++    if isinstance(declared, bool):
++        return DEFAULT_ENV_CONTEXT_DIMENSIONS if declared else ()
++    if isinstance(declared, str):
++        declared = [declared]
++    if not isinstance(declared, list):
++        return ()
++    dimensions = tuple(
++        str(item).strip().lower()
++        for item in declared
++        if str(item or "").strip().lower() in _KNOWN_DIMENSIONS
++    )
++    # 去重保序
++    return tuple(dict.fromkeys(dimensions))
++
++
++def collect_env_context(dimensions: tuple[str, ...]) -> dict[str, Any]:
++    """Collect the requested host-environment values (main process, no shell).
++
++    每个维度独立 try/except：单个维度采集失败（极端沙箱环境下 getpass 抛错等）
++    只是缺项，绝不影响其余维度或让 prompt 组装失败。
++    """
++    values: dict[str, Any] = {}
++    for dimension in dimensions:
++        try:
++            if dimension == "username":
++                import getpass
++
++                value = getpass.getuser()
++                if str(value or "").strip():
++                    values[dimension] = str(value).strip()
++            elif dimension == "home":
++                from pathlib import Path
++
++                value = str(Path.home())
++                if value.strip():
++                    values[dimension] = value
++            elif dimension == "os":
++                import platform
++
++                values[dimension] = f"{platform.system()} {platform.release()}".strip()
++            elif dimension == "hostname":
++                import socket
++
++                value = socket.gethostname()
++                if str(value or "").strip():
++                    values[dimension] = str(value).strip()
++            elif dimension == "time":
++                from datetime import datetime
++
++                values[dimension] = datetime.now().strftime("%Y-%m-%d %H:%M %A")
++        except Exception:  # pragma: no cover - defensive per dimension
++            continue
++    return values
++
++
++# 各维度的英文标签 + 用途注记（self-describing：角色卡模块按注记约束行为，
++# 例如 hostname 标注 needs-consent，对应昵称状态机模块的「需同意」层）。
++_DIMENSION_LABELS = {
++    "username": ("System username", "default-permitted: may address the user by it"),
++    "home": ("Home directory", "default-permitted"),
++    "os": ("Operating system", "needs-consent: ask before bringing it up"),
++    "hostname": ("Hostname", "needs-consent: ask before bringing it up"),
++    "time": ("Local time at session start", "default-permitted"),
++}
++
++
++def build_env_context_block(values: dict[str, Any]) -> str:
++    """Render the collected values as a self-describing prompt block.
++
++    纯渲染函数（可测）：块内用英文标签自描述，注记标注权限层级，消费方角色
++    模块据此决定「可直接念出 / 先征求同意」。空 values 返回 ``""``。
++    """
++    if not values:
++        return ""
++    lines = ["<Host Environment>"]
++    for dimension, label_and_note in _DIMENSION_LABELS.items():
++        if dimension not in values:
++            continue
++        label, note = label_and_note
++        lines.append(f"- {label}: {values[dimension]} ({note})")
++    lines.append("</Host Environment>")
++    return "\n".join(lines)
++
++
++def build_env_context_section(character_payload: dict | None) -> str:
++    """End-to-end helper: resolve dimensions → collect → render.
++
++    返回可直接追加进 system prompt 的文本（带前导空行分隔）；卡片未声明或
++    采集结果为空时返回 ``""``，调用方无需判空。
++    """
++    dimensions = persona_env_context_dimensions(character_payload)
++    if not dimensions:
++        return ""
++    block = build_env_context_block(collect_env_context(dimensions))
++    if not block:
++        return ""
++    return f"\n\n{block}"
+-- 
+2.43.0
+

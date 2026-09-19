@@ -2,7 +2,14 @@
 
 本目录存放对 N.E.K.O 子项目（默认位于本仓库的 `../N.E.K.O`）的**全部本地修改**，以 `git format-patch` 序列维护：可重放、可审计、可随基线升级迁移。基线 commit 与分叉姿态见 [BASELINE.md](BASELINE.md)。
 
-当前状态：**基线已锚定，0 个补丁**（所有对 N.E.K.O 的改动从本目录起步）。
+当前状态：**基线已锚定**。补丁清单（P1-2 分支带入 003/004；001/002 为 P1-1（L1 上游修复）预留序号，其分支合并后序号自然连续）：
+
+| 序号 | 补丁 | 来源任务 | 内容 |
+| --- | --- | --- | --- |
+| 003 | `003-persona-mount-mode.patch` | P1-2 #1 | persona_override 挂载分轨：声明式 `mount_mode`（完整人设 replace / 附加模块 append）+ `append_guidance` append-only 模块轨 + `env_context` 开关键 + 四情形断言测试 |
+| 004 | `004-desktop-env-injection.patch` | P1-2 #2 | 桌面昵称状态机数据面：主进程采集宿主环境（getpass/platform 等，无 shell）经 `utils/persona_env_context.py` 注入 `_build_initial_prompt`，未声明零注入 |
+
+> ⚠️ 在 001/002 落地前，`replay-patches.sh` 会因序号不连续（003 起始）拒绝整组重放——这是校验的预期行为。单独验证 003/004 可直接 `git am` 这两个文件到基线（P1-2 已在干净基线 worktree 上做过：双补丁干净应用 + 新增测试全绿 + OOC 回归 23/23）。
 
 ## 命名规范
 
