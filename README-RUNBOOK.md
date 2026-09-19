@@ -23,15 +23,28 @@ export NEKO_DATA_ROOT="$HOME/.local/share/N.E.K.O"
 
 ### 探测实际数据根（备份/排障前必做）
 
-默认路径会被两种机制改写：环境变量 `NEKO_STORAGE_SELECTED_ROOT`（storage_roots.py:94，launcher 可注入），以及已提交到磁盘的 storage policy（`<锚定根>/state/storage_policy.json`，首次启动后可能把运行根选定到别处）。所以**备份和排障前先探测实际根**，不要blindly用默认值：
+默认路径会被两种机制改写：环境变量 `NEKO_STORAGE_SELECTED_ROOT`（storage_roots.py:94，launcher / systemd unit 注入），以及已提交到磁盘的 storage policy（`<锚定根>/state/storage_policy.json`，首次启动后可能把运行根选定到别处）。所以**备份和排障前先探测实际根**，不要盲目用默认值。
+
+**⚠ 环境绑定陷阱**：服务实际用的根取决于**服务进程自己的环境**（systemd unit 的 `Environment=`、launcher 注入），这些变量不会传回你的终端——在你的 shell 里 `echo` 只能证明「终端没设」，不能代表服务。按下面顺序探测，越往后越接近服务视角的真实值：
 
 ```bash
-# 1. 先看是否被环境变量覆盖（非空即以它为准）
+# 0. 当前终端（仅当服务是你自己从终端手动拉起时才准确）
 echo "NEKO_STORAGE_SELECTED_ROOT=$NEKO_STORAGE_SELECTED_ROOT"
 
-# 2. 再问上游代码实际的 app_docs_dir（会综合 env + 已提交 policy 得出权威答案）
+# 1. systemd 场景：user manager 全局环境 + unit 自己声明的 Environment=
+systemctl --user show-environment | grep NEKO_STORAGE
+# unit 内 Environment= 行（unit 落盘后可用；unit 名以 systemd 节为准，示例：
+systemctl --user show neko-memory.service -p Environment
+
+# 2. 终极兜底：直接读运行中进程的真实环境（最权威；同用户无需 sudo）
+cat /proc/$(pgrep -f app.memory_server | head -1)/environ | tr '\0' '\n' | grep NEKO_STORAGE
+# 服务跑在其他用户下时：sudo cat /proc/$(pgrep -f app.memory_server | head -1)/environ | tr '\0' '\n' | grep NEKO_STORAGE
+
+# 3. 把查到的服务环境对齐到当前 shell（没查到就确认清空），再问上游代码权威根
+export NEKO_STORAGE_SELECTED_ROOT=<第1/2步查到的值>    # 服务确实设了才 export；否则 unset
 cd $NEKO_SRC && uv run python -c \
-  "from utils.config_manager import get_config_manager; print(get_config_manager().app_docs_dir)"
+  "from utils.config_manager import get_config_manager; print(get_config_manager(migrate=False).app_docs_dir)"
+# migrate=False = 只读解析路径、不触发任何数据迁移（上游 launcher 预启动路径即此用法，见 launcher_core/runtime.py:393）
 ```
 
 探测输出的路径若与 `$NEKO_DATA_ROOT` 不同，后续命令请以探测结果为准（重新 `export NEKO_DATA_ROOT=<探测结果>`）。
@@ -76,14 +89,13 @@ launcher 启动时对 48912/48915/48911 逐个探测（`launcher_core/runtime.py
 2. **三个默认端口上已是同一 instance_id 的完整 N.E.K.O 后端** → launcher **attach**（不重起服务，只起桌面 UI 复用现有后端）。
 3. **只有部分端口被 N.E.K.O 服务占用**（例如独立跑着的 memory_server，或 instance_id 不一致的一组服务）→ launcher **不补齐也不复用**：整套服务挪到回退端口、以新 INSTANCE_ID 另起一套 → **两套后端并存、记忆分裂**。这是最大的启动陷阱：想用 launcher 就让三个端口都空着；想复用就得保证三口同 instance（systemd 场景见下节）。
 
-### 语义顺序（谁先谁后为什么）
+### 启动顺序：拉起顺序与就绪顺序是两层（别说混）
 
-1. memory_server（48912）——先就绪，主进程 start_session 就要读 `/new_dialog`
-2. a-memorix-service（未来，P0-1 完成后生效）——检索层，晚于 memory、早于主进程
-3. 主服务（48911）与 agent 服务（48915）——插件服务器随之拉起 qq_auto_reply / wechat_integration
-4. NapCat——由 qq_auto_reply 插件自动拉起并守护，**永远不要手动先启 NapCat**
+**拉起顺序**（launcher 保证，只管「谁先被启动」）：memory(48912) → main(48911) → agent(48915)。多进程模式按此逐个 spawn，每个子进程只等「模块加载完成」（import 稳定，防低内存 OOM）就放行下一个，**不等它服务就绪**；合并模式三个服务并发拉起、无先后。a-memorix-service（未来，P0-1 完成后生效）应安排在 memory 之后、main 之前。NapCat 由 qq_auto_reply 插件自动拉起并守护，**永远不要手动先启 NapCat**。
 
-launcher 一条命令即保证上述顺序（多进程按序 spawn、merged 并发但统一校验就绪）。**不要**在 launcher 之外手动先起任何 N.E.K.O 服务（触发预检第 3 态分裂）；dev 调试单独起 `python -m app.memory_server` 时，同一时间不要跑 launcher。
+**整体就绪**（两种模式都是统一收口）：多进程在全部 spawn 后统一等端口+初始化完成（60s 超时），merged 统一健康检查（30s 超时）——它保证「全部就绪」这个终点，**不保证 memory 比 main 先就绪**。主进程依赖 memory 先行（start_session 读 `/new_dialog`）靠拉起顺序与启动耗时自然满足，健康检查只是终点门槛。
+
+**禁止零散启动单个服务**：在完整后端之外手动先起某个 N.E.K.O 服务，会把 launcher 推入预检第 3 态（整套换端口另起、记忆分裂）。合法例外：systemd 完整后端（三口共享同一 instance_id）本身就是 attach 复用的对象，不算零散启动；dev 调试单独起 `python -m app.memory_server` 时，同一时间不要跑 launcher。
 
 ### 停止顺序
 

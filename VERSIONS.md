@@ -37,10 +37,10 @@
 
 > 核心原则：**代码与数据必须同代**。新版进程一旦启动并写过记忆，回滚代码时数据不能沿用（旧代码读不懂新写入的格式），必须连数据备份一起恢复。这就是升级前必做备份的原因。
 
-### 第 1 步：升级前记录（三个 commit 一个都不能少）
+### 第 1 步：升级前记录三件套（缺一不可）
 
 ```bash
-# ① 上游基线（应与本表第 1 行一致）
+# ① 上游基线 commit（应与本表第 1 行一致）
 git -C /mnt/shared/_Projects/N.E.K.O/N.E.K.O log --oneline -1
 # ② 集成仓库 commit（决定「当时的补丁集合」——回滚时重放的是它，不是最新补丁）
 git -C $NEKO_SERVICES log --oneline -1
@@ -52,11 +52,13 @@ cat $NEKO_SERVICES/patches/neko/BASELINE.md    # p0-0-governance 分支合入后
 ### 第 2 步：探测实际数据根 + 停服务 + 备份
 
 ```bash
-# 先探测实际运行数据根（可能被 NEKO_STORAGE_SELECTED_ROOT 或 storage policy 改写，
-# 详见 runbook 第 0 节；探测结果若非默认值，重新 export NEKO_DATA_ROOT=<探测结果>）
-echo "NEKO_STORAGE_SELECTED_ROOT=$NEKO_STORAGE_SELECTED_ROOT"
+# 先探测实际运行数据根——注意环境绑定：服务的 NEKO_STORAGE_* 在它自己的进程环境里
+# （systemd unit Environment= / launcher 注入），不会传回你的终端。完整探测步骤
+# （systemctl show-environment / show -p Environment / /proc/<pid>/environ 兜底）
+# 见 runbook 第 0 节「探测实际数据根」，此处假设已按该节把服务环境对齐到当前 shell。
 cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O && uv run python -c \
-  "from utils.config_manager import get_config_manager; print(get_config_manager().app_docs_dir)"
+  "from utils.config_manager import get_config_manager; print(get_config_manager(migrate=False).app_docs_dir)"
+# migrate=False：只读解析路径，不触发迁移（此时即将停服备份，绝不能让探测写数据）
 
 systemctl --user stop neko.target    # 手动模式则停掉 launcher 进程
 mkdir -p $HOME/neko-backup
