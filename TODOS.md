@@ -39,3 +39,9 @@
 ## UC3-B 跟进项（F1 修复随分支重导）
 - P2：F3 ingest 在 sync connector 主循环 await（a-memorix 慢挂时卡会话边界 ~10s；默认 off；后续 fire-and-forget 化，external_id 幂等已铺路）
 - P3：F4 空库对齐 off-by-one（全新 recent.json 首条永不注入，010/002 同款，一次性无害）
+
+## UC3-A 跟进项（代审通过后遗留，均 P3）
+- /renew /settle 的 astore 失败 HTTP 可见性收窄（docstring 已披露，重试型调用方失去信号）
+- /settle 在 recent.json UNREADABLE 时跳过 time_indexed（行为收严，docstring 明示）
+- 并发双压缩 in-flight Event 提前置位（读态仍一致，等待语义弱化）
+- fuse 丢弃无 id 的 hybrid 行；/new_dialog 持锁内 a-memorix HTTP（≤1s 有界）；同步 count_tokens 在事件循环；turn_uid 需写入端保证全局唯一（契约注记）
