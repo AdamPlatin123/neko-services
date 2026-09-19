@@ -1,4 +1,4 @@
-From cc3f7a534b20a121cc7819e45fef91a9f8d36487 Mon Sep 17 00:00:00 2001
+From ce0f5a10d8cd9b33dd4854d97a896cf7b3f6f065 Mon Sep 17 00:00:00 2001
 From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
 Date: Sun, 20 Sep 2026 00:35:16 +0800
 Subject: [PATCH] =?UTF-8?q?feat(memory):=20settle=20=E6=88=90=E5=8A=9F?=
@@ -47,13 +47,13 @@ success:false 拦截/超时降级/默认 off 零调用/部分失败 WARN 不抛/
 空会话跳过/成功计数/接入点守门——renew+session_end 都挂钩子且带
 语言屏障 guard）；cross_server 相关回归 236 passed。
 ---
- main_logic/cross_server.py             | 202 ++++++++++++++++++
- tests/unit/test_amemorix_write_hook.py | 276 +++++++++++++++++++++++++
- 2 files changed, 478 insertions(+)
+ main_logic/cross_server.py             | 209 +++++++++++++++++++
+ tests/unit/test_amemorix_write_hook.py | 277 +++++++++++++++++++++++++
+ 2 files changed, 486 insertions(+)
  create mode 100644 tests/unit/test_amemorix_write_hook.py
 
 diff --git a/main_logic/cross_server.py b/main_logic/cross_server.py
-index 84a172f5..3da76a41 100644
+index 84a172f5..473a83bb 100644
 --- a/main_logic/cross_server.py
 +++ b/main_logic/cross_server.py
 @@ -22,6 +22,8 @@ Note that the cross server is a one-way forwarder and never sends anything back
@@ -65,7 +65,7 @@ index 84a172f5..3da76a41 100644
  import inspect
  from urllib.parse import quote
  
-@@ -639,6 +641,183 @@ async def _try_send_bytes(slot: _WSSlot | None, payload: bytes) -> bool:
+@@ -639,6 +641,190 @@ async def _try_send_bytes(slot: _WSSlot | None, payload: bytes) -> bool:
          return False
  
  
@@ -122,13 +122,20 @@ index 84a172f5..3da76a41 100644
 +    - user_id="adam"：**多用户预留维度的占位**（宪章 #6 / P0-0 #4）——MVP
 +      单用户，未来多用户化时用真实账号 id 替换，近零成本对冲；
 +    - chat_id=角色名：与 memory_server recent.json 的按角色分文件对齐；
-+    - turn_uid=块内容 sha256 前 8 hex：同内容重放得到同 external_id，幂等
-+      去重由 a-memorix 的外部幂等映射兜底（重复 settle 同 turn 不重复写）；
++    - turn_uid=块内容 sha256 前 16 hex（64 位）：同内容重放得到同
++      external_id，幂等去重由 a-memorix 的外部幂等映射兜底（重复 settle 同
++      turn 不重复写）。取 16 hex 而非更短：8 hex（32 位）在万块级（~9k 块）
++      就有 ~1% 生日碰撞概率，两条不同对话会坍缩成一条被误去重；64 位下
++      碰撞需要的块数（~6e8）远超任何会话规模，可忽略。
++      已知局限（有意接受）：内容哈希做幂等键意味着**同一会话内一字不差的
++      重复 turn 块会被坍缩为一条**（例如用户连发两次相同的话且角色回复也
++      相同——真实对话中整 turn 逐字重复极罕见）。重复本身的频次信息不进
++      a-memorix 索引；memory_server 事实源仍保留完整逐条记录。
 +    - seq：本钩子按 turn 块整体写入，恒 0；序号维度为未来 per-turn 近实时
 +      通知（/cache 后单条 ingest、seq 递增）预留——见 _ingest_chat_history_
 +      to_a_memorix 的决策注释。
 +    """
-+    content_hash = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8]
++    content_hash = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:16]
 +    return f"neko_desktop:adam:{lanlan_name}:{content_hash}:0"
 +
 +
@@ -249,7 +256,7 @@ index 84a172f5..3da76a41 100644
  async def _post_memory_server(
      endpoint: str,
      lanlan_name: str,
-@@ -1067,6 +1246,14 @@ async def run_sync_connector(
+@@ -1067,6 +1253,14 @@ async def run_sync_connector(
                                                  pass
                                      else:
                                          logger.info(f"[{lanlan_name}] 热重置记忆已成功上传到 memory_server ({_renew_endpoint})")
@@ -264,7 +271,7 @@ index 84a172f5..3da76a41 100644
                                  except RuntimeError as e:
                                      if "shutdown" in str(e).lower() or "closed" in str(e).lower():
                                          logger.info(f"[{lanlan_name}] 进程正在关闭，{_renew_endpoint}请求已取消")
-@@ -1440,6 +1627,21 @@ async def run_sync_connector(
+@@ -1440,6 +1634,21 @@ async def run_sync_connector(
                                                      pass
                                          else:
                                              logger.info(f"[{lanlan_name}] session end 记忆结算完成（{_settle_endpoint}），{len(_settle_payload)} 条消息")
@@ -288,10 +295,10 @@ index 84a172f5..3da76a41 100644
                                          if status_callback:
 diff --git a/tests/unit/test_amemorix_write_hook.py b/tests/unit/test_amemorix_write_hook.py
 new file mode 100644
-index 00000000..b92f3857
+index 00000000..cef99be2
 --- /dev/null
 +++ b/tests/unit/test_amemorix_write_hook.py
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,277 @@
 +# -*- coding: utf-8 -*-
 +"""a-memorix 写钩子的测试（p1-1 #9，UC1 转正后的检索索引写入）。
 +
@@ -390,7 +397,8 @@ index 00000000..b92f3857
 +    assert parts[0] == "neko_desktop", "channel 按会话来源=桌面主进程"
 +    assert parts[1] == "adam", "user_id 是多用户预留维度的占位（见函数注释）"
 +    assert parts[2] == _HER, "chat_id 与 recent.json 按角色分文件对齐"
-+    assert len(parts[3]) == 8 and all(c in "0123456789abcdef" for c in parts[3])
++    # 16 hex = 64 位内容哈希：万块级生日碰撞概率可忽略（8 hex 时 ~9k 块即 1%）
++    assert len(parts[3]) == 16 and all(c in "0123456789abcdef" for c in parts[3])
 +    assert parts[4] == "0", "整块写入 seq=0；序号维度为 per-turn 通知预留"
 +
 +

@@ -1,4 +1,4 @@
-From 48600a9d790c40d9c6482149703d8d3163ec2527 Mon Sep 17 00:00:00 2001
+From 6eb0a02a662e9690ffd50d6adcfeb5046691e741 Mon Sep 17 00:00:00 2001
 From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
 Date: Sun, 20 Sep 2026 00:32:20 +0800
 Subject: [PATCH] =?UTF-8?q?feat(desktop):=20=E6=B4=BB=E8=B7=83=E4=BC=9A?=
@@ -28,9 +28,13 @@ start_session 时取一次 /new_dialog（lifecycle 预取 task），之后既不
   按水位取增量、本会话回流消息按 (role, content) 过滤、失败降级
   水位不动、并发轮锁串行）。
 - main_logic/core/lifecycle.py：_create_offline_vlm_client 绑定回调；
-  _start_session_fetch_new_dialog 成功后复位对齐标志（new_dialog
-  全量基线在场 → 下一次回调先懒对齐；该函数是 new_dialog 唯一取用
-  通道，start_session 与 offline handoff 候选两条路径都覆盖）。
+  _reset_cross_context_alignment helper 统一复位对齐标志——new_dialog
+  共三处会话取用全部覆盖：_start_session_fetch_new_dialog（start_session
+  主路径 + offline handoff 候选共用）与 _background_prepare_pending_session
+  热切换直连（pending session 经 _create_offline_vlm_client 已带回调，
+  提升后首轮即增量注入——漏复位会把基线里已有跨端消息再注入一遍）；
+  proactive_chat/service.py 的第四处直连独立 prompt、无回调，无双重
+  注入面（注记在 helper docstring 防漏查）。
 - main_logic/core/manager.py：水位三字段（__init__，每会话独立）。
 
 已知偏差（有意）：realtime 音频会话不走该回调（音频直连 provider，
@@ -44,33 +48,58 @@ start_session 时取一次 /new_dialog（lifecycle 预取 task），之后既不
 stream_text 三层前缀顺序/无回调零回归/回调异常不吞轮次/基线复位×2）；
 相关回归 test_proactive_vision_screenshot_staging 等 162 passed。
 ---
- main_logic/core/lifecycle.py                  |  13 +
+ main_logic/core/lifecycle.py                  |  37 ++
  main_logic/core/manager.py                    |  10 +
  main_logic/core/streaming.py                  | 177 +++++++
  main_logic/omni_offline_client/_streaming.py  |  21 +
- .../test_desktop_cross_context_injection.py   | 432 ++++++++++++++++++
- 5 files changed, 653 insertions(+)
+ .../test_desktop_cross_context_injection.py   | 479 ++++++++++++++++++
+ 5 files changed, 724 insertions(+)
  create mode 100644 tests/unit/test_desktop_cross_context_injection.py
 
 diff --git a/main_logic/core/lifecycle.py b/main_logic/core/lifecycle.py
-index 68886ba1..1b217790 100644
+index 68886ba1..2f04e1c5 100644
 --- a/main_logic/core/lifecycle.py
 +++ b/main_logic/core/lifecycle.py
-@@ -1534,6 +1534,13 @@ class LifecycleMixin:
+@@ -1505,6 +1505,28 @@ class LifecycleMixin:
+             logger.warning("⚠️ TTS未就绪，当前回复将继续缓存，等待后续就绪信号")
+         return True
+ 
++    def _reset_cross_context_alignment(self) -> None:
++        """p1-1 1a-4：/new_dialog 全量基线到场 → 跨端增量水位需要重新对齐。
++
++        置 ``_cross_context_aligned=False`` 即可——对齐动作懒执行：下一次
++        ``_cross_context_refresh``（streaming mixin）发现未对齐时先取 next_seq、
++        不注入（此时注入即与 new_dialog 的 recent 段双重注入）。
++
++        调用约定：**凡是把 /new_dialog 全量基线拼进某个会话 prompt 的路径，
++        成功后必须调本 helper**，否则提升后的会话带着 stale aligned=True +
++        旧水位进入首轮，会把基线里已有的跨端消息再注入一遍（恰是本机制
++        要防的双重注入）。new_dialog 共四处取用：
++
++        1. ``_start_session_fetch_new_dialog``（start_session 主路径与 offline
++           handoff 候选 bootstrap 共用）——函数内已调；
++        2. ``_background_prepare_pending_session`` 的热切换直连（pending_session
++           经 ``_create_offline_vlm_client`` 已带 on_cross_context_refresh 回调，
++           提升后即走正常增量注入）——直连成功分支单独调；
++        3. proactive_chat/service.py 的主动搭话直连——独立 prompt、不绑回调，
++           无双重注入面，无需复位（注记在此防漏查）。
++        """
++        self._cross_context_aligned = False
++
+     def _new_dialog_request_kwargs(self) -> dict:
+         """Share explicit-locale provenance across initial and hot-swap bootstrap."""
+         request_kwargs = {"timeout": 5.0}
+@@ -1534,6 +1556,9 @@ class LifecycleMixin:
              raise ConnectionError(f"❌ 记忆服务连接失败: {e} (端口 {port})")
          if not resp.is_success:
              raise ConnectionError(f"❌ 记忆服务返回非2xx状态 {resp.status_code}: {resp.text[:200]}")
-+        # p1-1 1a-4：/new_dialog 全量基线即将注入本次会话（start_session 的
-+        # initial_prompt 或 offline handoff 候选的 bootstrap）——跨端增量水位
-+        # 需要重新对齐。对齐动作懒执行：下一次 _cross_context_refresh 发现
-+        # 未对齐时先取 next_seq、不注入（注入即与 new_dialog 的 recent 段双重
-+        # 注入）。放在这里而不是 start_session 主流程：本函数是 new_dialog 的
-+        # 唯一取用通道（两条路径都覆盖），成功即意味着"全量基线在场"。
-+        self._cross_context_aligned = False
++        # p1-1 1a-4：全量基线在场 → 复位对齐（四处取用清单与语义见
++        # _reset_cross_context_alignment）。
++        self._reset_cross_context_alignment()
          return resp.text
  
      def _create_offline_vlm_client(
-@@ -1573,6 +1580,12 @@ class LifecycleMixin:
+@@ -1573,6 +1598,12 @@ class LifecycleMixin:
              enable_long_response_summary=external_tts_enabled,
          )
          session.on_proactive_done = self.handle_proactive_complete
@@ -83,6 +112,19 @@ index 68886ba1..1b217790 100644
          session.on_thinking_active = self._make_thinking_active_callback(session)
          # 和两个 realtime 构造点同一处理：句柄绑到这个 client 自己，而不是
          # 构造时刻的 self.session。handoff candidate 在被提升前既不是
+@@ -2608,6 +2639,12 @@ class LifecycleMixin:
+                 raise ConnectionError(f"❌ 记忆服务响应超时！请检查记忆服务是否正常运行 (端口 {self.memory_server_port})")
+             if not resp.is_success:
+                 raise ConnectionError(f"❌ 记忆服务热切换时返回非2xx状态 {resp.status_code}: {resp.text[:200]}")
++            # p1-1 1a-4：热切换直连的 /new_dialog 全量基线即将拼进 pending_session
++            # 的 initial_prompt——pending 侧经 _create_offline_vlm_client 已带
++            # on_cross_context_refresh 回调，提升后首轮就走增量注入；不复位
++            # 对齐的话，stale 水位会把基线里已有的跨端消息再注入一遍
++            # （_reset_cross_context_alignment 的调用约定）。
++            self._reset_cross_context_alignment()
+             initial_prompt += (
+                 resp.text
+                 + self._convert_cache_to_str(next_session_context_messages)
 diff --git a/main_logic/core/manager.py b/main_logic/core/manager.py
 index c6ab9e7b..5dc198ea 100644
 --- a/main_logic/core/manager.py
@@ -330,10 +372,10 @@ index 4b7bbd12..473917ef 100644
          )
 diff --git a/tests/unit/test_desktop_cross_context_injection.py b/tests/unit/test_desktop_cross_context_injection.py
 new file mode 100644
-index 00000000..561be568
+index 00000000..13e14bf2
 --- /dev/null
 +++ b/tests/unit/test_desktop_cross_context_injection.py
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,479 @@
 +# -*- coding: utf-8 -*-
 +"""桌面跨端上下文每轮增量注入的测试（p1-1 1a-4，UC3 完整契约）。
 +
@@ -766,6 +808,53 @@ index 00000000..561be568
 +            await manager._start_session_fetch_new_dialog(_HER, _PORT)
 +
 +    assert manager._cross_context_aligned is True
++
++
++# ─────────────────── 5. pending/hot-swap 直连基线复位（F1）───────────
++
++
++def test_reset_helper_flips_flag_only():
++    """helper 只翻对齐标志、不动水位（对齐时才覆盖水位）。"""
++    manager = _make_manager()
++    manager._cross_context_aligned = True
++    manager._cross_context_next_seq = 42
++    manager._reset_cross_context_alignment()
++    assert manager._cross_context_aligned is False
++    assert manager._cross_context_next_seq == 42
++
++
++def test_fetch_new_dialog_delegates_to_reset_helper():
++    """fetch 路径必须走 helper 而非内联赋值（防回归到 010 首版的内联写法，
++    helper 是全部 new_dialog 取用点的唯一复位入口）。"""
++    source = _lifecycle_source()
++    assert "_reset_cross_context_alignment()" in source
++    # 正向断言：直接赋值只允许出现在 helper 定义内一处——fetch/热切换路径
++    # 都必须经 helper，防止回归到内联写法后新取用点再漏复位
++    direct_assigns = source.count("self._cross_context_aligned = False")
++    assert direct_assigns == 1, "直接赋值只允许出现在 helper 定义内"
++
++
++def test_hot_swap_pending_new_dialog_resets_alignment():
++    """热切换直连 /new_dialog 拼进 pending_session 的 initial_prompt——
++    pending 侧已带 on_cross_context_refresh 回调，直连成功后必须复位对齐，
++    否则提升后首轮带着 stale aligned=True + 旧水位把基线里已有的跨端消息
++    再注入一遍（恰是本机制要防的双重注入；F1 修复的守门）。"""
++    source = _lifecycle_source()
++    start = source.index("_background_prepare_pending_session")
++    zone = source[start:]
++    direct = zone[:zone.index("initial_prompt += (")]
++    assert "_reset_cross_context_alignment()" in direct, (
++        "热切换直连成功分支（resp.is_success 通过后、拼 initial_prompt 前）"
++        "必须复位跨端对齐"
++    )
++
++
++def _lifecycle_source() -> str:
++    path = os.path.join(
++        os.path.dirname(__file__), "..", "..", "main_logic", "core", "lifecycle.py",
++    )
++    with open(path, encoding="utf-8") as f:
++        return f.read()
 -- 
 2.43.0
 
