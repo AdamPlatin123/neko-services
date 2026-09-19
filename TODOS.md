@@ -35,3 +35,7 @@
 - off 时三条无条件 INFO 日志（投递完成/改写完成/缓冲确认）——高频群每 deliver 多两条
 - ChineseTypoGenerator 每块构造（21k pinyin 建表）——提升到模块级缓存
 - jieba 0.42.1 sdist 构建重量——离线部署注意点（文档已记）
+
+## UC3-B 跟进项（F1 修复随分支重导）
+- P2：F3 ingest 在 sync connector 主循环 await（a-memorix 慢挂时卡会话边界 ~10s；默认 off；后续 fire-and-forget 化，external_id 幂等已铺路）
+- P3：F4 空库对齐 off-by-one（全新 recent.json 首条永不注入，010/002 同款，一次性无害）
