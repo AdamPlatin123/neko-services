@@ -10,3 +10,10 @@
 - P2：ooc12-pack.json 的 neko_src 机器路径字段改为基线 hash 别名（跨机一致性）
 - P2：ooc12_regression.py 的 M5 导入包 try/except、删未用导入、--pack-out 默认不写仓库内跟踪文件
 - P3：mount_mode 白名单校验+非法值日志；env_context docstring 补传输面说明；测试标记归类 plugin_unit
+
+## P1-1a 跟进项（代审通过后遗留）
+- P2：F2 对齐窗口竞态（/new_dialog 渲染与对齐 fetch 之间落盘且 seq≤next_seq 的消息本会话不可见）——并入 UC3 已知偏差记账
+- P2：F3 读注入超时 5s vs mvp-tech-design S2 表写的 2s——规格文档偏差登记（实现取上游既有值，合理）
+- P3：F4 水位在 fetch 成功即推进（非 LLM 消费后）——语义选择记账
+- P3：F5 角色目录整体删除重建后 seq 从 1 重来，残留会话旧水位静默跳过——注释记账
+- P3：F6 成功注入 INFO 日志补 request_id；新端点登记进 neko-access-audit §1 端点表
