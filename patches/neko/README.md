@@ -14,9 +14,9 @@ NNN-<slug>.patch
 - `<slug>`：全小写、短横线分隔的短名，概括补丁内容，例如 `001-memory-server-recent-history.patch`；
 - **只追加、不插队**：新补丁永远取当前最大序号 +1。需要修改历史补丁时，等价于从该补丁起重建其后整段序列。
 
-## 补丁如何生成（仓库内暂存 → 核对 → 目录级原子切换）
+## 补丁如何生成（仓库内暂存 → 核对 → 可回滚替换）
 
-在 N.E.K.O 仓库中基于 BASELINE.md 记录的基线 commit 建分支、提交改动，然后在**本仓库内的暂存目录**导出全量补丁，核对无误后对 `patches/neko/` 做**目录级原子切换**——整个流程要么整体成功，要么旧补丁集合原样保留：
+在 N.E.K.O 仓库中基于 BASELINE.md 记录的基线 commit 建分支、提交改动，然后在**本仓库内的暂存目录**导出全量补丁，核对无误后对 `patches/neko/` 做**目录级可回滚替换（rollback-able swap）**——整个流程要么整体成功，要么旧补丁集合可恢复保留。注意：两步 rename 之间存在短暂的目录缺失窗口，且意外中断不会自动恢复，故称「可回滚」而非「原子」，中断后按下方要点手动恢复：
 
 ```bash
 cd <neko-services>
@@ -36,13 +36,18 @@ shopt -s nullglob; news=(./*.patch); shopt -u nullglob
 [ "${#news[@]}" -gt 0 ] || { echo "导出为空：分支区间或分支选错，不替换"; exit 1; }
 
 cd <neko-services>
-# 目录级原子切换：两步 rename；olddir 目标名不存在，mv 语义即为 rename
+# 目录级可回滚替换：两步 rename（olddir 目标名不存在，mv 语义即为 rename）；
+# 之间有短暂缺失窗口，失败/中断不自动恢复——恢复分支执行后必须检查结果
 olddir="patches/.old-patches.$$"
 if mv patches/neko "$olddir" && mv "$stage/neko" patches/neko; then
     rm -rf "$olddir" "$stage"      # 成功：清理
 else
-    [ -d patches/neko ] || mv "$olddir" patches/neko   # 失败：切换未完成则恢复旧集合
-    echo "替换失败：旧集合已恢复（或原样未动），暂存目录保留待查: $stage" >&2
+    [ -d patches/neko ] || mv "$olddir" patches/neko   # 切换未完成则恢复旧集合
+    if [ -d patches/neko ]; then
+        echo "替换失败：旧集合已恢复（或原样未动），暂存目录保留待查: $stage" >&2
+    else
+        echo "替换失败且自动恢复未成功：请按下方要点从 $olddir 手动恢复" >&2
+    fi
     exit 1
 fi
 ```
@@ -51,7 +56,13 @@ fi
 
 - **不要**直接向 `patches/neko/` 追加导出，也不要先删后逐文件 mv——中断会留下空集或不完整集合；
 - **导出零补丁一律报错不替换**：空集合几乎必然意味着分支/区间选错，静默替换会抹掉既有补丁链；
-- 流程意外中断时，`patches/.tmp-patches.*` / `patches/.old-patches.*` 残留即回滚材料：若 `patches/neko` 缺失或不完整，手动 `mv <.old 目录> patches/neko` 恢复后清理残留。
+- 流程意外中断时，`patches/.tmp-patches.*` / `patches/.old-patches.*` 残留即回滚材料。手动恢复时**先把缺失/不完整的 `patches/neko` 移走，再换回旧集合**——目标目录存在时直接 `mv <.old 目录> patches/neko` 会把旧目录移进其内部而非替换：
+
+  ```bash
+  mv patches/neko patches/.broken-$$      # 移走缺失/不完整的目录（若存在）
+  mv <.old 目录> patches/neko             # 换回旧集合
+  [ -f patches/neko/BASELINE.md ] && rm -rf patches/.broken-$$ && echo "已恢复"
+  ```
 
 `replay-patches.sh` 会自动校验：文件名符合 `NNN-<slug>.patch`、序号从 001 起严格连续，不合规即拒绝重放。
 
