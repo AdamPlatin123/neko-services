@@ -79,26 +79,30 @@ require_cmd() {
 # ---------------------------------------------------------------------------
 # JSON 字段提取（jq > python3 两级；无可靠解析器时宁可失败也不降级猜测）
 # 用法：json_field <json文本> <字段名>
-# 出口码：0 = 顶层对象解析成功，stdout 输出字段值（字段缺失输出空串）
-#         1 = 解析失败（body 非单一合法 JSON 对象、含尾部垃圾、顶层非对象，
-#             或 jq 与 python3 均不可用）——调用方必须视为检查失败，不得放行
-# 安全性说明（codex pre-merge review P1 修复）：
-#   - jq 路径不吞退出码：jq 对「合法对象后追加垃圾」会在输出后返回非 0，
-#     此处显式判非 0 即失败，防止部分输出被误当作字段值；
-#   - python3 路径用 json.load 严格解析整个输入（尾部垃圾抛异常），
-#     且要求顶层必须是对象（数组/标量判失败）；
-#   - 刻意不做 grep 文本匹配降级：嵌套字段（如 {"detail":{"status":"ok"}}）
-#     会被正则误取导致放行，宁严勿松。
+# 出口码：0 = 解析成功，stdout 输出字段值（字段缺失输出空串）
+#         1 = 解析失败——调用方必须视为检查失败，不得放行
+# 失败条件（codex review 两轮收紧）：
+#   body 非单一合法 JSON 对象、含尾部垃圾、多值输入流（如 "{} {}" 或
+#   追加 null——jq 用 [(inputs)] 验证恰好一个值）、空输入、顶层非对象
+#   （数组/字符串/null）、jq 与 python3 均不可用。
+# 注意：本函数输出值仅供展示（如 INSTANCE_ID）；安全敏感的相等比较
+# 必须用 json_field_eq（bash 命令替换会剥尾换行，"x\n" 会被误当 "x"）。
 # ---------------------------------------------------------------------------
 json_field() {
     local json=$1 key=$2 out
     if have_cmd jq; then
-        if ! out=$(jq -r --arg k "$key" 'if has($k) then (.[$k]|tostring) else "" end' \
-            <<<"$json" 2>/dev/null); then
+        # [(inputs)] 收集首个值之后的全部输入：非空即多值输入流 → null →
+        # jq -e 对 null/false 输出退出非 0；空输入流则 filter 零次执行、
+        # 无输出 → jq -e 退出 4。两者均判失败。
+        if ! out=$(jq -er --arg k "$key" '
+                if (type == "object") and ([(inputs)] | length == 0)
+                then (if has($k) then (.[$k] | tostring) else "" end)
+                else null
+                end
+            ' <<<"$json" 2>/dev/null); then
             return 1
         fi
-        # 多值输入流（如两个拼接对象）会产生多行输出，多行不等于单行期望值，
-        # 由调用方的严格相等比较天然拦截；此处再显式拒绝多行，语义更明确
+        # 单值验证通过后，多行只可能来自字段值内嵌换行——同样拒绝
         if [[ "$(printf '%s\n' "$out" | wc -l)" -gt 1 ]]; then
             return 1
         fi
@@ -109,14 +113,50 @@ import json, sys
 try:
     data = json.load(sys.stdin)
 except Exception:
-    sys.exit(1)  # 非法 JSON / 尾部垃圾：解析失败而非静默通过
+    sys.exit(1)  # 非法 JSON / 尾部垃圾 / 多文档（json.load 拒绝 "Extra data"）
 if not isinstance(data, dict):
-    sys.exit(1)  # 顶层必须是对象
+    sys.exit(1)  # 顶层必须是对象（数组/字符串/null 均失败；空输入同样抛异常）
 value = data.get(sys.argv[1])
 print("" if value is None else value)
 ' "$key" <<<"$json" 2>/dev/null
     else
         # 无 jq 且无 python3：不做文本猜测，明确失败（安装其一即可恢复）
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# json_field_eq <json文本> <字段名> <期望值> — 解析器内部的严格相等断言
+# 出口码：0 = 解析成功且字段值严格等于期望值
+#         1 = 解析失败 / 多值输入 / 字段缺失 / 值不等 / 值内嵌换行等不可见差异
+# 为什么比较必须在解析器内做（codex review P2 修复）：bash 命令替换会剥掉
+# 尾部换行，"N.E.K.O\n" 经 $(...) 后变成 "N.E.K.O" 从而绕过 bash 层 == 比较；
+# jq 的字符串比较与 Python 的 == 均不剥换行，"N.E.K.O\n" != "N.E.K.O"。
+# ---------------------------------------------------------------------------
+json_field_eq() {
+    local json=$1 key=$2 expected=$3
+    if have_cmd jq; then
+        jq -e --arg k "$key" --arg exp "$expected" '
+            if (type == "object") and ([(inputs)] | length == 0)
+            then (if has($k) and ((.[$k] | tostring) == $exp) then true else false end)
+            else false
+            end
+        ' <<<"$json" >/dev/null 2>&1
+    elif have_cmd python3; then
+        python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+value = data.get(sys.argv[1])
+if isinstance(value, (dict, list)):
+    sys.exit(1)  # 结构体值不参与字符串比较
+sys.exit(0 if ("" if value is None else str(value)) == sys.argv[2] else 1)
+' "$key" "$expected" <<<"$json" >/dev/null 2>&1
+    else
         return 1
     fi
 }
@@ -191,9 +231,11 @@ PY
 # N.E.K.O 服务健康断言（防「200+error」反模式与端口被无关进程占用）：
 #   1) HTTP 状态码 == 200
 #   2) body 为单一合法 JSON 对象且 status == "ok"（解析失败=失败，不放行）
-#   3) app 字段必须存在且严格等于 NEKO_APP_SIGNATURE——缺失/为空/不符均失败
-#      （区分真后端与占端口进程；codex review P1 修复：不再放行缺失指纹）
-#   4) 可选：service 字段匹配（memory / main / ...）
+#   3) app 字段必须存在且严格等于 NEKO_APP_SIGNATURE——缺失/为空/不符/
+#      含不可见字符差异（如尾部换行）均失败
+#   4) 可选：service 字段严格匹配（memory / main / ...）
+# 相等比较全部在解析器内部完成（json_field_eq），不经过 bash 命令替换
+# （其会剥尾换行导致 "x\n" 被误当 "x"）。
 # 通过后调用方可读取全局变量 HTTP_CODE / HTTP_BODY。
 # 出口码：0=通过；1=失败（已打印原因）
 # ---------------------------------------------------------------------------
@@ -203,7 +245,7 @@ HTTP_BODY=""
 
 http_check() {
     local name=$1 url=$2 expect_service=${3:-}
-    local raw code status app service
+    local raw code status app
     HTTP_CODE=""
     HTTP_BODY=""
 
@@ -226,33 +268,30 @@ http_check() {
         return 1
     fi
     if ! status=$(json_field "$HTTP_BODY" status); then
-        fail "${name}: body 无法解析为单一 JSON 对象（非法 JSON/尾部垃圾/无 jq 与 python3）body=${HTTP_BODY:0:160}"
+        fail "${name}: body 无法解析为单一 JSON 对象（非法 JSON/多值输入/空输入/无 jq 与 python3）body=${HTTP_BODY:0:160}"
         return 1
     fi
     if [[ -z "$status" ]]; then
         fail "${name}: body 无 status 字段（非 N.E.K.O 健康格式）body=${HTTP_BODY:0:160}"
         return 1
     fi
-    if [[ "$status" != "ok" ]]; then
-        # 200 + status:error 反模式：状态码健康但业务失败，必须当作失败处理
-        fail "${name}: 200+error 反模式——body status='${status}'（期望 'ok'）body=${HTTP_BODY:0:160}"
+    if ! json_field_eq "$HTTP_BODY" status "ok"; then
+        # 相等判定在解析器内做：拦截 200+error 反模式，以及 "ok\n" 等
+        # 剥换行后视觉相同但字节不同的值
+        fail "${name}: status 非严格 'ok'（200+error 反模式或含不可见字符差异，显示值 '${status}'）body=${HTTP_BODY:0:160}"
         return 1
     fi
     if ! app=$(json_field "$HTTP_BODY" app); then
         fail "${name}: app 字段解析失败 body=${HTTP_BODY:0:160}"
         return 1
     fi
-    if [[ "$app" != "${NEKO_APP_SIGNATURE}" ]]; then
-        fail "${name}: app 指纹缺失或不符（得到 '${app:-<缺失/空>}'，期望 '${NEKO_APP_SIGNATURE}'；端口可能被其他进程占用）URL=${url}"
+    if ! json_field_eq "$HTTP_BODY" app "${NEKO_APP_SIGNATURE}"; then
+        fail "${name}: app 指纹缺失/为空/不符或含不可见字符差异（显示值 '${app:-<缺失>}'，期望 '${NEKO_APP_SIGNATURE}'；端口可能被其他进程占用）URL=${url}"
         return 1
     fi
     if [[ -n "$expect_service" ]]; then
-        if ! service=$(json_field "$HTTP_BODY" service); then
-            fail "${name}: service 字段解析失败 body=${HTTP_BODY:0:160}"
-            return 1
-        fi
-        if [[ "$service" != "$expect_service" ]]; then
-            fail "${name}: service='${service}'（期望 '${expect_service}'）URL=${url}"
+        if ! json_field_eq "$HTTP_BODY" service "$expect_service"; then
+            fail "${name}: service 非严格等于 '${expect_service}'（缺失/不符/含不可见差异）URL=${url}"
             return 1
         fi
     fi
