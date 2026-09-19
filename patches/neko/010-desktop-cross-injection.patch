@@ -1,0 +1,771 @@
+From 48600a9d790c40d9c6482149703d8d3163ec2527 Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:32:20 +0800
+Subject: [PATCH] =?UTF-8?q?feat(desktop):=20=E6=B4=BB=E8=B7=83=E4=BC=9A?=
+ =?UTF-8?q?=E8=AF=9D=E6=AF=8F=E8=BD=AE=E6=B3=A8=E5=85=A5=E8=B7=A8=E7=AB=AF?=
+ =?UTF-8?q?=E6=9C=80=E8=BF=91=E5=AF=B9=E8=AF=9D=E5=A2=9E=E9=87=8F=EF=BC=88?=
+ =?UTF-8?q?1a-4=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+workplan P1-1 #5（UC3 完整契约 1a-4）——此前桌面活跃会话只在
+start_session 时取一次 /new_dialog（lifecycle 预取 task），之后既不
+重启也不重取；recall 工具是模型主动调用、非每轮必读：主人在 QQ/
+微信说的新话，桌面端不重启会话就永远看不到。
+
+- main_logic/omni_offline_client/_streaming.py：stream_text 组装本轮
+  user content 前调用可选回调 on_cross_context_refresh，返回的
+  「[跨端最近对话]」块拼进 system_prefix 之前（跨端背景 → agent
+  回调 → 用户原话），随 HumanMessage 落 history（与 agent 回调
+  system_prefix 同语义）；回调异常只 WARN 兜底，绝不吞掉用户轮次。
+  独立 ASR 语音轮同样汇入 stream_text，一处覆盖。
+- main_logic/core/streaming.py（StreamingMixin）：
+  _fetch_recent_history_increment（与 wechat patch 002 同款契约：
+  共享 internal client、5s 超时、200+status:error 拦截、WARN 带
+  request_id、CancelledError 传播）+ _cross_context_refresh（水位
+  语义与 wechat 对偶：未对齐先取 next_seq 不注入防双重注入、已对齐
+  按水位取增量、本会话回流消息按 (role, content) 过滤、失败降级
+  水位不动、并发轮锁串行）。
+- main_logic/core/lifecycle.py：_create_offline_vlm_client 绑定回调；
+  _start_session_fetch_new_dialog 成功后复位对齐标志（new_dialog
+  全量基线在场 → 下一次回调先懒对齐；该函数是 new_dialog 唯一取用
+  通道，start_session 与 offline handoff 候选两条路径都覆盖）。
+- main_logic/core/manager.py：水位三字段（__init__，每会话独立）。
+
+已知偏差（有意）：realtime 音频会话不走该回调（音频直连 provider，
+注入需 conversation.item.create）——跨端增量由会话边界的 /new_dialog
+全量兜底；桌面 user 消息带注入前缀时回流过滤按精确匹配失配一次，
+无害（同 wechat 侧已知局限）。
+
+测试：tests/unit/test_desktop_cross_context_injection.py 17 例
+（helper 形状/error body 拦截/超时降级/取消传播/懒对齐/对齐失败重试/
+增量注入+回流过滤/水位不动/无新单调/畸形 next_seq/会话隔离/
+stream_text 三层前缀顺序/无回调零回归/回调异常不吞轮次/基线复位×2）；
+相关回归 test_proactive_vision_screenshot_staging 等 162 passed。
+---
+ main_logic/core/lifecycle.py                  |  13 +
+ main_logic/core/manager.py                    |  10 +
+ main_logic/core/streaming.py                  | 177 +++++++
+ main_logic/omni_offline_client/_streaming.py  |  21 +
+ .../test_desktop_cross_context_injection.py   | 432 ++++++++++++++++++
+ 5 files changed, 653 insertions(+)
+ create mode 100644 tests/unit/test_desktop_cross_context_injection.py
+
+diff --git a/main_logic/core/lifecycle.py b/main_logic/core/lifecycle.py
+index 68886ba1..1b217790 100644
+--- a/main_logic/core/lifecycle.py
++++ b/main_logic/core/lifecycle.py
+@@ -1534,6 +1534,13 @@ class LifecycleMixin:
+             raise ConnectionError(f"❌ 记忆服务连接失败: {e} (端口 {port})")
+         if not resp.is_success:
+             raise ConnectionError(f"❌ 记忆服务返回非2xx状态 {resp.status_code}: {resp.text[:200]}")
++        # p1-1 1a-4：/new_dialog 全量基线即将注入本次会话（start_session 的
++        # initial_prompt 或 offline handoff 候选的 bootstrap）——跨端增量水位
++        # 需要重新对齐。对齐动作懒执行：下一次 _cross_context_refresh 发现
++        # 未对齐时先取 next_seq、不注入（注入即与 new_dialog 的 recent 段双重
++        # 注入）。放在这里而不是 start_session 主流程：本函数是 new_dialog 的
++        # 唯一取用通道（两条路径都覆盖），成功即意味着"全量基线在场"。
++        self._cross_context_aligned = False
+         return resp.text
+ 
+     def _create_offline_vlm_client(
+@@ -1573,6 +1580,12 @@ class LifecycleMixin:
+             enable_long_response_summary=external_tts_enabled,
+         )
+         session.on_proactive_done = self.handle_proactive_complete
++        # p1-1 1a-4：跨端增量注入回调（streaming._cross_context_refresh）——
++        # stream_text 每轮组装 user content 前取共享记忆增量（文本轮与独立
++        # ASR 语音轮都汇入 stream_text，一处绑定全覆盖）。realtime 音频会话
++        # 不走该回调（音频直连 provider，注入需 conversation.item.create，
++        # 记为已知偏差：跨端增量仍由会话边界的 /new_dialog 全量兜底）。
++        session.on_cross_context_refresh = self._cross_context_refresh
+         session.on_thinking_active = self._make_thinking_active_callback(session)
+         # 和两个 realtime 构造点同一处理：句柄绑到这个 client 自己，而不是
+         # 构造时刻的 self.session。handoff candidate 在被提升前既不是
+diff --git a/main_logic/core/manager.py b/main_logic/core/manager.py
+index c6ab9e7b..5dc198ea 100644
+--- a/main_logic/core/manager.py
++++ b/main_logic/core/manager.py
+@@ -390,6 +390,16 @@ class LLMSessionManager(
+         # 运行里可能已经得到回应的旧搭话误算成「持续无互动」。
+         self.proactive_engagement_observation_started_at = time.time()
+ 
++        # 跨端最近对话增量注入的水位（p1-1 1a-4）：_cross_context_next_seq 是
++        # GET /recent_history 的游标（仅在成功拿到 payload 后推进）；_cross_context_aligned
++        # 在每次 /new_dialog 全量基线到场后置 False（见 _start_session_fetch_new_dialog），
++        # 下一次注入回调（streaming._cross_context_refresh）先对齐水位、不注入。
++        # 每会话独立（对齐动作即"新会话基线"的等价物），进程内存即可——进程重启后
++        # 第一个会话必然走 start_session → /new_dialog → 重新对齐。
++        self._cross_context_next_seq = 0
++        self._cross_context_aligned = False
++        self._cross_context_lock = asyncio.Lock()
++
+         # 用户静默 ≥ IDLE_SESSION_RESET_THRESHOLD_SECONDS 时主动断 session 的
+         # 后台 loop。lazily 在首次 start_session 时启动，永久存活（per-manager
+         # 单例），无 active session 时 sleep 后继续轮询。
+diff --git a/main_logic/core/streaming.py b/main_logic/core/streaming.py
+index 2b02a583..b022d07d 100644
+--- a/main_logic/core/streaming.py
++++ b/main_logic/core/streaming.py
+@@ -28,6 +28,7 @@ from main_logic.omni_realtime_client import OmniRealtimeClient
+ from main_logic.omni_offline_client import OmniOfflineClient
+ from main_logic.session_state import SessionEvent
+ from utils.language_utils import get_global_language_full
++from utils.llm_client import AIMessage, HumanMessage
+ from uuid import uuid4
+ from ._shared import (
+     _TEXT_SESSION_INPUT_TYPES,
+@@ -1058,3 +1059,179 @@ class StreamingMixin:
+                             "💥 deferred attachment input flush failed: %s",
+                             flush_error,
+                         )
++
++    # ── 跨端最近对话每轮增量注入（p1-1 1a-4，UC3 完整契约）─────────────
++    # 此前桌面活跃会话只在 start_session 时取一次 /new_dialog（lifecycle
++    # 的预取 task），之后既不重启也不重取；recall 工具是模型主动调用、非每轮
++    # 必读——主人在 QQ/微信说的新话，桌面端不重启会话就永远看不到。这里把
++    # wechat_integration 已验证的"水位 + 增量"范式（见 neko-services patch 002）
++    # 对偶到桌面主进程：回调绑定在 OmniOfflineClient.on_cross_context_refresh
++    # （lifecycle._create_offline_vlm_client），stream_text 每轮组装 user content
++    # 前调用——文本轮与独立 ASR 语音轮（同样汇入 stream_text）一并覆盖。
++
++    async def _fetch_recent_history_increment(
++        self, since_seq: int, limit: int = 50,
++    ) -> dict | None:
++        """GET /recent_history/{her}?since_seq= 取共享记忆增量（p1-1 L1）。
++
++        与 wechat_integration._fetch_recent_history_increment 同一契约：成功
++        （HTTP 2xx 且 body ``status=ok``）返回完整 payload（entries/next_seq）；
++        任何失败返回 None——调用方降级为"跳过注入、水位不动、下轮重试"，
++        绝不阻塞回复。失败一律 WARN 带 request_id 便于按轮次追踪（S8 可观测）。
++        用共享 internal client（loopback 专用连接池，同 /new_dialog 取用方）。
++        """
++        request_id = uuid4().hex[:8]
++        try:
++            from utils.internal_http_client import get_internal_http_client
++
++            response = await get_internal_http_client().get(
++                f"http://127.0.0.1:{self.memory_server_port}"
++                f"/recent_history/{self.lanlan_name}",
++                params={"since_seq": int(since_seq), "limit": int(limit)},
++                timeout=5.0,
++            )
++            if not response.is_success:
++                logger.warning(
++                    "[%s] recent_history increment failed: status=%s "
++                    "since_seq=%s request_id=%s",
++                    self.lanlan_name, response.status_code, since_seq, request_id,
++                )
++                return None
++            payload = response.json()
++            if not isinstance(payload, dict) or payload.get("status") != "ok":
++                # 端点失败模式是 200 + status:error——统一在这里拦下（DX-2）
++                logger.warning(
++                    "[%s] recent_history increment error body: since_seq=%s "
++                    "body=%s request_id=%s",
++                    self.lanlan_name, since_seq, str(payload)[:200], request_id,
++                )
++                return None
++            return payload
++        except asyncio.CancelledError:
++            # 会话拆除会取消 stream_text，回调里的在途请求必须跟着取消，
++            # 不能被降级逻辑吞掉。
++            raise
++        except Exception as e:
++            logger.warning(
++                "[%s] recent_history increment unavailable: since_seq=%s "
++                "error=%s request_id=%s",
++                self.lanlan_name, since_seq, e, request_id,
++            )
++            return None
++
++    @staticmethod
++    def _cross_context_safe_next_seq(payload: dict, fallback: int) -> int:
++        """Parse ``next_seq`` defensively——畸形值不能让 int() 抛出。
++
++        回调抛出的异常虽然在上游 stream_text 有兜底，但对齐失败应当走
++        "保持现状、下轮重试"，而不是依赖外层吞异常。
++        """
++        try:
++            return int(payload.get("next_seq") or fallback)
++        except (TypeError, ValueError):
++            return fallback
++
++    @staticmethod
++    def _cross_context_flatten_message_text(message) -> str:
++        """Flatten a history message's content into plain text（多模态段拼接）."""
++        content = getattr(message, "content", "")
++        if isinstance(content, str):
++            return content
++        if isinstance(content, list):
++            parts = []
++            for item in content:
++                if isinstance(item, dict):
++                    parts.append(str(item.get("text") or item.get("content") or ""))
++                else:
++                    parts.append(str(item))
++            return "\n".join(parts)
++        return str(content or "")
++
++    def _cross_context_own_fingerprints(self, current_text: str) -> set[tuple[str, str]]:
++        """本会话消息的 (role, content) 指纹集合（回流过滤用）。
++
++        recent_history 不区分消息来源通道：桌面自己经 turn end /cache 回流的
++        消息也在增量里——用本会话 LLM history（OmniOfflineClient._conversation_history）
++        + 本轮文本精确匹配过滤。已知局限（与 wechat 侧同款）：跨端一字不差的
++        内容会被误滤一次（无害，只丢一次注入）；本会话 user 消息若带注入前缀
++        （跨端块/agent 回调随 user content 落 history），/cache 回流的是纯文本、
++        匹配失配时会把自己上一轮注入一次——同样无害。
++        """
++        own: set[tuple[str, str]] = set()
++        if current_text:
++            own.add(("user", current_text))
++        history = getattr(getattr(self, "session", None), "_conversation_history", None) or []
++        for message in history:
++            if isinstance(message, HumanMessage):
++                role = "user"
++            elif isinstance(message, AIMessage):
++                role = "assistant"
++            else:
++                continue
++            own.add((role, self._cross_context_flatten_message_text(message)))
++        return own
++
++    async def _cross_context_refresh(self, current_text: str) -> str | None:
++        """每轮生成前的跨端增量注入回调（p1-1 1a-4）。
++
++        水位语义（与 wechat_integration._refresh_cross_context 对偶）：
++
++        - 未对齐（``_cross_context_aligned`` False，/new_dialog 全量基线刚到场）：
++          先 GET ``since_seq=0&limit=1`` 把水位对齐到当前 ``next_seq``，**本轮不
++          注入**——注入即与 /new_dialog 的 recent 段双重注入。对齐失败保持未对齐，
++          下轮重试（等价延迟一轮）。
++        - 已对齐：按水位取增量，注入「[跨端最近对话]」块（stream_text 把它拼进
++          本轮 user content 前缀，随 HumanMessage 落 history——与 agent 回调
++          system_prefix 同语义，模型后续仍可 reference）；水位仅在成功拿到
++          payload 后推进，同一条消息不会注入两次。
++        - 失败降级：跳过注入 + WARN（带 request_id），水位不动下轮重试。
++        - 并发轮（用户打字与独立 ASR 语音撞车）用锁串行取水位，避免两个并发
++          回调拿到同批 entries 双注入；锁内只有 loopback HTTP（5s 超时）。
++        """
++        lock = getattr(self, "_cross_context_lock", None)
++        if lock is None:
++            # __new__ 绕过 __init__ 的轻量构造（上游测试习惯）没有这个锁——
++            # 与上游 proactive/attachment 槽位的防御式读法一致。
++            lock = self._cross_context_lock = asyncio.Lock()
++        async with lock:
++            if not getattr(self, "_cross_context_aligned", False):
++                payload = await self._fetch_recent_history_increment(since_seq=0, limit=1)
++                if payload is None:
++                    return None
++                self._cross_context_next_seq = self._cross_context_safe_next_seq(payload, 0)
++                self._cross_context_aligned = True
++                return None
++
++            watermark = int(getattr(self, "_cross_context_next_seq", 0) or 0)
++            payload = await self._fetch_recent_history_increment(since_seq=watermark)
++            if payload is None:
++                return None
++            next_seq = self._cross_context_safe_next_seq(payload, watermark)
++            self._cross_context_next_seq = max(next_seq, watermark)
++
++            entries = [
++                e for e in (payload.get("entries") or [])
++                if isinstance(e, dict) and str(e.get("content") or "").strip()
++            ]
++            own_turns = self._cross_context_own_fingerprints(str(current_text or "").strip())
++            injected = [
++                e for e in entries
++                if (str(e.get("role") or ""), str(e.get("content") or "")) not in own_turns
++            ]
++            if not injected:
++                return None
++            lines = [
++                f"{e.get('speaker') or e.get('role')}: {e.get('content')}"
++                for e in injected
++            ]
++            logger.info(
++                "[%s] cross-context increment: entries=%d/%d next_seq=%d",
++                self.lanlan_name, len(injected), len(entries), next_seq,
++            )
++            return (
++                "======[跨端最近对话]======\n"
++                "以下是刚刚在其他通道（QQ/微信等）发生的对话，供你了解近况；"
++                "不要主动复述，也无需回应其中已结束的话题：\n"
++                + "\n".join(lines)
++                + "\n======[跨端最近对话结束]======"
++            )
+diff --git a/main_logic/omni_offline_client/_streaming.py b/main_logic/omni_offline_client/_streaming.py
+index 4b7bbd12..473917ef 100644
+--- a/main_logic/omni_offline_client/_streaming.py
++++ b/main_logic/omni_offline_client/_streaming.py
+@@ -686,6 +686,27 @@ class _StreamingMixin:
+         # 落 history，跟 voice mode user-role 注入对偶。
+         _user_text = text.strip()
+         _prefix_clean = (system_prefix or "").strip()
++        # p1-1 1a-4：跨端最近对话增量块（主人在 QQ/微信等通道的新消息）作为
++        # 本轮 user content 的**最前**前缀——由 core 的 SessionManager 回调提供
++        # （绑定见 lifecycle._create_offline_vlm_client，水位语义见
++        # streaming._cross_context_refresh）。回调内部已降级（失败返回 None），
++        # 这里只兜底意外异常，绝不让跨端注入失败吞掉用户的这一轮。放在最前：
++        # 跨端块是"近况背景"，agent 回调是"待办通知"，越接近用户原话的越新。
++        _cross_refresh = getattr(self, "on_cross_context_refresh", None)
++        if callable(_cross_refresh):
++            try:
++                _cross_block = str(await _cross_refresh(_user_text) or "").strip()
++            except asyncio.CancelledError:
++                raise
++            except Exception as _cross_err:
++                logger.warning(
++                    "cross-context refresh callback failed: %s", _cross_err,
++                )
++                _cross_block = ""
++            if _cross_block:
++                _prefix_clean = (
++                    f"{_cross_block}\n\n{_prefix_clean}" if _prefix_clean else _cross_block
++                )
+         _user_text_with_prefix = (
+             f"{_prefix_clean}\n\n{_user_text}" if _prefix_clean else _user_text
+         )
+diff --git a/tests/unit/test_desktop_cross_context_injection.py b/tests/unit/test_desktop_cross_context_injection.py
+new file mode 100644
+index 00000000..561be568
+--- /dev/null
++++ b/tests/unit/test_desktop_cross_context_injection.py
+@@ -0,0 +1,432 @@
++# -*- coding: utf-8 -*-
++"""桌面跨端上下文每轮增量注入的测试（p1-1 1a-4，UC3 完整契约）。
++
++覆盖三层（与 wechat_integration 的 patch 002 测试对偶，范式同源）：
++
++1. HTTP helper（StreamingMixin._fetch_recent_history_increment）：请求形状
++   （URL/params/超时/共享 internal client）、200+status:error 拦截、失败 WARN
++   带 request_id、超时/连接异常降级；
++2. 水位/过滤逻辑（StreamingMixin._cross_context_refresh）：未对齐时先对齐
++   不注入（防与 /new_dialog 双重注入）、对齐失败保持未对齐下轮重试、活跃
++   会话增量注入、本会话回流消息按 (role, content) 过滤、失败降级水位不动、
++   无新条目不注入且水位单调；
++3. stream_text 集成：on_cross_context_refresh 回调块拼进本轮 user content
++   最前缀（在 agent 回调 system_prefix 之前）、随 HumanMessage 落 history、
++   回调异常不吞用户轮次；/new_dialog 取用成功后对齐标志复位。
++"""
++from __future__ import annotations
++
++import asyncio
++import os
++import sys
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
++
++from utils.llm_client import AIMessage, HumanMessage, SystemMessage
++from main_logic.core import LLMSessionManager
++from main_logic.omni_offline_client import OmniOfflineClient
++
++pytestmark = pytest.mark.unit
++
++_HER = "Xiaoba"
++_PORT = 48912
++
++
++class _Logger:
++    def __init__(self):
++        self.warnings: list[str] = []
++        self.infos: list[str] = []
++
++    def warning(self, msg, *args, **kwargs):
++        self.warnings.append(str(msg))
++
++    def info(self, msg, *args, **kwargs):
++        self.infos.append(str(msg))
++
++    def error(self, msg, *args, **kwargs):
++        pass
++
++    def debug(self, msg, *args, **kwargs):
++        pass
++
++
++def _make_manager(session_history: list | None = None):
++    """__new__ 绕过 __init__ 的轻量 manager，只接水位相关字段。"""
++    manager = LLMSessionManager.__new__(LLMSessionManager)
++    manager.lanlan_name = _HER
++    manager.memory_server_port = _PORT
++    manager._cross_context_next_seq = 0
++    manager._cross_context_aligned = False
++    manager._cross_context_lock = asyncio.Lock()
++    fake_session = SimpleNamespace(_conversation_history=session_history or [])
++    manager.session = fake_session
++    return manager
++
++
++def _client_mock(get_response):
++    """mock 共享 internal client：一个预设的 GET 响应。"""
++    client = MagicMock()
++    client.get = AsyncMock(return_value=get_response)
++    return client
++
++
++def _resp(payload=None, status_code=200, is_success=True, text=""):
++    return SimpleNamespace(
++        status_code=status_code,
++        is_success=is_success,
++        text=text,
++        json=(lambda p: (lambda: p))(payload),
++    )
++
++
++def _ok_payload(entries, next_seq):
++    return {"status": "ok", "entries": entries, "next_seq": next_seq, "instance_id": "x"}
++
++
++# ─────────────────── 1. HTTP helper ───────────────────
++
++
++async def test_fetch_increment_request_shape_and_payload_passthrough():
++    manager = _make_manager()
++    payload = _ok_payload([{"seq": 3}], 4)
++    client = _client_mock(_resp(payload))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        result = await manager._fetch_recent_history_increment(since_seq=2)
++
++    assert result == payload
++    url = client.get.await_args.args[0]
++    assert url == f"http://127.0.0.1:{_PORT}/recent_history/{_HER}"
++    assert client.get.await_args.kwargs["params"] == {"since_seq": 2, "limit": 50}
++    assert client.get.await_args.kwargs["timeout"] == 5.0
++
++
++async def test_fetch_increment_intercepts_error_body_and_warns():
++    """端点失败模式：200 + status:error——必须在这里拦下（DX-2 反模式）。"""
++    manager = _make_manager()
++    client = _client_mock(_resp({"status": "error", "message": "boom"}))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ), patch("main_logic.core.streaming.logger") as log:
++        result = await manager._fetch_recent_history_increment(since_seq=0)
++
++    assert result is None
++    assert log.warning.called
++    joined = " ".join(str(c) for c in log.warning.call_args_list)
++    assert "request_id" in joined or "request_id=" in joined
++
++
++async def test_fetch_increment_degrades_on_exception():
++    manager = _make_manager()
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client",
++        side_effect=TimeoutError("5s"),
++    ), patch("main_logic.core.streaming.logger") as log:
++        result = await manager._fetch_recent_history_increment(since_seq=3)
++
++    assert result is None
++    assert log.warning.called
++
++
++async def test_fetch_increment_propagates_cancellation():
++    """会话拆除取消 stream_text 时，回调里的在途请求必须跟着取消。"""
++    manager = _make_manager()
++
++    async def _cancelled(*a, **kw):
++        raise asyncio.CancelledError()
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client",
++    ) as ctor:
++        ctor.return_value.get = _cancelled
++        with pytest.raises(asyncio.CancelledError):
++            await manager._fetch_recent_history_increment(since_seq=0)
++
++
++# ─────────────────── 2. watermark / filter ───────────────────
++
++
++async def test_first_call_after_new_dialog_aligns_watermark_without_injection():
++    """/new_dialog 全量基线在场（aligned=False）：先对齐水位、不注入。"""
++    manager = _make_manager()
++    client = _client_mock(_resp(_ok_payload([{"seq": 9, "content": "old"}], 10)))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        block = await manager._cross_context_refresh("你好")
++
++    assert block is None, "基线在场时注入即双重注入"
++    assert manager._cross_context_aligned is True
++    assert manager._cross_context_next_seq == 10
++    # 对齐只需要 next_seq：limit=1
++    assert client.get.await_args.kwargs["params"] == {"since_seq": 0, "limit": 1}
++
++
++async def test_alignment_failure_keeps_unaligned_for_retry():
++    manager = _make_manager()
++    manager._cross_context_next_seq = 7  # 旧水位不应被对齐失败污染
++
++    with patch.object(
++        LLMSessionManager,
++        "_fetch_recent_history_increment",
++        new=AsyncMock(return_value=None),
++    ):
++        block = await manager._cross_context_refresh("hi")
++
++    assert block is None
++    assert manager._cross_context_aligned is False, "保持未对齐，下轮重试"
++    assert manager._cross_context_next_seq == 7
++
++
++async def test_active_session_injects_increment_and_filters_own_messages():
++    manager = _make_manager(
++        session_history=[
++            HumanMessage(content="hi"),
++            AIMessage(content="yo"),
++        ],
++    )
++    manager._cross_context_aligned = True
++    manager._cross_context_next_seq = 2
++    payload = _ok_payload(
++        [
++            # 本会话上一轮经 /cache 回流的消息：按 (role, content) 匹配过滤
++            {"seq": 3, "role": "user", "speaker": "主人", "content": "hi"},
++            {"seq": 4, "role": "assistant", "speaker": _HER, "content": "yo"},
++            # 本轮刚提交的文本（回调发生在 history append 之前）
++            {"seq": 5, "role": "user", "speaker": "主人", "content": "新消息"},
++            # 真正的跨端增量
++            {"seq": 6, "role": "user", "speaker": "主人", "content": "微信消息"},
++        ],
++        7,
++    )
++    client = _client_mock(_resp(payload))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        block = await manager._cross_context_refresh("新消息")
++
++    assert block is not None
++    assert "[跨端最近对话]" in block
++    assert "微信消息" in block
++    for own in ("hi", "yo", "新消息"):
++        assert own not in block, f"本会话消息 {own!r} 不得进入注入块"
++    assert manager._cross_context_next_seq == 7
++    assert client.get.await_args.kwargs["params"]["since_seq"] == 2
++
++
++async def test_failure_degrades_to_skip_and_keeps_watermark():
++    manager = _make_manager()
++    manager._cross_context_aligned = True
++    manager._cross_context_next_seq = 5
++
++    with patch.object(
++        LLMSessionManager,
++        "_fetch_recent_history_increment",
++        new=AsyncMock(return_value=None),
++    ):
++        block = await manager._cross_context_refresh("hi")
++
++    assert block is None
++    assert manager._cross_context_next_seq == 5, "失败不推进水位，下轮重试"
++
++
++async def test_no_new_entries_returns_none_and_watermark_monotonic():
++    manager = _make_manager()
++    manager._cross_context_aligned = True
++    manager._cross_context_next_seq = 10
++    client = _client_mock(_resp(_ok_payload([], 11)))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        block = await manager._cross_context_refresh("hi")
++
++    assert block is None
++    assert manager._cross_context_next_seq == 11, "无新条目水位仍单调推进"
++
++
++async def test_malformed_next_seq_never_raises():
++    """畸形 next_seq（非空字符串等）不能让 int() 抛出吞掉整轮。"""
++    manager = _make_manager()
++    manager._cross_context_aligned = True
++    manager._cross_context_next_seq = 4
++    client = _client_mock(_resp(_ok_payload(
++        [{"seq": 5, "role": "user", "speaker": "主人", "content": "x"}],
++        "garbage",
++    )))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        block = await manager._cross_context_refresh("hi")
++
++    assert block is not None
++    assert manager._cross_context_next_seq == 4, "fallback = 旧水位"
++
++
++async def test_sessions_isolated_by_manager_instance_watermarks():
++    """会话隔离：两个 manager（不同会话）各自水位互不污染。"""
++    a = _make_manager()
++    b = _make_manager()
++    a._cross_context_aligned = True
++    a._cross_context_next_seq = 100
++    b._cross_context_aligned = False
++
++    responses = [
++        _resp(_ok_payload([{"seq": 101, "role": "user", "speaker": "主人", "content": "a-new"}], 102)),
++        _resp(_ok_payload([], 5)),
++    ]
++    client = MagicMock()
++    client.get = AsyncMock(side_effect=responses)
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        block_a = await a._cross_context_refresh("a-msg")
++        block_b = await b._cross_context_refresh("b-msg")
++
++    assert block_a is not None and "a-new" in block_a
++    assert a._cross_context_next_seq == 102
++    assert block_b is None, "b 未对齐：只对齐不注入"
++    assert b._cross_context_next_seq == 5
++
++
++# ─────────────────── 3. stream_text 集成 ───────────────────
++
++
++def _make_offline_for_stream() -> tuple[OmniOfflineClient, list]:
++    """复用上游 test_proactive_vision_screenshot_staging 的轻量构造。"""
++    c = OmniOfflineClient.__new__(OmniOfflineClient)
++    c._conversation_history = [SystemMessage(content="sys")]
++    c._pending_images = []
++    c._proactive_image_to_inject = None
++    c._proactive_image_staged_at = 0.0
++    c._proactive_image_history_len = 0
++    c.llm = SimpleNamespace(max_completion_tokens=2000)
++    c.model = "m"
++    c.vision_model = "vm"
++    c.max_response_rerolls = 0
++    c.max_response_length = 2000
++    c._prefix_buffer_size = 0
++    c.on_input_transcript = None
++    c.on_text_delta = AsyncMock()
++    c.on_status_message = None
++    c.on_response_discarded = None
++    c.on_response_done = None
++    c._begin_reasoning_stream = MagicMock()
++    c.switch_model = AsyncMock()
++
++    captured: list = []
++
++    async def _fake_astream_visible(messages, **overrides):
++        captured.append(list(messages))
++        raise RuntimeError("stop-after-construction")
++        yield  # pragma: no cover
++
++    c._astream_visible_with_tools = _fake_astream_visible
++    return c, captured
++
++
++def test_stream_text_folds_cross_context_block_before_agent_prefix():
++    """跨端块作为 user content 最前缀（跨端背景 → agent 回调 → 用户原话）。"""
++    c, captured = _make_offline_for_stream()
++
++    async def _refresh(_text):
++        return "======[跨端最近对话]======\n主人: 微信消息\n======[跨端最近对话结束]======"
++
++    c.on_cross_context_refresh = _refresh
++
++    asyncio.run(c.stream_text(
++        "在吗",
++        system_prefix="======[系统通知] 来自agent的回调======",
++    ))
++
++    msg = captured[0][-1]
++    assert isinstance(msg, HumanMessage)
++    assert msg.content.startswith("======[跨端最近对话]======")
++    assert "微信消息" in msg.content
++    assert "======[系统通知]" in msg.content
++    assert msg.content.endswith("在吗"), "用户原话永远在最后"
++    # 跨端块随 HumanMessage 落 history（与 agent 回调 system_prefix 同语义）
++    assert c._conversation_history[-1] is msg
++
++
++def test_stream_text_without_callback_is_byte_identical_old_path():
++    """未绑定回调（如 realtime 会话/轻量构造）时行为与改动前完全一致。"""
++    c, captured = _make_offline_for_stream()
++    asyncio.run(c.stream_text("普通一句话"))
++    assert captured[0][-1].content == "普通一句话"
++
++
++def test_stream_text_callback_failure_never_swallows_user_turn():
++    """回调抛意外异常：兜底吞掉、用户轮次照常发出。"""
++    c, captured = _make_offline_for_stream()
++
++    async def _bad_refresh(_text):
++        raise RuntimeError("unexpected")
++
++    c.on_cross_context_refresh = _bad_refresh
++    asyncio.run(c.stream_text("还是要发出去"))
++    assert captured, "回调异常不能吞掉用户这一轮"
++    assert captured[0][-1].content == "还是要发出去"
++
++
++def test_stream_text_callback_receives_stripped_user_text():
++    """回调收到 strip 后的用户文本（回流过滤与本轮文本指纹一致）。"""
++    c, _captured = _make_offline_for_stream()
++    seen: list[str] = []
++
++    async def _refresh(text):
++        seen.append(text)
++        return None
++
++    c.on_cross_context_refresh = _refresh
++    asyncio.run(c.stream_text("  带空格  "))
++    assert seen == ["带空格"]
++
++
++# ─────────────────── 4. /new_dialog 基线复位 ───────────────────
++
++
++async def test_new_dialog_success_resets_alignment_flag():
++    """/new_dialog 取用成功 → 全量基线在场 → 对齐标志复位（懒对齐）。"""
++    manager = _make_manager()
++    manager._cross_context_aligned = True
++    manager._cross_context_next_seq = 42
++    client = _client_mock(_resp(payload="", status_code=200, is_success=True, text=""))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        manager._new_dialog_request_kwargs = lambda: {"timeout": 5.0}
++        text = await manager._start_session_fetch_new_dialog(_HER, _PORT)
++
++    assert text == ""
++    assert manager._cross_context_aligned is False, "基线到场后必须重新对齐"
++    assert manager._cross_context_next_seq == 42, "旧水位保留，对齐时才覆盖"
++
++
++async def test_new_dialog_failure_keeps_previous_alignment():
++    """取基线失败（非 2xx）：不应复位——基线并不在场。"""
++    manager = _make_manager()
++    manager._cross_context_aligned = True
++    client = _client_mock(_resp(payload="err", status_code=500, is_success=False))
++
++    with patch(
++        "utils.internal_http_client.get_internal_http_client", return_value=client,
++    ):
++        manager._new_dialog_request_kwargs = lambda: {"timeout": 5.0}
++        with pytest.raises(ConnectionError):
++            await manager._start_session_fetch_new_dialog(_HER, _PORT)
++
++    assert manager._cross_context_aligned is True
+-- 
+2.43.0
+

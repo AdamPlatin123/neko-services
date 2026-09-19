@@ -2,14 +2,19 @@
 
 本目录存放对 N.E.K.O 子项目（默认位于本仓库的 `../N.E.K.O`）的**全部本地修改**，以 `git format-patch` 序列维护：可重放、可审计、可随基线升级迁移。基线 commit 与分叉姿态见 [BASELINE.md](BASELINE.md)。
 
-当前状态：**基线已锚定**。补丁清单（P1-2 分支带入 003/004；001/002 为 P1-1（L1 上游修复）预留序号，其分支合并后序号自然连续）：
+当前状态：**基线已锚定**。补丁清单（P1-2 分支带入 003/004；001/002 为 P1-1（L1 上游修复）预留序号，其分支合并后序号自然连续；010-012 为 P1-1 UC3-B（main 进程侧），005-009 预留给 UC3-A 的 memory_server 侧补丁）：
 
 | 序号 | 补丁 | 来源任务 | 内容 |
 | --- | --- | --- | --- |
 | 003 | `003-persona-mount-mode.patch` | P1-2 #1 | persona_override 挂载分轨：声明式 `mount_mode`（完整人设 replace / 附加模块 append）+ `append_guidance` append-only 模块轨 + `env_context` 开关键 + 四情形断言测试 |
 | 004 | `004-desktop-env-injection.patch` | P1-2 #2 | 桌面昵称状态机数据面：主进程采集宿主环境（getpass/platform 等，无 shell）经 `utils/persona_env_context.py` 注入 `_build_initial_prompt`，未声明零注入 |
+| 010 | `010-desktop-cross-injection.patch` | P1-1 #5（UC3 1a-4） | 桌面活跃会话每轮跨端增量注入：stream_text 组装 user content 前经 `on_cross_context_refresh` 回调取 `/recent_history` 增量拼「[跨端最近对话]」块（水位懒对齐防与 /new_dialog 双重注入；文本轮+独立 ASR 语音轮全覆盖；失败 WARN 降级不阻塞） |
+| 011 | `011-amemorix-write-hook.patch` | P1-1 #9（UC1 转正） | settle 成功后批量写 a-memorix 索引（session end /process|/settle + renew 两接入点，`chat_history.clear()` 前快照）：turn 块切分 + external_id 五段规范（内容哈希幂等）+ `/a_memorix/v1/ingest_summary`（chat_summary 语义，P0-1b 约束）；`A_MEMORIX_URL` 未设=off；近实时 notify 评估后降级为 settle 批量（决策见 patch 内 docstring） |
+| 012 | `012-wechat-conversation-tier.patch` | P1-1 #11 | 微信主对话从 agent 档换 conversation 档（跨端同档、与桌面同模型同人格）；`max_completion_tokens=300` 保留（与桌面 textGuard 300 对齐的权衡）；50 字提示词保留（已登记偏差） |
 
 > ⚠️ 在 001/002 落地前，`replay-patches.sh` 会因序号不连续（003 起始）拒绝整组重放——这是校验的预期行为。单独验证 003/004 可直接 `git am` 这两个文件到基线（P1-2 已在干净基线 worktree 上做过：双补丁干净应用 + 新增测试全绿 + OOC 回归 23/23）。
+>
+> 010-012 同理：在 001-009 落位前整组重放会被序号连续性校验拒绝。已验证的叠加顺序为 `001 → 002 → 010 → 011 → 012`（干净基线 worktree 上五个补丁依次 `git am` 全部成功，叠加态新增测试 54 passed；012 与 002 同改 `wechat_integration/__init__.py` 但区域不相交，无冲突）。
 
 ## 命名规范
 

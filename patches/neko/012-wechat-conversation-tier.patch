@@ -1,0 +1,216 @@
+From 657f19e0848c7028dd3e8302c2bbd66a9c3a95c0 Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:36:19 +0800
+Subject: [PATCH] =?UTF-8?q?feat(wechat):=20=E4=B8=BB=E5=AF=B9=E8=AF=9D?=
+ =?UTF-8?q?=E6=8D=A2=20conversation=20=E6=A1=A3=EF=BC=88=E8=B7=A8=E7=AB=AF?=
+ =?UTF-8?q?=E5=90=8C=E6=A1=A3=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+workplan P1-1 #11 / Eng 审查 #24——此前微信 _generate_wechat_reply 硬编码
+get_model_api_config("agent")，与桌面主对话（conversation 档）不同模型：
+同一角色在两个通道语气/风格漂移，"同一人格"体感断裂。换成 conversation
+档与桌面同模型，跨端同档是 P2-3 #5 的验收项（四端同档）；agent 档仍
+留给插件工具链。
+
+max_completion_tokens=300 评估后保留：(a) 与桌面 textGuard 默认 300
+（≈400 CJK 字）数值对齐，跨端回复体量一致；(b) 提示词仍要求"不超过
+50字"，300 绰绰有余、只起防失控护栏作用；(c) token 成本进 P2-3 #6
+预算监控（Eng 审查 #24 的采纳条件）。50 字提示词保留——已登记的已知
+体验偏差（mvp-tech-design P2-3 #5：桌面长回复 vs 微信短回复），不
+在此改。
+
+测试：plugin/plugins/wechat_integration/tests/test_model_tier.py 3 例
+（档位断言 conversation 且防回归 agent / 未配置优雅跳过 / 300 上限
+保留）；插件既有测试回归通过。
+---
+ plugin/plugins/wechat_integration/__init__.py |  15 +-
+ .../tests/test_model_tier.py                  | 137 ++++++++++++++++++
+ 2 files changed, 150 insertions(+), 2 deletions(-)
+ create mode 100644 plugin/plugins/wechat_integration/tests/test_model_tier.py
+
+diff --git a/plugin/plugins/wechat_integration/__init__.py b/plugin/plugins/wechat_integration/__init__.py
+index da0a0599..f3afe9b1 100644
+--- a/plugin/plugins/wechat_integration/__init__.py
++++ b/plugin/plugins/wechat_integration/__init__.py
+@@ -565,13 +565,17 @@ class WechatIntegrationPlugin(NekoPluginBase):
+ 
+             config_manager = get_config_manager()
+             master_name, her_name, _, catgirl_data, _, lanlan_prompt_map, _, _, _ = config_manager.get_character_data()
+-            model_config = config_manager.get_model_api_config("agent")
++            # 跨端同档（workplan P1-1 #11 / Eng 审查 #24）：微信从 agent 档换到
++            # conversation 档——与桌面主对话同一模型同一人格，"同一角色在不同
++            # 通道说话像同一个人"才成立（换档前微信跟桌面用的可能是两个模型，
++            # 语气/风格漂移）。agent 档仍留给插件工具链使用。
++            model_config = config_manager.get_model_api_config("conversation")
+             base_url = str(model_config.get("base_url") or "").strip()
+             model = str(model_config.get("model") or "").strip()
+             api_key = str(model_config.get("api_key") or "").strip()
+ 
+             if not base_url or not model:
+-                self.logger.warning("[wechat_integration] agent model not configured, skip reply")
++                self.logger.warning("[wechat_integration] conversation model not configured, skip reply")
+                 return None
+ 
+             master_title = master_name if master_name else "主人"
+@@ -665,6 +669,13 @@ class WechatIntegrationPlugin(NekoPluginBase):
+                 model=model,
+                 base_url=base_url,
+                 api_key=api_key,
++                # 300 token 上限评估（换 conversation 档时复核）：保留。换档后
++                # 模型更强、单回复本可更长，但 (a) 与桌面 textGuard 默认 300
++                # （tts_runtime._get_text_guard_max_length，≈400 CJK 字）数值对齐，
++                # 跨端回复体量一致；(b) 上方提示词仍要求"不超过50字"，300 token
++                # 对它绰绰有余，只起防失控护栏作用；(c) token 成本进 P2-3 #6
++                # 预算监控（Eng 审查 #24 采纳条件）。微信 50 字提示词本身保留
++                # ——已登记的已知体验偏差（mvp-tech-design P2-3 #5），不在此改。
+                 max_completion_tokens=300,
+                 timeout=30.0,
+                 provider_type=model_config.get("provider_type"),
+diff --git a/plugin/plugins/wechat_integration/tests/test_model_tier.py b/plugin/plugins/wechat_integration/tests/test_model_tier.py
+new file mode 100644
+index 00000000..39321d4c
+--- /dev/null
++++ b/plugin/plugins/wechat_integration/tests/test_model_tier.py
+@@ -0,0 +1,137 @@
++# -*- coding: utf-8 -*-
++"""微信回复模型档位的回归测试（p1-1 #11，跨端同档）。
++
++换档（agent → conversation）的产品理由：微信与桌面主对话共用 conversation
++档的同一模型，"同一角色在不同通道说话像同一个人"才成立。这里断言三件事：
++
++1. 档位取用是 "conversation"（不再是 "agent"）；
++2. conversation 档未配置（base_url/model 空）时优雅跳过（不抛、返回 None、
++   WARN 文案对）；
++3. max_completion_tokens=300 保留（与桌面 textGuard 默认 300 对齐的权衡
++   决策，见 __init__.py 换档处的注释）。
++"""
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++from plugin.plugins.wechat_integration import WechatIntegrationPlugin
++
++# _generate_wechat_reply 运行中会 `from main_logic.core import
++# apply_role_placeholders`——该模块的 import 链（utils.preferences）在模块级
++# 访问真实 ConfigManager 单例。生产环境中它在任何微信轮次之前早已导入；这里
++# 同样在打补丁前预导入，让补丁只作用于函数内的运行时调用（与
++# test_cross_context_injection.py 的说明同源）。
++import main_logic.core  # noqa: F401
++
++pytestmark = pytest.mark.plugin_unit
++
++_HER = "Xiaoba"
++
++
++class _Logger:
++    def __init__(self):
++        self.warnings: list[str] = []
++
++    def warning(self, msg, *args, **kwargs):
++        self.warnings.append(str(msg))
++
++    def info(self, msg, *args, **kwargs):
++        pass
++
++    def error(self, msg, *args, **kwargs):
++        pass
++
++    def debug(self, msg, *args, **kwargs):
++        pass
++
++
++def _make_plugin() -> WechatIntegrationPlugin:
++    plugin = object.__new__(WechatIntegrationPlugin)
++    plugin.logger = _Logger()
++    plugin._wechat_sessions = {}
++    return plugin
++
++
++class _ConfigSpy:
++    """记录 get_model_api_config 被请求的档位；按档位返回可配置的模型信息。"""
++
++    def __init__(self, model_config: dict):
++        self.requested_tiers: list[str] = []
++        self._model_config = model_config
++
++    def get_character_data(self):
++        return ("主人", _HER, None, {}, None, {_HER: "character prompt"},
++                None, None, None)
++
++    def get_model_api_config(self, tier):
++        self.requested_tiers.append(tier)
++        return dict(self._model_config)
++
++
++_FULL_MODEL = {
++    "base_url": "http://llm.local", "model": "conv-model",
++    "api_key": "k", "provider_type": None,
++}
++
++
++class _FakeLLM:
++    def __init__(self):
++        self.ctor_kwargs: dict | None = None
++
++    async def ainvoke(self, messages, **kwargs):
++        return SimpleNamespace(content="好的呀")
++
++    async def aclose(self):
++        return None
++
++
++async def _drive_turn(model_config: dict):
++    plugin = _make_plugin()
++    spy = _ConfigSpy(model_config)
++    fake_llm = _FakeLLM()
++    llm_ctor = AsyncMock(return_value=fake_llm)
++
++    with patch("utils.config_manager.get_config_manager", return_value=spy), \
++         patch("utils.llm_client.create_chat_llm_async", new=llm_ctor), \
++         patch("utils.language_utils.get_global_language_full", return_value="zh-CN"), \
++         patch.object(
++             WechatIntegrationPlugin, "_fetch_memory_context",
++             new=AsyncMock(return_value="persona context"),
++         ):
++        plugin._cleanup_wechat_sessions = lambda now=None: None
++        reply = await plugin._generate_wechat_reply(user_id="wx-master", message="在吗")
++
++    return plugin, spy, llm_ctor, reply
++
++
++async def test_reply_uses_conversation_tier_not_agent():
++    """跨端同档：微信主对话取 conversation 档（与桌面同模型同人格）。"""
++    _plugin, spy, _ctor, reply = await _drive_turn(dict(_FULL_MODEL))
++
++    assert reply == "好的呀"
++    assert spy.requested_tiers == ["conversation"], (
++        "必须取 conversation 档；回到 agent 档是跨端人格漂移回归"
++    )
++
++
++async def test_unconfigured_conversation_tier_skips_reply():
++    plugin, spy, _ctor, reply = await _drive_turn(
++        {"base_url": "", "model": "", "api_key": "", "provider_type": None},
++    )
++
++    assert reply is None
++    assert spy.requested_tiers == ["conversation"]
++    assert len(plugin.logger.warnings) == 1
++    assert "conversation model not configured" in plugin.logger.warnings[0]
++
++
++async def test_max_completion_tokens_kept_at_300():
++    """300 token 上限保留（与桌面 textGuard 默认 300 对齐的权衡，见换档注释）。"""
++    _plugin, _spy, ctor, _reply = await _drive_turn(dict(_FULL_MODEL))
++
++    kwargs = ctor.await_args.kwargs
++    assert kwargs["model"] == "conv-model"
++    assert kwargs["max_completion_tokens"] == 300
+-- 
+2.43.0
+
