@@ -1,0 +1,757 @@
+From b7bfa024ff1410d06f1949159890ab5fdc462afd Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <AdamPlatin123@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 23:33:38 +0800
+Subject: [PATCH 1/2] =?UTF-8?q?feat(memory):=20=E5=A2=9E=E9=87=8F=E8=AF=BB?=
+ =?UTF-8?q?=E5=8F=96=E7=AB=AF=E7=82=B9=20GET=20/recent=5Fhistory/{name}?=
+ =?UTF-8?q?=EF=BC=88JSON+=E6=B8=B8=E6=A0=87=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+跨端共享上下文的 L1 数据源（workplan P1-1 #1）：
+
+- memory/recent.py：存储层自增 seq——新消息在 _append_and_persist_locked
+  临界区内打点 additional_kwargs.recent_seq(+recent_seq_ts)，计数器按角色
+  持久化到 recent_seq_state.json；floor=max(sidecar,盘上/pending 最大 seq)，
+  历史重置后不复用旧号。memo(SystemMessage)不打点不占号；review 改写条目
+  无 seq 对增量端点不可见（防重复注入）。
+- app/memory_server/routes.py：GET /recent_history/{name}?since_seq=&limit=
+  返回 {status,entries[{seq,role,speaker,content,ts}],next_seq,instance_id}；
+  无 prompt-locale 渲染、无 system 混入；next_seq 单调推进；失败 200+status:error
+  与既有端点一致；超限截尾保留最新 limit 条。
+- 既有 GET /get_recent_history 是本地化渲染纯文本、无游标，直接注入会与
+  /new_dialog 双重注入——这是本端点存在的原因。
+- 守门测试登记：recent_file_lock 锁收口豁免 seq_state sidecar（meta 先例）；
+  compress_backup 路由围栏分类表新增本只读端点（get_recent_history 先例）。
+
+测试：tests/unit/test_recent_history_incremental_seq.py（打点单调性/重置不复用/
+提取排除/游标 limit 水位/端点契约形状 422 503），10 例全绿；相关回归 287 passed。
+---
+ app/memory_server/routes.py                   |  78 +++-
+ memory/recent.py                              | 181 +++++++++
+ tests/unit/test_recent_compress_backup.py     |   3 +
+ tests/unit/test_recent_file_lock.py           |   7 +-
+ .../test_recent_history_incremental_seq.py    | 363 ++++++++++++++++++
+ 5 files changed, 628 insertions(+), 4 deletions(-)
+ create mode 100644 tests/unit/test_recent_history_incremental_seq.py
+
+diff --git a/app/memory_server/routes.py b/app/memory_server/routes.py
+index f2a4faa0..a0c1b65e 100644
+--- a/app/memory_server/routes.py
++++ b/app/memory_server/routes.py
+@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
+ from typing import Literal
+ from uuid import uuid4
+ 
+-from fastapi import HTTPException, Request
++from fastapi import HTTPException, Query, Request
+ from fastapi.responses import JSONResponse, PlainTextResponse
+ from pydantic import BaseModel, Field
+ 
+@@ -1197,6 +1197,82 @@ async def get_recent_history(lanlan_name: str, language: str | None = None):
+             result += f"{speaker} | {content}\n"
+     return result
+ 
++@app.get("/recent_history/{lanlan_name}")
++async def incremental_recent_history(
++    lanlan_name: str,
++    since_seq: int = Query(
++        default=0, ge=0,
++        description="游标水位：只返回 seq 大于它的条目；0 = 全量（受 limit 截尾）",
++    ),
++    limit: int = Query(
++        default=50, ge=1, le=200,
++        description="返回条数上限，超出时保留最新的 limit 条",
++    ),
++):
++    """增量读取近期对话（跨端共享上下文的 L1 数据源，p1-1）。
++
++    与 GET /get_recent_history 的区别：后者是 PlainText、prompt-locale 渲染、
++    无游标——直接注入 prompt 会与 /new_dialog 的 recent 段双重注入。本端点返回
++    JSON+游标：调用方（如 wechat 每轮注入）持久化 ``next_seq`` 作为水位，下一轮
++    只取增量，同一条消息不会被注入两次。
++
++    契约：
++      - ``entries``：seq 升序的 ``{seq, role, speaker, content, ts}``。仅含打点
++        条目（见 memory/recent.py 模块级 RECENT_SEQ_* 说明）：压缩 memo（system）、
++        review 改写条目、打点落地前写入的存量旧条目都不在其中。``role`` 是稳定
++        枚举（user/assistant），``speaker`` 是 name_mapping 解析后的显示名，
++        ``ts`` 是该条落盘打点时刻（ISO 字符串，可能为 null）。
++      - ``next_seq``：本次调用后应保存的水位 = 最后一条返回条目的 seq+1；无新
++        条目时 = max(since_seq, 历史最大 seq)+1——对任一调用方单调推进、不回退。
++      - ``instance_id``：与 /health 同源的进程指纹（区分"打到了谁"）。
++      - 失败返回 200 + ``{"status": "error", "message": ...}``，与 /cache 等
++        既有端点一致（由统一客户端封装拦截，本仓库侧另行落地）。
++
++    已知局限（有意为之，P1-1 的 UC3 因果顺序契约另行落地）：recent.json 不区分
++    消息来源通道/会话——增量里会包含"调用方本会话自己"经 /cache 回流的消息，
++    调用方需自行按内容匹配过滤；无法按来源过滤是数据模型现状。
++    """
++    lanlan_name = validate_lanlan_name(lanlan_name)
++    if runtime.recent_history_manager is None:
++        raise HTTPException(
++            status_code=503,
++            detail="memory_server not fully initialized",
++        )
++    try:
++        from memory.recent import build_recent_history_increment, extract_recent_seq_entries
++
++        history = await runtime.recent_history_manager.aget_recent_history(lanlan_name)
++        _, _, _, _, name_mapping, _, _, _, _ = (
++            await runtime._config_manager.aget_character_data()
++        )
++        name_mapping = dict(name_mapping)
++        name_mapping['ai'] = lanlan_name
++
++        stamped = extract_recent_seq_entries(history)
++        tail, next_seq = build_recent_history_increment(
++            stamped, since_seq=since_seq, limit=limit,
++        )
++        from config import INSTANCE_ID
++        return {
++            'status': 'ok',
++            'entries': [
++                {
++                    'seq': e['seq'],
++                    'role': e['role'],
++                    'speaker': name_mapping.get(e['type'], e['role']) or e['role'],
++                    'content': e['content'],
++                    'ts': e['ts'],
++                }
++                for e in tail
++            ],
++            'next_seq': next_seq,
++            'instance_id': INSTANCE_ID,
++        }
++    except Exception as e:
++        logger.error(f"[MemoryServer] recent_history 增量读取失败: {e}", exc_info=True)
++        return {'status': 'error', 'message': str(e)}
++
++
+ @app.get("/search_for_memory/{lanlan_name}/{query}")
+ async def get_memory(
+     query: str,
+diff --git a/memory/recent.py b/memory/recent.py
+index bee38ad3..fc477349 100644
+--- a/memory/recent.py
++++ b/memory/recent.py
+@@ -92,6 +92,103 @@ REVIEW_FINGERPRINT_K = 3
+ REVIEW_FINGERPRINT_CONTENT_PREFIX = 50
+ _PROMPT_TEXT_PART_TYPES = frozenset((None, 'text', 'input_text', 'output_text'))
+ 
++# ── 存储层自增 seq（跨端增量读取用，p1-1 L1）──────────────────────────
++# recent.json 的存储格式是"纯消息列表"（messages_to_dict → [{type, data}]），没有
++# 现成的逐条稳定序号；time_indexed.db 的行按 /cache 批次（uuid session_id）落库、
++# 批内共享同一 timestamp，同样不能充当逐条单调序。因此引入存储层自增 seq：每条新
++# 对话消息在落盘临界区内打上 additional_kwargs.recent_seq（附 recent_seq_ts 记录
++# 打点时刻），计数器按角色持久化在 recent.json 同目录的 recent_seq_state.json。
++#
++# 选 additional_kwargs 而非改列表结构：messages_to_dict/from_dict 已完整往返该字段
++# （utils/llm_client/messages.py），所有既有读写方零感知——
++#   - 压缩 memo（SystemMessage）不打点、不占号：增量端点明确排除 system 条目；
++#   - review 改写生成的新消息对象不带 seq → 对增量端点不可见，不会把"改写前已被
++#     读走的内容"再次推送（改写结果仍经 /new_dialog 的渲染链可见）；
++#   - 硬上限裁剪只删最旧条目，幸存条目 seq 不变，游标语义不受影响；
++#   - 计数器 floor = max(sidecar 高水位, 盘上/pending 已打点最大 seq)，recent.json
++#     被重置清空后也不会回退复用旧号。
++RECENT_SEQ_KWARG = 'recent_seq'
++RECENT_SEQ_TS_KWARG = 'recent_seq_ts'
++RECENT_SEQ_STATE_FILENAME = 'recent_seq_state.json'
++
++
++def message_recent_seq(message) -> int | None:
++    """Return the stamped monotonic seq of a message, or None when unstamped."""
++    kwargs = getattr(message, 'additional_kwargs', None)
++    if not isinstance(kwargs, dict):
++        return None
++    seq = kwargs.get(RECENT_SEQ_KWARG)
++    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
++        return None
++    return seq
++
++
++def _entry_text_content(message) -> str:
++    """Flatten a message's content into plain text (multimodal parts joined)."""
++    content = getattr(message, 'content', '')
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = []
++        for item in content:
++            if isinstance(item, dict):
++                parts.append(str(item.get('text') or item.get('content') or ''))
++            else:
++                parts.append(str(item))
++        return '\n'.join(parts)
++    return str(content or '')
++
++
++def extract_recent_seq_entries(history: list) -> list[dict]:
++    """Extract seq-stamped dialogue entries (ascending by seq).
++
++    Feeds the incremental read endpoint (GET /recent_history/{name}). System
++    messages (compression memos) and unstamped entries (legacy recent.json
++    content written before the seq stamping landed, review rewrites) are
++    excluded — see the RECENT_SEQ_* block comment for the exact semantics.
++    """
++    entries = []
++    for message in history:
++        if isinstance(message, SystemMessage):
++            continue
++        seq = message_recent_seq(message)
++        if seq is None:
++            continue
++        kwargs = getattr(message, 'additional_kwargs', None) or {}
++        ts = kwargs.get(RECENT_SEQ_TS_KWARG)
++        entries.append({
++            'seq': seq,
++            # role: 稳定枚举（user/assistant/…）；type: 存储层原始类型（human/ai）
++            'role': getattr(message, 'role', None) or getattr(message, 'type', ''),
++            'type': getattr(message, 'type', ''),
++            'content': _entry_text_content(message),
++            'ts': str(ts) if ts else None,
++        })
++    entries.sort(key=lambda e: e['seq'])
++    return entries
++
++
++def build_recent_history_increment(
++    stamped: list[dict],
++    *,
++    since_seq: int,
++    limit: int,
++) -> tuple[list[dict], int]:
++    """Apply the cursor window over ``extract_recent_seq_entries`` output.
++
++    Returns ``(tail_entries, next_seq)``:
++
++    - ``tail_entries``：seq > since_seq 的条目按 seq 升序，超过 ``limit`` 时
++      截尾保留**最新**的 limit 条（更旧的增量被跳过且不会再出现）；
++    - ``next_seq``：调用方应保存的水位 = 最后一条返回条目的 seq+1；无新条目
++      时 = max(since_seq, 历史最大 seq)+1——对任一调用方单调推进、绝不回退。
++    """
++    max_seq = stamped[-1]['seq'] if stamped else 0
++    fresh = [e for e in stamped if e['seq'] > since_seq]
++    tail = fresh[len(fresh) - limit:] if len(fresh) > limit else fresh
++    next_seq = (tail[-1]['seq'] if tail else max(since_seq, max_seq)) + 1
++    return tail, next_seq
++
+ 
+ def _review_message_content(message) -> str:
+     if isinstance(message, dict):
+@@ -329,6 +426,7 @@ def _compute_review_capacity(snapshot: list, current: list) -> tuple[int, int |
+ # Setup logger
+ from utils.file_utils import (
+     atomic_write_json_async,
++    atomic_write_text,
+     read_json_async,
+     robust_json_loads,
+ )
+@@ -374,6 +472,84 @@ class CompressedRecentHistoryManager:
+         # A successful write from another producer invalidates the cached disk
+         # baseline even when the next physical read is transiently unavailable.
+         self._cached_disk_versions = {}
++        # 存储层自增 seq 的进程内计数器缓存（真源=sidecar 高水位+盘上打点，见
++        # _stamp_recent_seq_unlocked 的 floor 计算）。
++        self._seq_counters = {}
++
++    # ── 存储层自增 seq 记账（见模块级 RECENT_SEQ_* 注释）──────────────
++    def _recent_seq_state_path(self, file_path: str) -> str:
++        return os.path.join(os.path.dirname(file_path), RECENT_SEQ_STATE_FILENAME)
++
++    def _read_recent_seq_highwater(self, file_path: str) -> int:
++        state_path = self._recent_seq_state_path(file_path)
++        try:
++            with open(state_path, encoding='utf-8') as f:
++                data = json.load(f)
++            value = data.get('highwater') if isinstance(data, dict) else None
++            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++                return 0
++            return value
++        except FileNotFoundError:
++            return 0
++        except Exception as e:
++            logger.debug(f"[RecentHistory] 读取 seq 高水位失败({state_path}): {e}")
++            return 0
++
++    def _write_recent_seq_highwater(self, file_path: str, highwater: int) -> None:
++        # 先写计数器、后写 recent.json（调用序）：中断最多留下 seq 空洞（无害），
++        # 绝不会复用已落盘的序号——重复 seq 才会破坏增量端点的游标语义。
++        state_path = self._recent_seq_state_path(file_path)
++        try:
++            atomic_write_text(
++                state_path,
++                json.dumps({'highwater': highwater}, ensure_ascii=False),
++            )
++        except Exception as e:
++            # best-effort：盘上条目自带 seq，下次 append 的 floor 计算会自愈；
++            # 只有「历史被清空后计数器不回退」这一个场景依赖 sidecar。
++            logger.warning(f"[RecentHistory] 写 seq 高水位失败({state_path}): {e}")
++
++    def _stamp_recent_seq_unlocked(
++        self, file_path, lanlan_name, history, pending, new_messages,
++    ) -> None:
++        """给本批未打点的对话消息分配下一个单调 seq。
++
++        必须在持有 recent 文件锁时调用（即只在 ``_append_and_persist_locked``
++        内部），且在合并结果落盘**之前**——打点、recent.json 写入、计数器推进
++        对其他写入方构成一个临界区。读盘失败走 pending 的消息同样在此打点，
++        补写落盘时序号不乱。
++        """
++        if not new_messages:
++            return
++        stampable = [
++            m for m in new_messages
++            if not isinstance(m, SystemMessage)
++            and hasattr(m, 'additional_kwargs')
++            and message_recent_seq(m) is None
++        ]
++        if not stampable:
++            return
++        floor = self._read_recent_seq_highwater(file_path)
++        for existing in list(history) + list(pending):
++            seq = message_recent_seq(existing)
++            if seq is not None and seq > floor:
++                floor = seq
++        counters = getattr(self, '_seq_counters', None)
++        if counters is None:
++            counters = self._seq_counters = {}
++        cached = counters.get(lanlan_name)
++        if cached is not None and cached > floor:
++            floor = cached
++        counter = floor
++        now_iso = datetime.now().isoformat()
++        for message in stampable:
++            counter += 1
++            if not isinstance(message.additional_kwargs, dict):
++                message.additional_kwargs = {}
++            message.additional_kwargs[RECENT_SEQ_KWARG] = counter
++            message.additional_kwargs[RECENT_SEQ_TS_KWARG] = now_iso
++        counters[lanlan_name] = counter
++        self._write_recent_seq_highwater(file_path, counter)
+ 
+     # ── 未落盘批次账本 ────────────────────────────────────────────────
+     def _pending_batches(self, lanlan_name: str) -> list:
+@@ -654,6 +830,11 @@ class CompressedRecentHistoryManager:
+         ) as file_path:
+             status, history = self._load_history_unlocked(file_path, lanlan_name)
+             pending = recent_file.get_recent_pending_unlocked(file_path)
++            # p1-1 L1：新消息在临界区内领取单调 seq（见模块级 RECENT_SEQ_* 注释）。
++            # 放在 UNREADABLE 分支之前：读盘失败转入 pending 的消息同样要带 seq。
++            self._stamp_recent_seq_unlocked(
++                file_path, lanlan_name, history, pending, new_messages,
++            )
+             if status == RECENT_READ_UNREADABLE:
+                 # 读不到盘上内容 ≠ 盘上是空的。这里一写就是拿这批新消息覆盖掉
+                 # 整段读不出来的历史（重构前的 `except Exception: return []`
+diff --git a/tests/unit/test_recent_compress_backup.py b/tests/unit/test_recent_compress_backup.py
+index f0a7b6c6..02f9f3f9 100644
+--- a/tests/unit/test_recent_compress_backup.py
++++ b/tests/unit/test_recent_compress_backup.py
+@@ -394,6 +394,9 @@ def test_every_character_scoped_route_is_classified_for_the_fence():
+         ("/internal/memory/{lanlan_name}/repetition_insights", "POST"),
+         ("/followup_topics/{lanlan_name}", "GET"),
+         ("/get_recent_history/{lanlan_name}", "GET"),
++        # 增量读取（JSON+游标）：纯读 recent.json（文件锁自负），不写角色
++        # 数据——seq 高水位只在 /cache 等写入端点里推进。
++        ("/recent_history/{lanlan_name}", "GET"),
+         ("/search_for_memory/{lanlan_name}/{query}", "GET"),
+         ("/get_persona/{lanlan_name}", "GET"),
+         ("/api/memory/funnel/{lanlan_name}", "GET"),
+diff --git a/tests/unit/test_recent_file_lock.py b/tests/unit/test_recent_file_lock.py
+index 82da8120..3441e168 100644
+--- a/tests/unit/test_recent_file_lock.py
++++ b/tests/unit/test_recent_file_lock.py
+@@ -1651,7 +1651,8 @@ def test_no_recent_json_writer_bypasses_the_lock_module():
+ 
+     A write-primitive call counts as a recent.json write when its destination
+     expression does NOT mention ``meta`` (recent_meta.json is a different file)
+-    and either
++    or ``seq_state`` (recent_seq_state.json — the per-character seq highwater
++    sidecar, written only inside the same file lock) and either
+       (a) the destination expression mentions ``recent`` (following one level of
+           local assignment), or
+       (b) the enclosing function — or the class it lives in — mentions the
+@@ -1720,8 +1721,8 @@ def test_no_recent_json_writer_bypasses_the_lock_module():
+             for node in writes:
+                 dest = _segment(lines, node.args[0])
+                 resolved = f"{dest} {assigned.get(dest, '')}".lower()
+-                if "meta" in resolved:
+-                    continue  # recent_meta.json 是另一个文件，不归这把锁管
++                if "meta" in resolved or "seq_state" in resolved:
++                    continue  # recent_meta.json / recent_seq_state.json 是另一些文件，不归这把锁管
+                 named = set(re.findall(r"[\w-]+\.json", resolved))
+                 if named and "recent.json" not in named:
+                     continue  # 目标表达式明说了是别的文件（如 characters.json）
+diff --git a/tests/unit/test_recent_history_incremental_seq.py b/tests/unit/test_recent_history_incremental_seq.py
+new file mode 100644
+index 00000000..c403d99c
+--- /dev/null
++++ b/tests/unit/test_recent_history_incremental_seq.py
+@@ -0,0 +1,363 @@
++# -*- coding: utf-8 -*-
++"""Contract tests for the incremental recent-history read path (p1-1 L1).
++
++Covers three layers of GET /recent_history/{name}?since_seq=&limit=:
++
++1. storage stamping — update_history assigns a per-character monotonic seq
++   (persisted via recent_seq_state.json) inside the append critical section;
++2. extraction/window — extract_recent_seq_entries + build_recent_history_increment
++   (shape, cursor, tail-limit, watermark monotonicity);
++3. the HTTP endpoint itself — mounted on the real memory_server FastAPI app with
++   the runtime components swapped for hermetic fakes (same spirit as
++   tests/integration/test_funnel_endpoint.py, but here the real route module is
++   importable and thin, so we exercise the real wrapper instead of duplicating it).
++
++Why a NEW endpoint instead of GET /get_recent_history: the old one renders
++prompt-locale PlainText with no cursor — injecting it per turn would double-inject
++everything already covered by /new_dialog's recent section.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from memory.recent import (
++    RECENT_SEQ_KWARG,
++    RECENT_SEQ_STATE_FILENAME,
++    CompressedRecentHistoryManager,
++    build_recent_history_increment,
++    extract_recent_seq_entries,
++    message_recent_seq,
++)
++from utils.llm_client import (
++    AIMessage,
++    HumanMessage,
++    SystemMessage,
++    messages_from_dict,
++)
++
++pytestmark = pytest.mark.unit
++
++_LANLAN = "Xiaoba"
++_MASTER = "Master"
++
++
++class _FakeConfigManager:
++    """只提供 update_history / aget_recent_history 路径用到的字段。"""
++
++    def __init__(self, memory_dir: str, recent_log: dict):
++        self.memory_dir = memory_dir
++        self._recent_log = recent_log
++
++    def get_character_data(self):
++        return self.aget_character_data_sync()
++
++    def aget_character_data_sync(self):
++        # 9 元组布局对齐 CompressedRecentHistoryManager 的解包：
++        # (master, her, ?, catgirl_data, name_mapping, lanlan_prompt_map, ?, ?, recent_log)
++        return (
++            _MASTER, _LANLAN, None, {},
++            {"human": _MASTER, "ai": _LANLAN, "system": "SYSTEM_MESSAGE"},
++            None, None, None, self._recent_log,
++        )
++
++    async def aget_character_data(self):
++        return self.aget_character_data_sync()
++
++
++def _make_manager(tmp_path: Path) -> CompressedRecentHistoryManager:
++    """Build a manager without the real ConfigManager (bypasses __init__)."""
++    file_path = str(tmp_path / "recent.json")
++    mgr = object.__new__(CompressedRecentHistoryManager)
++    mgr._config_manager = _FakeConfigManager(str(tmp_path), {_LANLAN: file_path})
++    mgr.max_history_length = 10
++    mgr.compress_threshold = 15
++    mgr.log_file_path = {_LANLAN: file_path}
++    mgr.name_mapping = {"human": _MASTER, "ai": _LANLAN, "system": "SYSTEM_MESSAGE"}
++    mgr.user_histories = {}
++    mgr._seq_counters = {}
++    return mgr
++
++
++def _read_disk_messages(file_path: str) -> list:
++    with open(file_path, encoding="utf-8") as f:
++        return messages_from_dict(json.load(f))
++
++
++@pytest.fixture(autouse=True)
++def _patch_cloudsave(monkeypatch):
++    monkeypatch.setattr(
++        "memory.recent.assert_cloudsave_writable", lambda *a, **kw: None,
++    )
++
++
++# ─────────────────── 1. storage stamping ───────────────────
++
++
++def test_update_history_stamps_monotonic_seq_and_persists(tmp_path):
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="hello"), AIMessage(content="hi there")],
++        _LANLAN, compress=False,
++    ))
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="second turn")], _LANLAN, compress=False,
++    ))
++
++    final = _read_disk_messages(file_path)
++    seqs = [message_recent_seq(m) for m in final]
++    assert seqs == [1, 2, 3], f"seq 应从 1 起连续单调，实际 {seqs}"
++    assert not isinstance(final[0], SystemMessage)
++    # ts 打点随 seq 一起持久化
++    for m in final:
++        assert m.additional_kwargs.get("recent_seq_ts")
++
++    # sidecar 高水位同步推进
++    state_path = os.path.join(os.path.dirname(file_path), RECENT_SEQ_STATE_FILENAME)
++    with open(state_path, encoding="utf-8") as f:
++        assert json.load(f) == {"highwater": 3}
++
++
++def test_memo_system_messages_do_not_consume_seq_numbers(tmp_path):
++    """压缩 memo（SystemMessage）不打点、不占号——增量流里永远不该出现 system。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="u1"), AIMessage(content="a1")],
++        _LANLAN, compress=False,
++    ))
++    # 模拟一次压缩 splice：头部换成 memo，尾部保留
++    disk = _read_disk_messages(file_path)
++    memo = SystemMessage(content="先前对话的备忘录: ...")
++    merged = [memo] + disk
++    from utils.llm_client import messages_to_dict
++    from utils import recent_file
++    with recent_file.recent_file_access(file_path):
++        recent_file.write_recent_payload_unlocked(file_path, messages_to_dict(merged))
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="u2")], _LANLAN, compress=False,
++    ))
++
++    final = _read_disk_messages(file_path)
++    seqs = [message_recent_seq(m) for m in final]
++    # memo 不占号：新对话条目直接续在既有最大 seq 之后
++    assert message_recent_seq(final[0]) is None
++    assert seqs[1:] == [1, 2, 3], f"memo 后的对话 seq 应为 1,2,3，实际 {seqs}"
++
++
++def test_counter_floor_prevents_seq_reuse_after_history_reset(tmp_path):
++    """recent.json 被重置清空后，sidecar 高水位兜底——seq 不回退复用旧号。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="u1"), AIMessage(content="a1")],
++        _LANLAN, compress=False,
++    ))
++    state_path = os.path.join(os.path.dirname(file_path), RECENT_SEQ_STATE_FILENAME)
++    # 拉高 sidecar 模拟"盘上曾打到 5 号后被整体清空"
++    with open(state_path, "w", encoding="utf-8") as f:
++        json.dump({"highwater": 5}, f)
++    with open(file_path, "w", encoding="utf-8") as f:
++        json.dump([], f)
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="fresh")], _LANLAN, compress=False,
++    ))
++
++    final = _read_disk_messages(file_path)
++    assert message_recent_seq(final[0]) == 6, "清空后新条目应从高水位+1 继续，不复用旧号"
++
++
++# ─────────────────── 2. extraction + window ───────────────────
++
++
++def test_extract_recent_seq_entries_excludes_system_and_unstamped():
++    stamped_ai = AIMessage(content="stamped")
++    stamped_ai.additional_kwargs[RECENT_SEQ_KWARG] = 2
++    stamped_ai.additional_kwargs["recent_seq_ts"] = "2026-09-19T12:00:00"
++    legacy_human = HumanMessage(content="legacy unstamped")  # 打点前的存量条目
++    memo = SystemMessage(content="memo")
++    mm = AIMessage(content=[{"type": "text", "text": "part1"}, {"type": "text", "text": "part2"}])
++    mm.additional_kwargs[RECENT_SEQ_KWARG] = 3
++    mm.additional_kwargs["recent_seq_ts"] = "2026-09-19T12:00:01"
++
++    entries = extract_recent_seq_entries(
++        [memo, legacy_human, stamped_ai, mm],
++    )
++
++    assert [e["seq"] for e in entries] == [2, 3]
++    assert entries[0]["role"] == "assistant"
++    assert entries[0]["ts"] == "2026-09-19T12:00:00"
++    assert entries[1]["content"] == "part1\npart2", "多模态 content 应拍平为文本"
++
++
++def test_build_recent_history_increment_cursor_limit_and_watermark():
++    stamped = [
++        {"seq": i, "role": "user", "type": "human", "content": f"m{i}", "ts": None}
++        for i in range(1, 11)  # seq 1..10
++    ]
++
++    # 全量 + tail-limit：超过 limit 保留最新一侧
++    tail, next_seq = build_recent_history_increment(stamped, since_seq=0, limit=3)
++    assert [e["seq"] for e in tail] == [8, 9, 10]
++    assert next_seq == 11
++
++    # 增量：只取水位之后的
++    tail, next_seq = build_recent_history_increment(stamped, since_seq=4, limit=50)
++    assert [e["seq"] for e in tail] == [5, 6, 7, 8, 9, 10]
++    assert next_seq == 11
++
++    # 无新条目：水位 = max(since, max_seq)+1，绝不回退
++    tail, next_seq = build_recent_history_increment(stamped, since_seq=10, limit=50)
++    assert tail == [] and next_seq == 11
++    # 水位领先于历史（历史被裁剪/重置）：继续单调推进
++    tail, next_seq = build_recent_history_increment(stamped, since_seq=20, limit=50)
++    assert tail == [] and next_seq == 21
++
++    # 空历史：next_seq=1，与首条消息将拿到的 seq 对齐
++    tail, next_seq = build_recent_history_increment([], since_seq=0, limit=50)
++    assert tail == [] and next_seq == 1
++
++
++# ─────────────────── 3. HTTP endpoint (real route) ───────────────────
++
++
++async def _drive_endpoint(tmp_path, stamped_history, params):
++    """Mount the real route on the real app with hermetic runtime swaps."""
++    import httpx
++    from app.memory_server import routes, runtime
++
++    mgr = _make_manager(tmp_path)
++    mgr.user_histories[_LANLAN] = list(stamped_history)
++
++    async def _fake_aget(name, **kwargs):
++        return list(mgr.user_histories.get(name, ()))
++
++    fake_manager = type("FakeManager", (), {"aget_recent_history": staticmethod(_fake_aget)})()
++
++    saved = (
++        runtime.recent_history_manager, runtime._config_manager,
++        runtime._memory_runtime_init_completed, runtime._memory_storage_blocked_after_init,
++    )
++    runtime.recent_history_manager = fake_manager
++    runtime._config_manager = mgr._config_manager
++    # storage_limited_mode_guard 中间件在 startup 钩子完成前对一切路径 409 短路；
++    # 测试里置位"初始化已完成"，让请求到达路由本身。
++    runtime._memory_runtime_init_completed = True
++    runtime._memory_storage_blocked_after_init = False
++    try:
++        transport = httpx.ASGITransport(app=routes.app)
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://127.0.0.1",
++        ) as client:
++            return await client.get(f"/recent_history/{_LANLAN}", params=params)
++    finally:
++        (
++            runtime.recent_history_manager, runtime._config_manager,
++            runtime._memory_runtime_init_completed, runtime._memory_storage_blocked_after_init,
++        ) = saved
++
++
++def _stamped_entry(seq: int, content: str, type_: str = "human"):
++    msg = HumanMessage(content=content) if type_ == "human" else AIMessage(content=content)
++    msg.additional_kwargs[RECENT_SEQ_KWARG] = seq
++    msg.additional_kwargs["recent_seq_ts"] = f"2026-09-19T12:00:{seq:02d}"
++    return msg
++
++
++@pytest.mark.asyncio
++async def test_endpoint_returns_contract_shape_and_instance_id(tmp_path):
++    history = [
++        _stamped_entry(1, "u1"),
++        _stamped_entry(2, "a1", "ai"),
++        _stamped_entry(3, "u2"),
++    ]
++    resp = await _drive_endpoint(tmp_path, history, {})
++    assert resp.status_code == 200
++    body = resp.json()
++
++    assert body["status"] == "ok"
++    assert body["next_seq"] == 4
++    assert isinstance(body["instance_id"], str) and body["instance_id"]
++    assert [e["seq"] for e in body["entries"]] == [1, 2, 3]
++    first = body["entries"][0]
++    assert set(first.keys()) == {"seq", "role", "speaker", "content", "ts"}
++    # role=稳定枚举；speaker=name_mapping 解析后的显示名
++    assert first["role"] == "user" and first["speaker"] == _MASTER
++    assert body["entries"][1]["role"] == "assistant" and body["entries"][1]["speaker"] == _LANLAN
++    assert first["ts"] == "2026-09-19T12:00:01"
++
++
++@pytest.mark.asyncio
++async def test_endpoint_cursor_and_limit(tmp_path):
++    history = [_stamped_entry(i, f"m{i}") for i in range(1, 11)]
++
++    body = (await _drive_endpoint(tmp_path, history, {"since_seq": 5})).json()
++    assert [e["seq"] for e in body["entries"]] == [6, 7, 8, 9, 10]
++    assert body["next_seq"] == 11
++
++    body = (await _drive_endpoint(
++        tmp_path, history, {"since_seq": 0, "limit": 2},
++    )).json()
++    assert [e["seq"] for e in body["entries"]] == [9, 10]
++    assert body["next_seq"] == 11
++
++    # 水位无新条目：next_seq 单调推进
++    body = (await _drive_endpoint(tmp_path, history, {"since_seq": 10})).json()
++    assert body["entries"] == [] and body["next_seq"] == 11
++
++
++@pytest.mark.asyncio
++async def test_endpoint_excludes_unstamped_and_system_entries(tmp_path):
++    memo = SystemMessage(content="memo")
++    legacy = HumanMessage(content="legacy")
++    history = [memo, legacy, _stamped_entry(7, "fresh")]
++
++    body = (await _drive_endpoint(tmp_path, history, {"since_seq": 0})).json()
++    assert [e["seq"] for e in body["entries"]] == [7]
++    assert body["next_seq"] == 8
++
++
++@pytest.mark.asyncio
++async def test_endpoint_rejects_out_of_range_query_params(tmp_path):
++    resp = await _drive_endpoint(tmp_path, [], {"limit": 0})
++    assert resp.status_code == 422
++    resp = await _drive_endpoint(tmp_path, [], {"limit": 201})
++    assert resp.status_code == 422
++    resp = await _drive_endpoint(tmp_path, [], {"since_seq": -1})
++    assert resp.status_code == 422
++
++
++@pytest.mark.asyncio
++async def test_endpoint_503_when_manager_not_initialized(tmp_path):
++    import httpx
++    from app.memory_server import routes, runtime
++
++    saved = (
++        runtime.recent_history_manager,
++        runtime._memory_runtime_init_completed, runtime._memory_storage_blocked_after_init,
++    )
++    runtime.recent_history_manager = None
++    runtime._memory_runtime_init_completed = True
++    runtime._memory_storage_blocked_after_init = False
++    try:
++        transport = httpx.ASGITransport(app=routes.app)
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://127.0.0.1",
++        ) as client:
++            resp = await client.get(f"/recent_history/{_LANLAN}")
++    finally:
++        (
++            runtime.recent_history_manager,
++            runtime._memory_runtime_init_completed, runtime._memory_storage_blocked_after_init,
++        ) = saved
++    assert resp.status_code == 503
+-- 
+2.43.0
+

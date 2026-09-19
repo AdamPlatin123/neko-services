@@ -1,0 +1,461 @@
+From bc41bae92c43a1c56d597f13251aea19af9a52df Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <AdamPlatin123@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 23:51:29 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?feat(wechat):=20=E6=B4=BB=E8=B7=83=E4=BC=9A?=
+ =?UTF-8?q?=E8=AF=9D=E6=AF=8F=E8=BD=AE=E6=B3=A8=E5=85=A5=E8=B7=A8=E7=AB=AF?=
+ =?UTF-8?q?=E6=9C=80=E8=BF=91=E5=AF=B9=E8=AF=9D=E5=A2=9E=E9=87=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+workplan P1-1 #2（L1：每入口回复前读共享上下文）——此前活跃会话每轮
+system 只有开场那次 /new_dialog，主人在桌面/QQ 的新消息微信侧不可见：
+
+- _generate_wechat_reply 每轮调 _refresh_cross_context：
+  - 新会话（/new_dialog 基线在场）：只把水位对齐到 next_seq、不注入——
+    注入即与 /new_dialog 的 recent 段双重注入（Codex Eng 审查 P1 的根因）；
+    基线拿不到时走全量兜底，等价延迟一轮取基线。
+  - 活跃会话：GET /recent_history/{her}?since_seq=水位（httpx 5s 超时、
+    不走代理）取增量注入「[跨端最近对话]」块；水位（cross_context_next_seq）
+    仅在成功后推进，同一条消息不会注入两次。
+  - recent_history 无通道来源字段：本会话经 /cache 回流的消息用
+    (role, content) 匹配本会话滑窗过滤；局限（已注释）——跨端一字不差的
+    内容会被误滤一次，无害。本地滑窗保留，职责是本会话上下文。
+  - 失败降级：跳过注入 + WARN（带 request_id），水位不动下轮重试，
+    绝不阻塞回复。
+- 测试：plugin_integration 标记——请求形状/status:error 拦截/超时降级/
+  新会话对齐不注入/回流过滤/三轮全链路（注入一次、无增量不重复注入）。
+---
+ plugin/plugins/wechat_integration/__init__.py | 123 ++++++++
+ .../tests/test_cross_context_injection.py     | 274 ++++++++++++++++++
+ 2 files changed, 397 insertions(+)
+ create mode 100644 plugin/plugins/wechat_integration/tests/test_cross_context_injection.py
+
+diff --git a/plugin/plugins/wechat_integration/__init__.py b/plugin/plugins/wechat_integration/__init__.py
+index da0a0599..11cd3580 100644
+--- a/plugin/plugins/wechat_integration/__init__.py
++++ b/plugin/plugins/wechat_integration/__init__.py
+@@ -649,10 +649,20 @@ class WechatIntegrationPlugin(NekoPluginBase):
+                 memory_context = None
+             session["last_activity"] = now
+ 
++            # p1-1 L1（workplan P1-1 #2）：每轮读共享上下文增量。此前活跃会话
++            # 每轮的 system 只有开场那次 /new_dialog（拿不到其他通道的新消息），
++            # 主人在桌面/QQ 说了什么微信侧一无所知；现在改为每轮调
++            # GET /recent_history/{her}?since_seq=水位 取增量注入。
++            cross_context_block = await self._refresh_cross_context(
++                session, her_name, message, baseline_context=memory_context,
++            )
++
+             # 构建 system prompt（含记忆上下文）
+             final_system_prompt = system_prompt
+             if memory_context:
+                 final_system_prompt = system_prompt + "\n\n" + memory_context
++            if cross_context_block:
++                final_system_prompt = final_system_prompt + "\n" + cross_context_block
+ 
+             # 构建完整消息列表: system + history (裁剪到窗口上限) + new_user_msg
+             messages = [{"role": "system", "content": final_system_prompt}]
+@@ -747,6 +757,119 @@ class WechatIntegrationPlugin(NekoPluginBase):
+             pass
+         return None
+ 
++    async def _fetch_recent_history_increment(
++        self, her_name: str, since_seq: int, limit: int = 50,
++    ) -> Optional[dict[str, Any]]:
++        """GET /recent_history/{her}?since_seq= 取共享记忆的增量（p1-1 L1）。
++
++        成功（HTTP 2xx 且 body status=ok）返回完整 payload（含 entries/next_seq）；
++        任何失败返回 None——调用方降级为"跳过注入、水位不动、下轮重试"，绝不
++        阻塞回复。WARN 带 request_id 便于按轮次追踪。
++        """
++        request_id = uuid.uuid4().hex[:8]
++        try:
++            import httpx
++            from config import MEMORY_SERVER_PORT
++            async with httpx.AsyncClient(timeout=5.0, proxy=None, trust_env=False) as client:
++                response = await client.get(
++                    f"http://127.0.0.1:{MEMORY_SERVER_PORT}/recent_history/{her_name}",
++                    params={"since_seq": int(since_seq), "limit": int(limit)},
++                )
++            if not response.is_success:
++                self.logger.warning(
++                    "[wechat_integration] recent_history increment failed: "
++                    f"status={response.status_code} her={her_name} since_seq={since_seq} "
++                    f"request_id={request_id}"
++                )
++                return None
++            payload = response.json()
++            if not isinstance(payload, dict) or payload.get("status") != "ok":
++                # 端点失败模式是 200 + status:error——统一在这里拦下
++                self.logger.warning(
++                    "[wechat_integration] recent_history increment error body: "
++                    f"her={her_name} since_seq={since_seq} "
++                    f"body={str(payload)[:200]} request_id={request_id}"
++                )
++                return None
++            return payload
++        except Exception as e:
++            self.logger.warning(
++                "[wechat_integration] recent_history increment unavailable: "
++                f"her={her_name} since_seq={since_seq} error={e} request_id={request_id}"
++            )
++            return None
++
++    async def _refresh_cross_context(
++        self,
++        session: dict[str, Any],
++        her_name: str,
++        current_message: str,
++        *,
++        baseline_context: Optional[str],
++    ) -> Optional[str]:
++        """维护跨端上下文水位，返回本轮要注入 system 的增量块（或 None）。
++
++        - 新会话（baseline_context 非空）：/new_dialog 已经渲染了全部近期历史，
++          只把水位对齐到当前 next_seq、**不注入**——否则同一段内容会双重注入
++          （这正是旧 GET /get_recent_history 不能直接用的原因）。baseline 拿不到
++          （memory server 刚好没回）时走下面的全量兜底，等价于延迟一轮取基线。
++        - 活跃会话：按水位取增量；recent_history 不区分消息来源通道，本会话
++          自己经 /cache 回流的消息也在增量里——用「本会话滑窗 + 本轮消息」的
++          (role, content) 精确匹配过滤掉；同一条消息不重复注入由 seq 水位保证
++          （水位只在成功拿到 payload 后推进）。已知局限：主人在别的通道发了
++          一字不差的内容会被误滤（罕见，只丢一次注入，无害）；若未来存储层
++          带上通道/会话来源字段，应改为按来源过滤。
++        """
++        watermark = int(session.get("cross_context_next_seq") or 0)
++        if baseline_context:
++            payload = await self._fetch_recent_history_increment(
++                her_name, since_seq=0, limit=1,  # 只需要 next_seq，不需要内容
++            )
++            if payload is not None:
++                session["cross_context_next_seq"] = int(payload.get("next_seq") or 0)
++            return None
++
++        payload = await self._fetch_recent_history_increment(her_name, since_seq=watermark)
++        if payload is None:
++            return None
++        try:
++            next_seq = int(payload.get("next_seq") or watermark)
++        except (TypeError, ValueError):
++            next_seq = watermark
++        session["cross_context_next_seq"] = max(next_seq, watermark)
++
++        entries = [
++            e for e in (payload.get("entries") or [])
++            if isinstance(e, dict) and str(e.get("content") or "").strip()
++        ]
++        own_turns = {
++            (h.get("role"), h.get("content"))
++            for h in (session.get("history") or [])
++            if isinstance(h, dict)
++        }
++        own_turns.add(("user", current_message))
++        injected = [
++            e for e in entries
++            if (e.get("role"), e.get("content")) not in own_turns
++        ]
++        if not injected:
++            return None
++        lines = [
++            f"{e.get('speaker') or e.get('role')}: {e.get('content')}"
++            for e in injected
++        ]
++        self.logger.info(
++            "[wechat_integration] cross-context increment: "
++            f"entries={len(injected)}/{len(entries)} next_seq={next_seq}"
++        )
++        return (
++            "======[跨端最近对话]======\n"
++            "以下是刚刚在其他通道（桌面/QQ 等）发生的对话，供你了解近况；"
++            "不要主动复述，也无需回应其中已结束的话题：\n"
++            + "\n".join(lines)
++            + "\n======[跨端最近对话结束]======"
++        )
++
+     @staticmethod
+     async def _cache_memory_delta(her_name: str, messages: list[dict[str, Any]]) -> None:
+         """缓存增量对话到 Memory Server"""
+diff --git a/plugin/plugins/wechat_integration/tests/test_cross_context_injection.py b/plugin/plugins/wechat_integration/tests/test_cross_context_injection.py
+new file mode 100644
+index 00000000..85482ac5
+--- /dev/null
++++ b/plugin/plugins/wechat_integration/tests/test_cross_context_injection.py
+@@ -0,0 +1,274 @@
++# -*- coding: utf-8 -*-
++"""跨端上下文每轮增量注入的测试（p1-1 L1，workplan P1-1 #2）。
++
++覆盖三层：
++1. HTTP helper：请求形状（URL/params/超时/不走代理）、status:error 拦截、
++   失败 WARN 带 request_id；
++2. 水位/过滤逻辑（_refresh_cross_context）：新会话只对齐水位不注入（防与
++   /new_dialog 双重注入）、活跃会话增量注入、本会话回流消息按内容过滤、
++   失败降级水位不动；
++3. 回复全链路（_generate_wechat_reply mock 版）：跨端消息进入 system、
++   下一轮无增量时不重复注入（同轮去重的自动化断言）。
++"""
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++
++import pytest
++
++from plugin.plugins.wechat_integration import WechatIntegrationPlugin
++
++# _generate_wechat_reply 运行中会 `from main_logic.core import
++# apply_role_placeholders`——该模块的 import 链（utils.preferences）在模块级
++# 访问真实 ConfigManager 单例。生产环境中它在任何微信轮次之前早已导入；这里
++# 同样在打补丁前预导入，让补丁只作用于函数内的运行时调用。
++import main_logic.core  # noqa: F401
++
++pytestmark = pytest.mark.plugin_integration
++
++_HER = "Xiaoba"
++
++
++class _Logger:
++    def __init__(self):
++        self.warnings: list[str] = []
++        self.infos: list[str] = []
++
++    def warning(self, msg, *args, **kwargs):
++        self.warnings.append(str(msg))
++
++    def info(self, msg, *args, **kwargs):
++        self.infos.append(str(msg))
++
++    def error(self, msg, *args, **kwargs):
++        pass
++
++    def debug(self, msg, *args, **kwargs):
++        pass
++
++
++def _make_plugin() -> WechatIntegrationPlugin:
++    plugin = object.__new__(WechatIntegrationPlugin)
++    plugin.logger = _Logger()
++    plugin._wechat_sessions = {}
++    return plugin
++
++
++def _resp(payload=None, status_code=200, is_success=True):
++    return SimpleNamespace(
++        status_code=status_code,
++        is_success=is_success,
++        json=(lambda p: (lambda: p))(payload),
++    )
++
++
++def _client_mock(get_responses=None, post_response=None):
++    client = AsyncMock()
++    client.__aenter__.return_value = client
++    client.__aexit__.return_value = False
++    if get_responses is not None:
++        client.get = AsyncMock(side_effect=list(get_responses))
++    if post_response is not None:
++        client.post = AsyncMock(return_value=post_response)
++    return client
++
++
++# ─────────────────── 1. HTTP helper ───────────────────
++
++
++async def test_fetch_increment_request_shape_and_payload_passthrough():
++    plugin = _make_plugin()
++    payload = {"status": "ok", "entries": [{"seq": 3}], "next_seq": 4, "instance_id": "x"}
++    client = _client_mock(get_responses=[_resp(payload)])
++
++    with patch("httpx.AsyncClient", return_value=client) as ctor:
++        result = await plugin._fetch_recent_history_increment(_HER, since_seq=2)
++
++    assert result == payload
++    ctor.assert_called_once_with(timeout=5.0, proxy=None, trust_env=False)
++    url = client.get.await_args.args[0]
++    assert url.endswith(f"/recent_history/{_HER}")
++    assert client.get.await_args.kwargs["params"] == {"since_seq": 2, "limit": 50}
++
++
++async def test_fetch_increment_intercepts_error_body_and_warns_with_request_id():
++    plugin = _make_plugin()
++    # 端点失败模式：200 + status:error（与 /cache 一致）——必须在这里拦下
++    client = _client_mock(get_responses=[_resp({"status": "error", "message": "boom"})])
++
++    with patch("httpx.AsyncClient", return_value=client):
++        result = await plugin._fetch_recent_history_increment(_HER, since_seq=0)
++
++    assert result is None
++    assert len(plugin.logger.warnings) == 1
++    assert "request_id=" in plugin.logger.warnings[0]
++
++
++async def test_fetch_increment_degrades_on_exception():
++    plugin = _make_plugin()
++    with patch("httpx.AsyncClient", side_effect=TimeoutError("5s")):
++        result = await plugin._fetch_recent_history_increment(_HER, since_seq=3)
++    assert result is None
++    assert len(plugin.logger.warnings) == 1
++    assert "request_id=" in plugin.logger.warnings[0]
++
++
++# ─────────────────── 2. watermark / filter ───────────────────
++
++
++async def test_new_session_aligns_watermark_without_injection():
++    """/new_dialog 已渲染全部近期历史：新会话只取 next_seq 对齐水位、不注入。"""
++    plugin = _make_plugin()
++    session = {"history": []}
++    payload = {"status": "ok", "entries": [{"seq": 9, "content": "old"}], "next_seq": 10}
++    client = _client_mock(get_responses=[_resp(payload)])
++
++    with patch("httpx.AsyncClient", return_value=client):
++        block = await plugin._refresh_cross_context(
++            session, _HER, "hi", baseline_context="persona ctx",
++        )
++
++    assert block is None, "新会话有 /new_dialog 基线，注入即双重注入"
++    assert session["cross_context_next_seq"] == 10
++    # 对齐水位只需要 next_seq：limit=1
++    assert client.get.await_args.kwargs["params"] == {"since_seq": 0, "limit": 1}
++
++
++async def test_active_session_injects_increment_and_filters_own_messages():
++    plugin = _make_plugin()
++    session = {
++        "history": [
++            {"role": "user", "content": "hi"},
++            {"role": "assistant", "content": "yo"},
++        ],
++        "cross_context_next_seq": 2,
++    }
++    payload = {
++        "status": "ok",
++        "entries": [
++            # 本会话上一轮经 /cache 回流的消息：recent_history 无法区分来源，
++            # 按 (role, content) 匹配本会话滑窗过滤
++            {"seq": 3, "role": "user", "speaker": "主人", "content": "hi"},
++            {"seq": 4, "role": "assistant", "speaker": _HER, "content": "yo"},
++            # 真正的跨端增量
++            {"seq": 5, "role": "user", "speaker": "主人", "content": "桌面消息"},
++        ],
++        "next_seq": 6,
++    }
++    client = _client_mock(get_responses=[_resp(payload)])
++
++    with patch("httpx.AsyncClient", return_value=client):
++        block = await plugin._refresh_cross_context(
++            session, _HER, "new msg", baseline_context=None,
++        )
++
++    assert block is not None
++    assert "[跨端最近对话]" in block
++    assert "主人: 桌面消息" in block
++    assert "hi" not in block and "yo" not in block, "本会话消息不得进入注入块"
++    assert session["cross_context_next_seq"] == 6
++    assert client.get.await_args.kwargs["params"]["since_seq"] == 2
++
++
++async def test_failure_degrades_to_skip_and_keeps_watermark():
++    plugin = _make_plugin()
++    session = {"history": [], "cross_context_next_seq": 5}
++
++    with patch.object(
++        WechatIntegrationPlugin,
++        "_fetch_recent_history_increment",
++        new=AsyncMock(return_value=None),
++    ):
++        block = await plugin._refresh_cross_context(
++            session, _HER, "hi", baseline_context=None,
++        )
++
++    assert block is None
++    assert session["cross_context_next_seq"] == 5, "失败不推进水位，下轮重试"
++
++
++# ─────────────────── 3. reply 全链路 ───────────────────
++
++
++class _FakeLLM:
++    def __init__(self):
++        self.calls: list[list[dict]] = []
++
++    async def ainvoke(self, messages, **kwargs):
++        self.calls.append(messages)
++        return SimpleNamespace(content="好的呀")
++
++    async def aclose(self):
++        return None
++
++
++def _patched_config():
++    return SimpleNamespace(
++        get_character_data=lambda: (
++            "主人", _HER, None, {}, None, {_HER: "character prompt"},
++            None, None, None,
++        ),
++        get_model_api_config=lambda tier: {
++            "base_url": "http://llm.local", "model": "test-model",
++            "api_key": "k", "provider_type": None,
++        },
++    )
++
++
++async def _drive_turn(plugin: WechatIntegrationPlugin, fake_llm: _FakeLLM, get_responses):
++    """跑一轮 _generate_wechat_reply，返回 (system_prompt, 本轮 httpx client)。"""
++    client = _client_mock(get_responses=get_responses, post_response=_resp({"status": "cached"}))
++    with patch("httpx.AsyncClient", return_value=client), \
++         patch("utils.config_manager.get_config_manager", return_value=_patched_config()), \
++         patch("utils.llm_client.create_chat_llm_async", new=AsyncMock(return_value=fake_llm)), \
++         patch("utils.language_utils.get_global_language_full", return_value="zh-CN"), \
++         patch.object(
++             WechatIntegrationPlugin, "_fetch_memory_context",
++             new=AsyncMock(return_value="persona context"),
++         ):
++        plugin._cleanup_wechat_sessions = lambda now=None: None
++        reply = await plugin._generate_wechat_reply(user_id="wx-master", message="微信消息")
++    assert reply == "好的呀"
++    system_prompt = fake_llm.calls[-1][0]["content"]
++    return system_prompt, client
++
++
++async def test_reply_flow_injects_increment_once_across_turns():
++    """新会话对齐水位（不注入）→ 跨端增量注入一次 → 无增量不重复注入。"""
++    plugin = _make_plugin()
++    fake_llm = _FakeLLM()
++
++    # 第 1 轮（新会话）：/new_dialog 基线 + 水位对齐到 10，无注入
++    align = _resp({"status": "ok", "entries": [{"seq": 9, "content": "old"}], "next_seq": 10})
++    system1, client1 = await _drive_turn(plugin, fake_llm, [align])
++    assert "persona context" in system1
++    assert "[跨端最近对话]" not in system1
++    assert plugin._wechat_sessions["wx-master"]["cross_context_next_seq"] == 10
++
++    # 第 2 轮（活跃会话）：桌面增量 seq10 → 注入
++    increment = _resp({
++        "status": "ok",
++        "entries": [
++            {"seq": 10, "role": "user", "speaker": "主人", "content": "桌面消息"},
++            # 本轮自己的消息不在增量里（fetch 发生在 /cache 之前），但上一轮的
++            # 回流消息会出现——必须被过滤
++            {"seq": 11, "role": "user", "speaker": "主人", "content": "微信消息"},
++        ],
++        "next_seq": 12,
++    })
++    system2, client2 = await _drive_turn(plugin, fake_llm, [increment])
++    assert "[跨端最近对话]" in system2
++    block2 = system2.split("[跨端最近对话]======")[1].split("======[跨端最近对话结束]")[0]
++    assert "主人: 桌面消息" in block2
++    assert "微信消息" not in block2, "本会话自己回流的消息必须被过滤，不得双重注入"
++    assert client2.get.await_args.kwargs["params"]["since_seq"] == 10
++    assert plugin._wechat_sessions["wx-master"]["cross_context_next_seq"] == 12
++
++    # 第 3 轮：无新增量 → 不注入（同一条消息跨轮不重复注入的断言）
++    empty = _resp({"status": "ok", "entries": [], "next_seq": 12})
++    system3, client3 = await _drive_turn(plugin, fake_llm, [empty])
++    assert "[跨端最近对话]" not in system3
++    assert "桌面消息" not in system3
++    assert client3.get.await_args.kwargs["params"]["since_seq"] == 12
+-- 
+2.43.0
+
