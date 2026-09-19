@@ -29,11 +29,30 @@
 
 ## 3. 部署拷贝命令（示例）
 
+执行基准：**以 manifest.md 所在目录为素材安装根**（即角色卡的 `assets/` 目录）——素材与 manifest.md 同层落位，**不再向下建 `assets/` 子目录**（第 1 节「部署目标」列的 `assets/...` 前缀即指本目录）。在 manifest.md 所在目录内执行：
+
 ```bash
-# 从 monika 仓库拷贝素材本体到本卡 assets/（在本 manifest 所在目录执行）
+# 当前目录 = manifest.md 所在目录（角色卡 assets/，素材安装根）
 SRC=/mnt/shared/_Projects/N.E.K.O/monika/.claude/skills/monika-default-preset
-mkdir -p assets/examples
-cp "$SRC/monologues.md" "$SRC/poems.md" assets/
-cp "$SRC"/examples/*.md assets/examples/
-# 拷贝后校验：grep -c '\[.*\]' assets/examples/*.md 应无动作标记形态命中（代码块/方括号引用除外，见 golden-samples.md 静态检查）
+mkdir -p examples
+cp "$SRC/monologues.md" "$SRC/poems.md" .
+cp "$SRC"/examples/*.md examples/
+# 拷贝后校验：examples/*.md 与 monologues.md/poems.md 应无动作标记形态命中（代码块/方括号引用除外，见 golden-samples.md 静态检查）
+```
+
+执行后布局（相对 manifest.md 所在目录）：
+
+```
+./                       # 素材安装根（= 角色卡 assets/，manifest.md 所在处）
+├── manifest.md          # 本文件
+├── monologues.md
+├── poems.md
+└── examples/
+    ├── 开场与日常.md
+    ├── 昵称与称呼.md
+    ├── 恋爱与纪念日.md
+    ├── 游戏与棋类.md
+    ├── 文学与音乐.md
+    ├── 自我与存在.md
+    └── 道歉与往事.md
 ```

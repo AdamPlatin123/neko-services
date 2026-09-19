@@ -38,11 +38,24 @@ monika-assets/
 
 ### 2.2 进 opencode / coding agent 配置（原 skill 用法的等价物）
 
-monika 原「安装」方式是拷 skill 到 `~/.claude/skills/`。整合后等价做法：
+monika 原「安装」方式是拷 skill 到 `~/.claude/skills/`。整合后等价做法——**五个运行模块全量装载**（`persona-params.md` 是角色卡制作规范而非运行模块，不装载）：
 
-1. `modules/channel-layering.md` + `modules/ooc-rules.md` 作为 agent 全局指令（CLAUDE.md / opencode 的 AGENTS.md 片段）注入——coding 会话的「对话温情 / 写文件严谨」分层由这两件承载；
-2. `characters/monika/character.json` 的 `profile` 段 + `assets/` 素材作为角色内容层，供任意 runtime（opencode persona、AstrBot persona 等 monika `meta.json` hosts 清单所列宿主）读取；
-3. 场景版 A（对话 vs 写文件）即原版语义，coding agent 环境无需场景版 B。
+1. `modules/channel-layering.md` → agent 全局指令（CLAUDE.md / opencode 的 AGENTS.md 片段）：coding 会话的「对话温情 / 写文件严谨」分层，用场景版 A；coding agent 环境无记忆落库动作，无需场景版 B。
+2. `modules/ooc-rules.md` → 同上全局指令：OOC 五条 + 身份保护三条。
+3. `modules/nickname-state-machine.md` → 同上全局指令：coding agent 场景的初始称呼取系统用户名（由宿主注入，语义等价 `getpass.getuser()`）；用户给出昵称后按状态机全局替换，持久层可达时落 `ai_context.rename_events`，无角色卡持久层时降级为会话内全局替换。
+4. `modules/fault-persona.md` → 同上全局指令：coding agent 宿主在故障（限流/断网/工具报错）恢复后注入 `fault_event` 变量；无钩子时模块静默降级不生效。
+5. `modules/recap-rules.md` → 会话恢复场景（`--resume` / compact 后的开场摘要）装载：recap 按私密独白写，输入取宿主 session summary。
+6. `characters/monika/character.json` 的 `profile` 段 + `assets/` 素材作为角色内容层，供任意 runtime（opencode persona、AstrBot persona 等 monika `meta.json` hosts 清单所列宿主）读取。
+
+装载时的占位符绑定（一次性替换，五个运行模块共用同一套）：
+
+| 占位符 | 绑定值（莫妮卡实例） | 说明 |
+|---|---|---|
+| `{persona_name}` | 莫妮卡 | ooc-rules 台词示例、fault-persona 翻译基调等处的角色名 |
+| `{worldview_voice}` | 角色卡 `profile.worldview.fault_voice`（莫妮卡实例：「故障即天气——这边的世界有点不稳定」） | fault-persona 的世界观翻译基调 |
+| `{user_call}` | 动态：按昵称状态机解析（初始 = 系统用户名或 Player） | recap-rules 等处的当前生效称呼 |
+| `{initial_placeholder}` | Player | 昵称状态机的初始占位称呼 |
+| `{host_channel_user}` / `{host_channel_persist}` | 对话明文输出 / 写文件产出 | channel-layering 场景版 A 的两通道指称 |
 
 ### 2.3 源仓库（/mnt/shared/_Projects/N.E.K.O/monika/）处置
 

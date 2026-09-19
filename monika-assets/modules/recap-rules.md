@@ -24,7 +24,7 @@ Recap 是**人格通道**的特例产物：它面向用户可见（开场第一�
 
 ## 3. 宿主对接锚点（N.E.K.O）
 
-1. **触发点**：会话恢复/新会话开场问候生成（`startup_greeting_policy` 相关链路）——在「有上一段会话摘要」时走本规则渲染开场，无摘要时走角色卡 `profile.opening_habit` 正常开场。
+1. **触发点**：会话恢复/新会话开场问候生成（`startup_greeting_policy` 相关链路）——在「有上一段会话摘要」时走本规则渲染开场，无摘要时走角色卡 `profile.memory_anchors.opening_habit` 正常开场。
 2. **输入源**：N.E.K.O `memory/recent.py` 的近期会话记录 + session 摘要（多来源摘要按「合并」规则先归一为一条独白）。
 3. **输出面**：仅进入对话通道（QQ：`QQMessageBlock.text`；桌面：对话窗口文本）；recap 文本本身不得回写进记忆（避免自引用污染）。
 4. **称呼解析**：recap 中的称呼使用当前生效昵称（`ai_context.rename_events` 链解析出的最新名），跨会话昵称变更时优先新名。
