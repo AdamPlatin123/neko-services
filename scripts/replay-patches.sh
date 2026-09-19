@@ -151,14 +151,69 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
-# --- 实际应用：整组一次 git am（失败时 --abort 撤销整组，无部分残留）---
-if ! git -C "$NEKO_REPO" am "${patches[@]}"; then
+# --- 实际应用：非空段 git am + 墓碑空补丁 git commit --allow-empty ---
+# 006 为墓碑空补丁（manifest README「空 commit 保持序号连续使整组重放可执行」）。
+# git 2.43 的 am --allow-empty 对空补丁直接 fatal（"Resolve operation not
+# in progress"），故：按序遍历补丁，非空补丁累积为连续段一次 git am（保持
+# 整组 am 的原子语义）；空补丁用 git mailinfo 解析补丁头（Subject/Author/
+# Date）后 git commit --allow-empty 造空 commit。任何一步失败：撤销到重放
+# 前 HEAD，无部分残留中间态。
+start_head="$(git -C "$NEKO_REPO" rev-parse HEAD)"
+
+fail_out() {
     errlog ""
-    errlog "整组补丁应用失败。请勿带着失败状态重跑（会因基线不匹配被拒）。"
-    errlog "回滚方法（撤销本次全部已应用补丁，回到重放前 HEAD）:"
-    errlog "  git -C \"$NEKO_REPO\" am --abort"
+    errlog "整组补丁应用失败，已回滚到重放前 HEAD（$start_head）。"
+    errlog "请勿带着失败状态重跑（会因基线不匹配被拒）。"
     errlog "修复补丁或目标仓库后，重新运行本脚本从基线整体重放。"
     exit 1
+}
+
+rollback_all() {
+    git -C "$NEKO_REPO" am --abort >/dev/null 2>&1 || true
+    git -C "$NEKO_REPO" reset --hard "$start_head" >/dev/null 2>&1 || true
+}
+
+# 空补丁判定：正文不含任何 diff（diff --git / --- a|b|/dev/null）行
+is_empty_patch() {
+    ! grep -qE '^(diff --git|--- (a/|b/|/dev/null))' "$1"
+}
+
+# 造墓碑空 commit：mailinfo 解析头（Subject 单行为墓碑全部 message；
+# msg 正文只是邮件尾签名 "-- /2.43.0"，不用）
+apply_empty_patch() {
+    local p="$1" info msg pbody
+    info="$(mktemp)" msg="$(mktemp)" pbody="$(mktemp)"
+    if ! git mailinfo "$msg" "$pbody" < "$p" > "$info" 2>/dev/null; then
+        rm -f "$info" "$msg" "$pbody"
+        return 1
+    fi
+    local subject author email date
+    subject="$(sed -n 's/^Subject: //p' "$info")"
+    author="$(sed -n 's/^Author: //p' "$info")"
+    email="$(sed -n 's/^Email: //p' "$info")"
+    date="$(sed -n 's/^Date: //p' "$info")"
+    rm -f "$info" "$msg" "$pbody"
+    [ -n "$subject" ] && [ -n "$author" ] && [ -n "$email" ] || return 1
+    git -C "$NEKO_REPO" commit --allow-empty \
+        --author="$author <$email>" ${date:+--date="$date"} \
+        -m "$subject" >/dev/null
+}
+
+group=()
+for p in "${patches[@]}"; do
+    if is_empty_patch "$p"; then
+        if [ "${#group[@]}" -gt 0 ]; then
+            git -C "$NEKO_REPO" am "${group[@]}" || { rollback_all; fail_out; }
+            group=()
+        fi
+        log "（墓碑空补丁 $(basename "$p")：git commit --allow-empty 落地为空 commit）"
+        apply_empty_patch "$p" || { rollback_all; fail_out; }
+    else
+        group+=("$p")
+    fi
+done
+if [ "${#group[@]}" -gt 0 ]; then
+    git -C "$NEKO_REPO" am "${group[@]}" || { rollback_all; fail_out; }
 fi
 
 log ""

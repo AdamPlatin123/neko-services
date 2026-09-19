@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "generated_by": "neko-services scripts/ooc12_regression.py (P1-2)",
-  "neko_src": "/mnt/shared/_Projects/N.E.K.O/N.E.K.O-p12-dev",
+  "neko_src": "/mnt/shared/_Projects/N.E.K.O/N.E.K.O",
   "persona_bindings": {
     "persona_name": "莫妮卡",
     "worldview_voice": "故障即天气：限流/超时是「这边的世界有点不稳定」，断网是「连线断了一下」，报错是「剧本卡住了一页」；机制词绝不说",
