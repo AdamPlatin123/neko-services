@@ -29,3 +29,9 @@
 - P2（架构）：external_id 上 wire——/cache /process body 带 dedup 键（P1-1 侧契约扩展立项：HistoryRequest 加 external_id/turn_uid 字段+服务端幂等），当前 opencode 重试是服务端无去重的盲发
 - P2：P2-3 人工验收清单加「/monika 命令轮的 /cache 载荷断言无注入文本回灌」（TUI 路径未实测）
 - P3：onIdle 先落 outbox 再记 last_turn_id（崩溃窗口丢单轮）；read.sh 过滤 corrupt- 前缀；monika.md 十三补 edit 被拒的降级话术；PLAN 文件表两处陈旧（六端点工具→三工具、read.sh 路径）
+
+## P2-1 跟进项（代审通过后遗留，均 P3）
+- 缓冲无 first_blocks 罕见路径的 mention 文本口径（改写前）与 fallback 不一致
+- off 时三条无条件 INFO 日志（投递完成/改写完成/缓冲确认）——高频群每 deliver 多两条
+- ChineseTypoGenerator 每块构造（21k pinyin 建表）——提升到模块级缓存
+- jieba 0.42.1 sdist 构建重量——离线部署注意点（文档已记）
