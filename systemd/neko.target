@@ -1,0 +1,23 @@
+# =============================================================================
+# neko.target — N.E.K.O 常驻服务集总入口（systemd user target）
+# 部署裁决（workplan P0-0 第 7 项，代审后为三件套拓扑）：
+#   - 「systemctl --user start neko.target」一键冷启全部常驻服务（<2 分钟）；
+#   - 三件套 = neko-memory(48912) / neko-main(48911) / neko-agent(48915)，
+#     共享同一 NEKO_INSTANCE_ID——launcher 只在三口 /health 齐全且指纹全同
+#     时才 attach 桌面前端；部分占用会触发整套换端口另起第二套（双写
+#     分裂），故三件套必须作为一个整体启停（各 unit 已设 PartOf= 本 target）；
+#   - 与桌面 launcher（uv run launcher.py）互斥使用：见 systemd/INSTALL.md
+#     「互斥警告」节与 runbook（neko-services/README.md）拓扑节；
+#   - NapCat 由 qq_auto_reply 插件托管（进程树跟随插件生命周期，stdout 接
+#     日志文件供 doctor 巡检），不设独立 unit；
+#   - neko-a-memorix.service 为占位（ConditionPathExists 不满足时自动
+#     skipped），P0-1「a-memorix 服务化」落地后自动纳入，无需改本文件。
+# =============================================================================
+
+[Unit]
+Description=N.E.K.O resident services (memory + main + agent + a-memorix)
+Wants=neko-memory.service neko-main.service neko-agent.service neko-a-memorix.service
+After=neko-memory.service neko-main.service neko-agent.service neko-a-memorix.service
+
+[Install]
+WantedBy=default.target
