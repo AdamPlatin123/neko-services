@@ -1,0 +1,581 @@
+From ce0f5a10d8cd9b33dd4854d97a896cf7b3f6f065 Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:35:16 +0800
+Subject: [PATCH] =?UTF-8?q?feat(memory):=20settle=20=E6=88=90=E5=8A=9F?=
+ =?UTF-8?q?=E5=90=8E=E6=89=B9=E9=87=8F=E5=86=99=E5=85=A5=20a-memorix=20?=
+ =?UTF-8?q?=E6=A3=80=E7=B4=A2=E7=B4=A2=E5=BC=95=EF=BC=88UC1=20#9=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+workplan P1-1 #9（UC1 裁决保留双层后的写钩子）——memory_server 为唯一
+事实源，a-memorix 只存可重建索引；钩子默认 off（A_MEMORIX_URL 未设置
+即零行为差异），仅在结算成功后触发。
+
+- main_logic/cross_server.py 新增写钩子三件：
+  - _split_turn_blocks：会话历史按 user 边界切 turn 块（主动搭话的
+    assistant 尾巴单独成块；system 条目/空文本跳过）；
+  - _a_memorix_external_id：五段规范
+    {channel}:{user_id}:{chat_id}:{turn_uid}:{seq}——channel=neko_desktop
+    （wechat/qq 通道钩子落地时沿用同一规范），user_id="adam" 为多用户
+    预留维度占位（宪章 #6），chat_id=角色名对齐 recent.json 分文件，
+    turn_uid=块内容 sha256 前 8 hex（同内容重放同 id，幂等去重由
+    a-memorix 外部幂等映射兜底），seq 恒 0 为 per-turn 通知预留；
+  - _ingest_turn_block_to_a_memorix：POST /a_memorix/v1/ingest_summary
+    （mem-client 风格：request_id、2xx+success 判定、202 启动队列按
+    成功、失败分类返回）。走 ingest_summary 而非裸 ingest_text 是
+    P0-1b 约束：a-memorix scope 身份解析只认 chat_summary:*/web_import:*
+    前缀，显式 text 的 ingest_summary 内部转
+    ingest_text(source_type="chat_summary") 才不产生检索 scope 缺口。
+- 接入点两处，均在 chat_history.clear() 之前取快照：session end 的
+  /process|/settle 成功分支（is_context_reset_barrier 屏障分支不触发
+  ——memory_server 侧放弃了注定被丢弃的摘要，索引侧同一姿态）；renew
+  session 的 /renew|/settle 成功分支（renew 清空后剩余段由最终
+  session end 快照覆盖，两批无重叠）。
+- 近实时通知（/cache 后逐条 notify）评估后**降级为 settle 后批量**：
+  ingest 含 embedding 计算（非轻量），turn end /cache 在 connector
+  消息主循环里 await 会卡住 gemini_response 流转发（最坏每 turn 拖
+  10s）；fire-and-forget 引入无界并发+seq 状态机不成比例；读侧近实时
+  由 L1（recent.json 秒级可读）兜底。决策细节见
+  _ingest_chat_history_to_a_memorix docstring。
+- 失败=日志 WARN 不重试（丢块可从事实源重建，external_id 内容哈希
+  维度保证重建重放不重复写入）。
+
+测试：tests/unit/test_amemorix_write_hook.py 14 例（turn 切分×3/
+external_id 规范+稳定性/请求形状与 chat_summary 语义/202 成功/
+success:false 拦截/超时降级/默认 off 零调用/部分失败 WARN 不抛/
+空会话跳过/成功计数/接入点守门——renew+session_end 都挂钩子且带
+语言屏障 guard）；cross_server 相关回归 236 passed。
+---
+ main_logic/cross_server.py             | 209 +++++++++++++++++++
+ tests/unit/test_amemorix_write_hook.py | 277 +++++++++++++++++++++++++
+ 2 files changed, 486 insertions(+)
+ create mode 100644 tests/unit/test_amemorix_write_hook.py
+
+diff --git a/main_logic/cross_server.py b/main_logic/cross_server.py
+index 84a172f5..473a83bb 100644
+--- a/main_logic/cross_server.py
++++ b/main_logic/cross_server.py
+@@ -22,6 +22,8 @@ Note that the cross server is a one-way forwarder and never sends anything back
+ 
+ import ssl
+ import uuid
++import hashlib
++import os
+ import inspect
+ from urllib.parse import quote
+ 
+@@ -639,6 +641,190 @@ async def _try_send_bytes(slot: _WSSlot | None, payload: bytes) -> bool:
+         return False
+ 
+ 
++# ── a-memorix 写钩子（p1-1 #9，UC1 转正后的检索索引写入）────────────────
++# 事实源唯一性原则（P1-1 #5）：memory_server 是唯一事实源，a-memorix 只存
++# 可重建的索引/派生数据。因此本钩子只在 memory_server 结算**成功后**触发，
++# 失败只 WARN 不重试——丢的块可随时从事实源重建（external_id 的内容哈希
++# 维度保证重建重放不会重复写入）。
++
++#: 环境变量未设置/为空 = 写钩子关闭（默认 off）；设置为服务根 URL 启用，
++#: 如 http://127.0.0.1:48921（与 neko-services scripts/lib.sh 的
++#: NEKO_AMEMORIX_URL 默认一致）。逐次读取（不缓存），便于测试与运行期开关。
++A_MEMORIX_URL_ENV = "A_MEMORIX_URL"
++
++
++def _a_memorix_base_url() -> str:
++    """Return the configured a-memorix base URL, or '' when the hook is off."""
++    return str(os.environ.get(A_MEMORIX_URL_ENV, "") or "").strip().rstrip("/")
++
++
++def _split_turn_blocks(chat_history: list, lanlan_name: str) -> list[str]:
++    """把会话历史切成 turn 块文本（user 边界切块），供 a-memorix ingest。
++
++    每块以一条 user 消息开头、到下一条 user 消息之前的全部 assistant 消息
++    结束（主动搭话等无 user 前导的 assistant 尾巴单独成块）。system 条目
++    （如"网络错误，您已断开连接！"）不是对话内容，跳过。空文本条目跳过。
++    """
++    blocks: list[str] = []
++    current: list[str] = []
++    for item in chat_history:
++        if not isinstance(item, dict):
++            continue
++        role = item.get("role")
++        if role not in ("user", "assistant"):
++            continue
++        text = _extract_chat_item_text(item).strip()
++        if not text:
++            continue
++        if role == "user" and current:
++            blocks.append("\n".join(current))
++            current = []
++        label = lanlan_name if role == "assistant" else "用户"
++        current.append(f"[{label}] {text}")
++    if current:
++        blocks.append("\n".join(current))
++    return blocks
++
++
++def _a_memorix_external_id(lanlan_name: str, block_text: str) -> str:
++    """external_id 规范 ``{channel}:{user_id}:{chat_id}:{turn_uid}:{seq}``。
++
++    - channel=neko_desktop：本写钩子只服务桌面主进程的 settle；wechat/qq
++      通道的钩子在各自插件侧落地时沿用同一规范（channel 维度预留）；
++    - user_id="adam"：**多用户预留维度的占位**（宪章 #6 / P0-0 #4）——MVP
++      单用户，未来多用户化时用真实账号 id 替换，近零成本对冲；
++    - chat_id=角色名：与 memory_server recent.json 的按角色分文件对齐；
++    - turn_uid=块内容 sha256 前 16 hex（64 位）：同内容重放得到同
++      external_id，幂等去重由 a-memorix 的外部幂等映射兜底（重复 settle 同
++      turn 不重复写）。取 16 hex 而非更短：8 hex（32 位）在万块级（~9k 块）
++      就有 ~1% 生日碰撞概率，两条不同对话会坍缩成一条被误去重；64 位下
++      碰撞需要的块数（~6e8）远超任何会话规模，可忽略。
++      已知局限（有意接受）：内容哈希做幂等键意味着**同一会话内一字不差的
++      重复 turn 块会被坍缩为一条**（例如用户连发两次相同的话且角色回复也
++      相同——真实对话中整 turn 逐字重复极罕见）。重复本身的频次信息不进
++      a-memorix 索引；memory_server 事实源仍保留完整逐条记录。
++    - seq：本钩子按 turn 块整体写入，恒 0；序号维度为未来 per-turn 近实时
++      通知（/cache 后单条 ingest、seq 递增）预留——见 _ingest_chat_history_
++      to_a_memorix 的决策注释。
++    """
++    content_hash = hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:16]
++    return f"neko_desktop:adam:{lanlan_name}:{content_hash}:0"
++
++
++async def _ingest_turn_block_to_a_memorix(
++    base_url: str,
++    lanlan_name: str,
++    block_text: str,
++    *,
++    seq: int,
++) -> tuple[bool, str]:
++    """POST /a_memorix/v1/ingest_summary 写入一个 turn 块（mem-client 风格）。
++
++    走 ingest_summary（显式 text 非空 → 内部转 ingest_text(source_type=
++    "chat_summary")）：P0-1b 查证 a-memorix 的 scope 身份解析只认
++    chat_summary:*/web_import:* 前缀——聊天写入必须走该 source_type 路径，
++    裸 ingest_text + 自选 source_type 会造成检索 scope 缺口。
++
++    成功判定：HTTP 2xx 且 body 为 dict 且 ``success`` 不为 False——202 =
++    启动队列排队（WAL 回放，最终会写入）按成功对待。失败返回 (False, detail)，
++    调用方只 WARN 不重试。
++    """
++    request_id = uuid.uuid4().hex[:8]
++    payload = {
++        "external_id": _a_memorix_external_id(lanlan_name, block_text),
++        "chat_id": lanlan_name,
++        "text": block_text,
++        "participants": ["用户", lanlan_name],
++        "metadata": {
++            "channel": "neko_desktop",
++            "seq": int(seq),
++            "request_id": request_id,
++        },
++    }
++    try:
++        response = await get_internal_http_client().post(
++            f"{base_url}/a_memorix/v1/ingest_summary",
++            json=payload,
++            timeout=10.0,
++        )
++    except asyncio.CancelledError:
++        raise
++    except Exception as e:
++        return False, f"{type(e).__name__}: {e}"
++
++    if not response.is_success:
++        return False, f"HTTP {response.status_code}"
++    try:
++        result = response.json() if response.text else {}
++    except Exception:
++        return False, "non-JSON response"
++    if not isinstance(result, dict):
++        return False, f"unexpected response type: {type(result).__name__}"
++    if result.get("success") is False:
++        return False, str(result.get("error") or result.get("detail") or "unknown_error")
++    return True, ""
++
++
++async def _ingest_chat_history_to_a_memorix(
++    chat_history: list,
++    lanlan_name: str,
++    *,
++    trigger: str,
++) -> None:
++    """结算成功后把本会话对话批量写入 a-memorix（p1-1 #9 写钩子入口）。
++
++    触发点：session end 的 /process|/settle 成功后、renew session 的
++    /renew|/settle 成功后（两者都在 chat_history.clear() 之前取快照——
++    renew 清空历史后，剩余段由 session end 的快照覆盖，两批无重叠）。
++    语言切换屏障（is_context_reset_barrier）分支**不触发**：memory_server
++    侧都放弃了注定被丢弃的摘要，索引侧保持同一姿态（事实源唯一性）。
++
++    近实时通知的决策（workplan #9 的 L2 替代路径评估）：**降级为 settle 后
++    批量**，不做 /cache 后逐条 notify。理由：
++    1. a-memorix ingest_text 含 embedding 计算（非轻量请求），turn end 的
++       /cache 在本 connector 的消息主循环里 await——同循环还负责
++       gemini_response 流转发与 user transcript 通知，逐条 notify 最坏
++       每 turn 拖 10s 会卡住整个 sync 管道；
++    2. fire-and-forget 规避阻塞会引入无界并发 + external_id seq 状态机，
++       复杂度不成比例；
++    3. 读侧近实时由 L1（recent.json 每轮 /cache 秒级可读）兜底——a-memorix
++       是语义检索层，"会话结束后可检索"对 MVP 检索场景够用。块级
++       external_id 幂等让未来切换到 per-turn 通知时可以无损重放。
++    """
++    base_url = _a_memorix_base_url()
++    if not base_url:
++        return
++    blocks = _split_turn_blocks(chat_history, lanlan_name)
++    if not blocks:
++        return
++    results = await asyncio.gather(*(
++        _ingest_turn_block_to_a_memorix(base_url, lanlan_name, block, seq=i)
++        for i, block in enumerate(blocks)
++    ), return_exceptions=True)
++    failures = []
++    for i, outcome in enumerate(results):
++        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
++            # CancelledError 等非 Exception 的 BaseException 不吞
++            raise outcome
++        if isinstance(outcome, Exception):
++            failures.append(f"#{i}: {type(outcome).__name__}: {outcome}")
++        elif not outcome[0]:
++            failures.append(f"#{i}: {outcome[1]}")
++    if failures:
++        # 只 WARN 不重试（重复 settle 幂等由 external_id 兜底；丢块可从
++        # memory_server 事实源重建——本钩子开头的事实源原则注释）。
++        logger.warning(
++            "[%s] a-memorix ingest (%s): %d/%d turn blocks failed: %s",
++            lanlan_name, trigger, len(failures), len(blocks),
++            "; ".join(failures[:5]),
++        )
++    else:
++        logger.info(
++            "[%s] a-memorix ingest (%s): %d turn blocks ok",
++            lanlan_name, trigger, len(blocks),
++        )
++
++
+ async def _post_memory_server(
+     endpoint: str,
+     lanlan_name: str,
+@@ -1067,6 +1253,14 @@ async def run_sync_connector(
+                                                 pass
+                                     else:
+                                         logger.info(f"[{lanlan_name}] 热重置记忆已成功上传到 memory_server ({_renew_endpoint})")
++                                        # p1-1 #9：结算成功后把本会话（重置前的
++                                        # 全量）批量写入 a-memorix——必须在下方
++                                        # chat_history.clear() 之前取快照；renew
++                                        # 清空后的新段由最终 session end 的快照
++                                        # 覆盖，两批无重叠。
++                                        await _ingest_chat_history_to_a_memorix(
++                                            chat_history, lanlan_name, trigger="renew",
++                                        )
+                                 except RuntimeError as e:
+                                     if "shutdown" in str(e).lower() or "closed" in str(e).lower():
+                                         logger.info(f"[{lanlan_name}] 进程正在关闭，{_renew_endpoint}请求已取消")
+@@ -1440,6 +1634,21 @@ async def run_sync_connector(
+                                                     pass
+                                         else:
+                                             logger.info(f"[{lanlan_name}] session end 记忆结算完成（{_settle_endpoint}），{len(_settle_payload)} 条消息")
++                                            # p1-1 #9（UC1 转正）：结算成功后把
++                                            # 本会话全量对话批量写入 a-memorix
++                                            # （默认 off，A_MEMORIX_URL 控制）。
++                                            # 在 chat_history.clear() 之前取快照；
++                                            # 只在成功分支触发（事实源唯一性：
++                                            # memory_server 没收下的内容不进索引）；
++                                            # 语言切换屏障分支不触发——memory_server
++                                            # 侧都放弃了注定被丢弃的摘要（屏障后
++                                            # recent.json 被权威清空），索引侧保持
++                                            # 同一姿态（见 _ingest_chat_history_
++                                            # to_a_memorix 的决策注释）。
++                                            if not is_context_reset_barrier:
++                                                await _ingest_chat_history_to_a_memorix(
++                                                    chat_history, lanlan_name, trigger="session_end",
++                                                )
+                                     except Exception as e:
+                                         logger.warning(f"[{lanlan_name}] session end 记忆结算失败 ({_settle_endpoint}): {e}")
+                                         if status_callback:
+diff --git a/tests/unit/test_amemorix_write_hook.py b/tests/unit/test_amemorix_write_hook.py
+new file mode 100644
+index 00000000..cef99be2
+--- /dev/null
++++ b/tests/unit/test_amemorix_write_hook.py
+@@ -0,0 +1,277 @@
++# -*- coding: utf-8 -*-
++"""a-memorix 写钩子的测试（p1-1 #9，UC1 转正后的检索索引写入）。
++
++覆盖四层：
++
++1. turn 切分（_split_turn_blocks）：user 边界切块、无 user 前导的 assistant
++   尾巴单独成块、system 条目跳过、空文本跳过；
++2. external_id 规范（_a_memorix_external_id）：五段
++   ``{channel}:{user_id}:{chat_id}:{turn_uid}:{seq}``、内容哈希稳定（同内容
++   重放同 id → 幂等兜底）、不同内容不同 id；
++3. 单块 ingest（_ingest_turn_block_to_a_memorix）：请求形状（ingest_summary
++   端点 / chat_summary 语义走 ingest_summary 路径）、2xx+success 判定、
++   202 排队按成功、200+success:false 拦截、超时降级；
++4. 批量入口（_ingest_chat_history_to_a_memorix）：A_MEMORIX_URL 未设 =
++   默认 off 零调用、部分失败只 WARN 不抛（settle 主流程不受影响）、
++   空会话跳过；以及接入点守门（settle 成功分支确实挂上了钩子——上游
++   test_no_recent_json_writer_bypasses_the_lock_module 的源码守门先例）。
++"""
++from __future__ import annotations
++
++import asyncio
++import os
++import sys
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
++
++from main_logic import cross_server
++
++pytestmark = pytest.mark.unit
++
++_HER = "Xiaoba"
++_BASE = "http://127.0.0.1:48921"
++
++
++def _history(*roles_texts):
++    return [
++        {"role": role, "content": [{"type": "text", "text": text}]}
++        for role, text in roles_texts
++    ]
++
++
++# ─────────────────── 1. turn 切分 ───────────────────
++
++
++def test_split_turn_blocks_cuts_at_user_boundaries():
++    history = _history(
++        ("user", "你好"),
++        ("assistant", "你好呀"),
++        ("assistant", "补充一句"),
++        ("user", "第二句"),
++        ("assistant", "回复二"),
++    )
++    blocks = cross_server._split_turn_blocks(history, _HER)
++    assert blocks == [
++        f"[用户] 你好\n[{_HER}] 你好呀\n[{_HER}] 补充一句",
++        f"[用户] 第二句\n[{_HER}] 回复二",
++    ]
++
++
++def test_split_turn_blocks_proactive_assistant_tail_becomes_own_block():
++    """主动搭话（无 user 前导的 assistant）单独成块——它也是记忆。"""
++    history = _history(
++        ("assistant", "主动搭话"),
++        ("user", "回应"),
++        ("assistant", "回复"),
++    )
++    blocks = cross_server._split_turn_blocks(history, _HER)
++    assert blocks == [
++        f"[{_HER}] 主动搭话",
++        f"[用户] 回应\n[{_HER}] 回复",
++    ]
++
++
++def test_split_turn_blocks_skips_system_and_empty_entries():
++    history = [
++        {"role": "system", "content": [{"type": "text", "text": "网络错误，您已断开连接！"}]},
++        {"role": "user", "content": [{"type": "text", "text": "  "}]},
++        {"role": "user", "content": [{"type": "text", "text": "真消息"}]},
++        {"role": "assistant", "content": [{"type": "text", "text": "回"}]},
++    ]
++    blocks = cross_server._split_turn_blocks(history, _HER)
++    assert blocks == [f"[用户] 真消息\n[{_HER}] 回"]
++
++
++# ─────────────────── 2. external_id 规范 ───────────────────
++
++
++def test_external_id_follows_five_segment_spec():
++    external_id = cross_server._a_memorix_external_id(_HER, "[用户] hi")
++    parts = external_id.split(":")
++    assert len(parts) == 5
++    assert parts[0] == "neko_desktop", "channel 按会话来源=桌面主进程"
++    assert parts[1] == "adam", "user_id 是多用户预留维度的占位（见函数注释）"
++    assert parts[2] == _HER, "chat_id 与 recent.json 按角色分文件对齐"
++    # 16 hex = 64 位内容哈希：万块级生日碰撞概率可忽略（8 hex 时 ~9k 块即 1%）
++    assert len(parts[3]) == 16 and all(c in "0123456789abcdef" for c in parts[3])
++    assert parts[4] == "0", "整块写入 seq=0；序号维度为 per-turn 通知预留"
++
++
++def test_external_id_is_stable_for_identical_content():
++    a = cross_server._a_memorix_external_id(_HER, "同一段对话")
++    b = cross_server._a_memorix_external_id(_HER, "同一段对话")
++    c = cross_server._a_memorix_external_id(_HER, "另一段对话")
++    assert a == b, "同内容重放同 id——幂等去重由 a-memorix external_id 映射兜底"
++    assert a != c
++
++
++# ─────────────────── 3. 单块 ingest ───────────────────
++
++
++def _client_mock(post_response=None, side_effect=None):
++    client = MagicMock()
++    if side_effect is not None:
++        client.post = AsyncMock(side_effect=side_effect)
++    else:
++        client.post = AsyncMock(return_value=post_response)
++    return client
++
++
++def _resp(payload=None, status_code=200, is_success=True, text=""):
++    return SimpleNamespace(
++        status_code=status_code,
++        is_success=is_success,
++        text=text or (str(payload) if payload is not None else ""),
++        json=(lambda p: (lambda: p))(payload),
++    )
++
++
++async def test_ingest_block_posts_to_ingest_summary_with_contract_shape():
++    client = _client_mock(post_response=_resp({"success": True, "stored_ids": ["x"]}))
++
++    with patch.object(cross_server, "get_internal_http_client", return_value=client):
++        ok, detail = await cross_server._ingest_turn_block_to_a_memorix(
++            _BASE, _HER, "[用户] hi", seq=3,
++        )
++
++    assert ok is True and detail == ""
++    call = client.post.await_args
++    assert call.args[0] == f"{_BASE}/a_memorix/v1/ingest_summary"
++    payload = call.kwargs["json"]
++    # P0-1b：聊天写入必须走 chat_summary 语义——显式 text 的 ingest_summary
++    # 内部转 ingest_text(source_type="chat_summary")，scope 解析才认得。
++    assert payload["text"] == "[用户] hi"
++    assert payload["chat_id"] == _HER
++    assert payload["external_id"].startswith(f"neko_desktop:adam:{_HER}:")
++    assert payload["metadata"]["channel"] == "neko_desktop"
++    assert payload["metadata"]["seq"] == 3
++
++
++async def test_ingest_block_treats_202_startup_queue_as_success():
++    """202 = 启动队列排队（WAL 回放最终写入）——按成功对待。"""
++    client = _client_mock(post_response=_resp(
++        {"queued": True, "success": True}, status_code=202, is_success=True,
++    ))
++    with patch.object(cross_server, "get_internal_http_client", return_value=client):
++        ok, _ = await cross_server._ingest_turn_block_to_a_memorix(
++            _BASE, _HER, "blk", seq=0,
++        )
++    assert ok is True
++
++
++async def test_ingest_block_intercepts_success_false_body():
++    client = _client_mock(post_response=_resp(
++        {"success": False, "error": "embedding degraded"}, status_code=200,
++    ))
++    with patch.object(cross_server, "get_internal_http_client", return_value=client):
++        ok, detail = await cross_server._ingest_turn_block_to_a_memorix(
++            _BASE, _HER, "blk", seq=0,
++        )
++    assert ok is False and "embedding degraded" in detail
++
++
++async def test_ingest_block_degrades_on_exception():
++    client = _client_mock(side_effect=TimeoutError("10s"))
++    with patch.object(cross_server, "get_internal_http_client", return_value=client):
++        ok, detail = await cross_server._ingest_turn_block_to_a_memorix(
++            _BASE, _HER, "blk", seq=0,
++        )
++    assert ok is False and "TimeoutError" in detail
++
++
++# ─────────────────── 4. 批量入口 + 接入点守门 ───────────────────
++
++
++async def test_hook_off_by_default_no_http_calls(monkeypatch):
++    monkeypatch.delenv("A_MEMORIX_URL", raising=False)
++    client = _client_mock()
++
++    with patch.object(cross_server, "get_internal_http_client", return_value=client):
++        await cross_server._ingest_chat_history_to_a_memorix(
++            _history(("user", "hi"), ("assistant", "yo")), _HER, trigger="session_end",
++        )
++
++    client.post.assert_not_awaited(), "默认 off：未配置 A_MEMORIX_URL 时零调用"
++
++
++async def test_batch_ingest_reports_partial_failure_without_raising(monkeypatch):
++    monkeypatch.setenv("A_MEMORIX_URL", _BASE)
++    ok_resp = _resp({"success": True})
++    bad_resp = _resp({"success": False, "error": "boom"}, status_code=200)
++    client = MagicMock()
++    client.post = AsyncMock(side_effect=[ok_resp, bad_resp, ok_resp])
++
++    history = _history(
++        ("user", "q1"), ("assistant", "a1"),
++        ("user", "q2"), ("assistant", "a2"),
++        ("user", "q3"), ("assistant", "a3"),
++    )
++    with patch.object(cross_server, "get_internal_http_client", return_value=client), \
++         patch.object(cross_server.logger, "warning") as warn:
++        await cross_server._ingest_chat_history_to_a_memorix(
++            history, _HER, trigger="session_end",
++        )
++
++    assert client.post.await_count == 3
++    warn.assert_called_once(), "部分失败只 WARN，绝不抛出阻塞 settle 主流程"
++    # logger.warning("... %d/%d turn blocks failed ...", 1, 3, ...)——格式化参数
++    assert 1 in warn.call_args.args and 3 in warn.call_args.args
++
++
++async def test_batch_ingest_skips_empty_history(monkeypatch):
++    monkeypatch.setenv("A_MEMORIX_URL", _BASE)
++    client = _client_mock()
++    with patch.object(cross_server, "get_internal_http_client", return_value=client):
++        await cross_server._ingest_chat_history_to_a_memorix([], _HER, trigger="session_end")
++        await cross_server._ingest_chat_history_to_a_memorix(
++            _history(("system", "只有系统条目")), _HER, trigger="session_end",
++        )
++    client.post.assert_not_awaited()
++
++
++async def test_batch_ingest_logs_success_count(monkeypatch):
++    monkeypatch.setenv("A_MEMORIX_URL", _BASE)
++    client = _client_mock(post_response=_resp({"success": True}))
++    history = _history(("user", "q1"), ("assistant", "a1"))
++    with patch.object(cross_server, "get_internal_http_client", return_value=client), \
++         patch.object(cross_server.logger, "info") as info:
++        await cross_server._ingest_chat_history_to_a_memorix(
++            history, _HER, trigger="renew",
++        )
++    assert any(
++        "turn blocks ok" in str(c.args[0] if c.args else "") or (
++            c.args and c.args[-1:] == (1,) and len(c.args) >= 2 and c.args[-2] == 1
++        )
++        for c in info.call_args_list
++    )
++
++
++def test_settle_paths_wire_the_write_hook():
++    """接入点守门（上游 test_no_recent_json_writer_bypasses_the_lock_module
++    的源码守门先例）：renew 与 session end 的结算成功分支都必须挂上写钩子，
++    且 session end 分支带语言屏障 guard。"""
++    source = inspect_source()
++    assert source.count("_ingest_chat_history_to_a_memorix(") >= 3, (
++        "定义 1 处 + renew/session_end 接入 2 处"
++    )
++    # session end 接入必须被 is_context_reset_barrier guard（屏障分支不进索引）
++    session_end_zone = source[source.index("session end 记忆结算完成"):]
++    barrier_guard = "if not is_context_reset_barrier:" in session_end_zone
++    assert barrier_guard, "语言切换屏障分支不得触发 a-memorix ingest"
++    # renew 接入在 clear 之前
++    renew_zone = source[
++        source.index("热重置记忆已成功上传"):source.index("'turn end', 'turn end agent_callback'")
++    ]
++    assert "_ingest_chat_history_to_a_memorix(" in renew_zone
++
++
++def inspect_source() -> str:
++    path = os.path.join(
++        os.path.dirname(__file__), "..", "..", "main_logic", "cross_server.py",
++    )
++    with open(path, encoding="utf-8") as f:
++        return f.read()
+-- 
+2.43.0
+
