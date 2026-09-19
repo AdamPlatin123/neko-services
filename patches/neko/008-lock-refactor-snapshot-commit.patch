@@ -1,0 +1,801 @@
+From 583f81a65432767b31134fff0f9c4dd804b7c10b Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:39:00 +0800
+Subject: [PATCH 2/3] =?UTF-8?q?feat(memory):=20=E6=91=98=E8=A6=81=20LLM=20?=
+ =?UTF-8?q?=E7=A7=BB=E5=87=BA=E8=A7=92=E8=89=B2=E7=BA=A7=20settle=20lock?=
+ =?UTF-8?q?=EF=BC=88=E5=BF=AB=E7=85=A7+=E7=89=88=E6=9C=AC=E6=A0=A1?=
+ =?UTF-8?q?=E9=AA=8C=E6=8F=90=E4=BA=A4=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+UC3 完整裁决 1a-3（workplan P1-1 #4）：此前 /renew /settle 在持有
+_get_settle_lock 期间调 update_history(detailed=True)——内含压缩摘要 LLM
+（数秒到数十秒），结算期间其他入口秒级 /cache 被 5s 超时杀死。
+
+- update_history 增加 phase_lock 参数：传入时自管三段——append 落盘段
+  （角色锁+文件锁内，_append_and_plan 同时快照待压缩数据并标记压缩意图）
+  → 压缩 LLM（**角色锁外**）→ splice 提交段（重入角色锁+文件锁）。splice
+  的 fingerprint 锚点校验即「版本校验后提交」：期间新 /cache 落入只追加
+  尾部、锚点匹配照常 merged；头部被清空/改写则 moot 丢弃。期间涌入量再次
+  超阈值 → 剩余量留待下次（不循环再压，enforce_hard_cap 兜底硬上限）。
+- update_history 增加 after_append 钩子：/renew /settle 的 astore_
+  conversation 从「锁内 update_history 之后」改为「append 段内回调」——
+  保持「recent append 先于 db 写」的身份校验顺序（stale 批次在 append 段
+  即中断，绝不进 time_indexed；test_memory_server_cache_settle 的
+  stale-identity 门禁继续通过）。
+- /new_dialog 语义保持：压缩 in-flight 标记（per-character Event，段1
+  clear、splice/失败/异常/取消出口 finally 统一 set）+ 拿锁前锁外有界等待
+  （NEW_DIALOG_COMPRESS_WAIT_SECONDS=30s；持锁等待会与 splice 段重入互锁）。
+  超时读当前状态——splice 是原子临界区、不存在半压缩状态，读到的只是
+  未经摘要的完整原文。
+- /cache（compress=False 无 LLM）与 /process（锁外）不受影响。
+
+测试：tests/unit/test_settle_lock_refactor.py 11 例——慢 LLM(0.5s) 期间
+并发 /cache 写与 /recent_history 读均 <0.3s 完成；压缩期间落入消息经
+锚点校验保留；new_dialog 等待原语挂起/收口/超时三态；LLM 失败/异常/取消
+路径 in-flight 全收口；after_append 顺序（锁内、LLM 前、stale 跳过）；
+期间涌入 12 条只压一次留待下次；无 phase_lock 旧路径不回归。
+相关回归 138+43 passed。
+---
+ app/memory_server/routes.py             |  78 +++--
+ config/__init__.py                      |   2 +
+ config/memory_settings.py               |   9 +
+ memory/recent.py                        | 164 ++++++++--
+ tests/unit/test_settle_lock_refactor.py | 380 ++++++++++++++++++++++++
+ 5 files changed, 592 insertions(+), 41 deletions(-)
+ create mode 100644 tests/unit/test_settle_lock_refactor.py
+
+diff --git a/app/memory_server/routes.py b/app/memory_server/routes.py
+index 5acdd383..736715a8 100644
+--- a/app/memory_server/routes.py
++++ b/app/memory_server/routes.py
+@@ -22,6 +22,7 @@ with its flush loop.
+ import asyncio
+ import json
+ import re
++import time
+ from datetime import datetime, timedelta
+ from typing import Literal
+ from uuid import uuid4
+@@ -1150,16 +1151,25 @@ async def process_conversation_for_renew(request: HistoryRequest, lanlan_name: s
+             if _has_human_messages(input_history):
+                 await gates._aclear_review_clean(lanlan_name)
+             logger.info(f"[MemoryServer] renew: 收到 {lanlan_name} 的对话历史处理请求，消息数: {len(input_history)}")
+-            # 首轮摘要带锁：阻塞 /new_dialog 直到摘要+时间戳写入完成
+-            async with runtime._get_settle_lock(lanlan_name):
+-                await runtime.recent_history_manager.update_history(
+-                    input_history,
+-                    lanlan_name,
+-                    detailed=True,
+-                    on_compress_done=review._on_compress_done,
+-                )
++            # 1a-3 锁重构（patch 008）：摘要 LLM 移出角色锁——update_history 经
++            # phase_lock 自管「append 段（astore 在段内 after_append 钩子里，
++            # 保持 append 先于 db 写的身份校验顺序）/ 压缩 LLM（锁外）/ splice
++            # 段」。此前整个 detailed 摘要关在 settle lock 里，结算期间其他入口
++            # 秒级 /cache 被 5s 超时杀死。「阻塞 /new_dialog 直到摘要完成」的
++            # 语义改由压缩 in-flight 标记承载（见 _new_dialog）。
++
++            async def _astore_renew():
+                 await runtime.time_manager.astore_conversation(uid, input_history, lanlan_name)
+ 
++            await runtime.recent_history_manager.update_history(
++                input_history,
++                lanlan_name,
++                detailed=True,
++                on_compress_done=review._on_compress_done,
++                phase_lock=runtime._get_settle_lock(lanlan_name),
++                after_append=_astore_renew,
++            )
++
+             # 以下操作在锁外执行，不阻塞 /new_dialog
+             # 异步事实提取
+             await post_turn._spawn_outbox_post_turn_signals(
+@@ -1205,15 +1215,22 @@ async def settle_conversation(request: HistoryRequest, lanlan_name: str):
+                 await gates._aclear_review_clean(lanlan_name)
+             logger.info(f"[MemoryServer] settle: 收到 {lanlan_name} 的结算请求，消息数: {len(input_history)}")
+ 
+-            async with runtime._get_settle_lock(lanlan_name):
++            # 1a-3 锁重构（patch 008）：与 /renew 对偶——astore 走 after_append
++            # 钩子（append 段内、身份校验后），摘要 LLM 在角色锁外。/settle 与
++            # /cache 并发不再互相卡死；/new_dialog 经 in-flight 标记等收口。
++
++            async def _astore_settle():
+                 if input_history:
+                     await runtime.time_manager.astore_conversation(uid, input_history, lanlan_name)
+-                await runtime.recent_history_manager.update_history(
+-                    [],
+-                    lanlan_name,
+-                    detailed=True,
+-                    on_compress_done=review._on_compress_done,
+-                )
++
++            await runtime.recent_history_manager.update_history(
++                [],
++                lanlan_name,
++                detailed=True,
++                on_compress_done=review._on_compress_done,
++                phase_lock=runtime._get_settle_lock(lanlan_name),
++                after_append=_astore_settle,
++            )
+ 
+             if input_history or is_supported_language_code(request.language):
+                 await post_turn._spawn_outbox_post_turn_signals(
+@@ -4005,11 +4022,32 @@ async def _new_dialog(
+     # cacheable 机会，记进来反而污染 per_char 分布。
+     _new_dialog_qps_counter[lanlan_name] = _new_dialog_qps_counter.get(lanlan_name, 0) + 1
+ 
+-    # settle_lock 保留：等 /renew /settle 的首轮摘要完成，读到一致数据。
+-    # review 不持此锁，且写盘是「整体引用替换 + fingerprint patch」原子操作，
+-    # 与本路径读取无 race；Phase C 已让 review 设计成可与 /process 并行的后台
+-    # 任务，/new_dialog 不再 cancel 在跑的 review（之前的 cancel 是 Phase A
+-    # 遗留物，会让 review 在活跃会话里几乎永不完成）。
++    # settle_lock 保留：与 /renew /settle 的 append/splice 短临界区互斥，读到
++    # 一致数据。review 不持此锁，且写盘是「整体引用替换 + fingerprint patch」
++    # 原子操作，与本路径读取无 race；Phase C 已让 review 设计成可与 /process
++    # 并行的后台任务，/new_dialog 不再 cancel 在跑的 review（之前的 cancel 是
++    # Phase A 遗留物，会让 review 在活跃会话里几乎永不完成）。
++    #
++    # 1a-3 锁重构（patch 008）：摘要 LLM 已移出 settle lock（/renew /settle 经
++    # phase_lock 分段），锁不再覆盖压缩窗口——「等摘要收口再读」改由压缩
++    # in-flight 标记承载：拿锁前在**锁外**有界等待（持锁等待会与 splice 段的
++    # 重入互锁）。超时则读当前状态：splice 是原子临界区、不存在半压缩状态，
++    # 读到的只是"未经摘要的完整原文"（更长但同样一致）。
++    recent_manager = runtime.recent_history_manager
++    if recent_manager is not None and recent_manager.is_compress_inflight(lanlan_name):
++        from config import NEW_DIALOG_COMPRESS_WAIT_SECONDS
++        deadline = time.monotonic() + NEW_DIALOG_COMPRESS_WAIT_SECONDS
++        while recent_manager.is_compress_inflight(lanlan_name):
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                logger.warning(
++                    "[MemoryServer] new_dialog: %s 等待压缩收口超时(%.0fs)，读取当前状态",
++                    lanlan_name, NEW_DIALOG_COMPRESS_WAIT_SECONDS,
++                )
++                break
++            await recent_manager.wait_compress_settled(
++                lanlan_name, timeout=remaining,
++            )
+     async with runtime._get_settle_lock(lanlan_name):
+         # 正则表达式：删除所有类型括号及其内容（包括[]、()、{}、<>、【】、（）等）
+         brackets_pattern = re.compile(r'(\[.*?\]|\(.*?\)|（.*?）|【.*?】|\{.*?\}|<.*?>)')
+diff --git a/config/__init__.py b/config/__init__.py
+index ad7a6413..685d34d4 100644
+--- a/config/__init__.py
++++ b/config/__init__.py
+@@ -241,6 +241,7 @@ from .memory_settings import (  # noqa: F401
+     RECENT_PER_MESSAGE_MAX_TOKENS,
+     RECENT_COMPRESS_INPUT_BUDGET_TOKENS,
+     RECENT_HARD_CAP_TOKENS,
++    NEW_DIALOG_COMPRESS_WAIT_SECONDS,
+     REFLECTION_TEXT_MAX_TOKENS,
+     REFLECTION_SURFACE_TOP_K,
+     REFLECTION_SYNTHESIS_FACTS_MAX,
+@@ -637,6 +638,7 @@ __all__ = [
+     'RECENT_PER_MESSAGE_MAX_TOKENS',
+     'RECENT_COMPRESS_INPUT_BUDGET_TOKENS',
+     'RECENT_HARD_CAP_TOKENS',
++    'NEW_DIALOG_COMPRESS_WAIT_SECONDS',
+     'REFLECTION_TEXT_MAX_TOKENS',
+     'REFLECTION_SURFACE_TOP_K',
+     'REFLECTION_SYNTHESIS_FACTS_MAX',
+diff --git a/config/memory_settings.py b/config/memory_settings.py
+index 036807a3..571c8682 100644
+--- a/config/memory_settings.py
++++ b/config/memory_settings.py
+@@ -509,6 +509,15 @@ RECENT_HARD_CAP_TOKENS = 60000
+   有界。设得很大，只作最后防线。
+ - 上游：未被压缩而累积的 recent 历史 token 数。"""
+ 
++NEW_DIALOG_COMPRESS_WAIT_SECONDS = 30.0
++"""/new_dialog 等待 in-flight 压缩收口的上界（UC3 1a-3，patch 008）。
++
++摘要 LLM 已移出角色级 settle lock（/renew /settle 经 phase_lock 分段），
++「等摘要收口再读」改由压缩 in-flight 标记承载：/new_dialog 拿锁前在锁外
++有界等待。超时则读当前状态——splice 是原子临界区、不存在半压缩状态，读到
++的只是"未经摘要的完整原文"（更长但同样一致）。摘要档超时上限 30s
++（MEMORY_LLM_HARD_TIMEOUT_SECONDS 同量级），正常压缩数秒即收口。"""
++
+ # ---- Memory: reflection ----
+ REFLECTION_TEXT_MAX_TOKENS = 150
+ """单条 reflection 文本的 soft cap。
+diff --git a/memory/recent.py b/memory/recent.py
+index ecb1b1d0..3362df39 100644
+--- a/memory/recent.py
++++ b/memory/recent.py
+@@ -1126,10 +1126,107 @@ class CompressedRecentHistoryManager:
+             )
+             return 'merged'
+ 
++    # ── 压缩 in-flight 标记（UC3 1a-3 锁重构，patch 008）────────────────
++    # /renew /settle 的摘要 LLM 移出角色级 settle lock 后，「/new_dialog 等摘要
++    # 收口再读」的语义改由这个 per-character 事件承载：段1（append 临界区）内
++    # 决定压缩即 clear，splice/失败/异常/取消的出口统一 set。/new_dialog 拿锁
++    # 前在**锁外**有界等待（持锁等待会与 splice 段的重入互锁）。
++    def _get_compress_inflight_event(self, lanlan_name: str) -> asyncio.Event:
++        events = getattr(self, '_compress_inflight_events', None)
++        if events is None:
++            events = self._compress_inflight_events = {}
++        event = events.get(lanlan_name)
++        if event is None:
++            event = asyncio.Event()
++            event.set()
++            events[lanlan_name] = event
++        return event
++
++    def _mark_compress_inflight(self, lanlan_name) -> None:
++        self._get_compress_inflight_event(lanlan_name).clear()
++
++    def _clear_compress_inflight(self, lanlan_name) -> None:
++        self._get_compress_inflight_event(lanlan_name).set()
++
++    def is_compress_inflight(self, lanlan_name) -> bool:
++        """True while this character has a compression LLM running outside the settle lock."""
++        return not self._get_compress_inflight_event(lanlan_name).is_set()
++
++    async def wait_compress_settled(self, lanlan_name, timeout: float) -> bool:
++        """Wait (bounded) for an in-flight compression to reach a committed state.
++
++        Returns True when settled (or already settled); False on timeout — the
++        caller then proceeds on the current on-disk state, which is always
++        internally consistent (the splice is one atomic critical section; there
++        is no half-compressed state, only compressed-earlier vs not-yet).
++        """
++        event = self._get_compress_inflight_event(lanlan_name)
++        if event.is_set():
++            return True
++        try:
++            await asyncio.wait_for(event.wait(), timeout)
++            return True
++        except asyncio.TimeoutError:
++            return False
++
++    async def _append_and_plan(
++        self, *, file_path, lanlan_name, admission_generation, new_messages,
++        turn_metadata, compress,
++    ):
++        """段1：append+落盘的文件锁临界区 + 压缩计划（快照待压缩数据+标记意图）。
++
++        不持角色级锁——由调用方决定是否包在 ``phase_lock`` 内（这样段1 与段3
++        可以分别进角色锁，而压缩 LLM 夹在两段之间跑在锁外）。返回
++        ``(history, persisted, turn_skip, snapshot)``；snapshot 非 None 时已置
++        in-flight 压缩标记（由 update_history 的 finally 负责收口）。
++        """
++        history, persisted, turn_skip = await _await_recent_mutation_to_completion(
++            self._append_and_persist_locked,
++            file_path,
++            lanlan_name,
++            list(new_messages),
++            admission_generation,
++            turn_metadata,
++        )
++        snapshot = None
++        if (
++            turn_skip is None and persisted and compress
++            and len(history) > self.compress_threshold
++        ):
++            snapshot = list(history[:-self.max_history_length + 1])
++        if snapshot is not None:
++            self._mark_compress_inflight(lanlan_name)
++        return history, persisted, turn_skip, snapshot
++
+     async def update_history(
+         self, new_messages, lanlan_name, detailed=False, compress=True,
+-        on_compress_done=None, turn_metadata=None,
++        on_compress_done=None, turn_metadata=None, phase_lock=None,
++        after_append=None,
+     ):
++        """Append + (可选)压缩合并。
++
++        ``phase_lock``（UC3 1a-3，patch 008）：可选的角色级锁（settle lock）。
++        - None（默认）：历史行为——调用方自行决定持锁与否（/process 在锁外调；
++          /cache 在自己的短锁段内调 compress=False 路径，二者都不受影响）。
++        - 传入时：update_history 把「append 落盘段」与「splice 提交段」各自包
++          进 phase_lock 的短临界区，压缩 LLM 在两段之间（**锁外**）跑——摘要
++          慢 LLM 不再阻塞同角色秒级的 /cache（此前被 5s 超时杀死）。splice 的
++          fingerprint 锚点校验即「版本校验后提交」：压缩期间新 /cache 落入只
++          会追加尾部，锚点匹配照常 merged；头部被清空/改写则 moot 丢弃。若期间
++          涌入量使历史再次超阈值，剩余量**留待下次**压缩（不循环再压——最简单
++          的正确方案，enforce_hard_cap 兜底硬上限）。
++          /renew /settle 传 runtime._get_settle_lock(name)；/new_dialog 依靠
++          is_compress_inflight / wait_compress_settled 保持「等摘要收口再读」。
++
++        ``after_append``：可选回调，在 append 段成功（身份校验通过、批次已落
++        盘、未幂等跳过）之后、压缩 LLM 之前调用——phase_lock 模式下仍在角色
++        锁内。/renew /settle 用它做 time_manager.astore_conversation，保持
++        「recent append 先于 db 写」的顺序：stale 身份批次（RecentFileDeleted-
++        Error）在 append 段即中断，绝不进 time_indexed。注意：回调自身的异常
++        会并入 update_history 的错误处理（log、不重抛）——astore 失败不影响
++        已成功的 recent 落盘，与旧行为（/renew 捕获后返回 error）的差异只在
++        HTTP 状态可见性，日志两条都留痕。
++        """
+         file_path, admission_generation = self._capture_recent_operation_admission(
+             lanlan_name,
+         )
+@@ -1147,18 +1244,32 @@ class CompressedRecentHistoryManager:
+             target=f"memory/{lanlan_name}/recent.json",
+         )
+ 
++        snapshot = None
+         try:
+             # CS-1：读盘 + 合并未落盘批次 + append + 落盘，一个临界区。
+             # 先把未压缩状态落盘再进耗时的 compress_history：后者走 LLM，数秒到
+             # 数十秒，期间进程崩溃或 task 被 cancel 会导致本批 new_messages 丢失。
+-            history, persisted, turn_skip = await _await_recent_mutation_to_completion(
+-                self._append_and_persist_locked,
+-                file_path,
+-                lanlan_name,
+-                list(new_messages),
+-                admission_generation,
+-                turn_metadata,
+-            )
++            if phase_lock is not None:
++                async with phase_lock:
++                    history, persisted, turn_skip, snapshot = (
++                        await self._append_and_plan(
++                            file_path=file_path, lanlan_name=lanlan_name,
++                            admission_generation=admission_generation,
++                            new_messages=new_messages,
++                            turn_metadata=turn_metadata, compress=compress,
++                        )
++                    )
++                    if after_append is not None and turn_skip is None and persisted:
++                        await after_append()
++            else:
++                history, persisted, turn_skip, snapshot = await self._append_and_plan(
++                    file_path=file_path, lanlan_name=lanlan_name,
++                    admission_generation=admission_generation,
++                    new_messages=new_messages,
++                    turn_metadata=turn_metadata, compress=compress,
++                )
++                if after_append is not None and turn_skip is None and persisted:
++                    await after_append()
+             if turn_skip is not None:
+                 # 因果契约（UC3 1a-2）：重复轮次已整批幂等跳过，调用方（/cache）
+                 # 据此跳过 time_indexed/outbox 等连带写入，返回 skipped 语义。
+@@ -1177,12 +1288,10 @@ class CompressedRecentHistoryManager:
+                 # 磁盘内容一起补写。
+                 return
+ 
+-            if compress and len(history) > self.compress_threshold:
+-                to_compress = history[:-self.max_history_length+1]
+-                snapshot = list(to_compress)
+-                # 压缩 LLM 在**锁外**跑。它耗时数秒到数十秒，关进临界区会把
+-                # /cache 一起挡住。
+-                compressed_result = await self.compress_history(to_compress, lanlan_name, detailed)
++            if snapshot is not None:
++                # 压缩 LLM 在**角色锁外**跑（文件锁本就不覆盖它）。它耗时数秒到
++                # 数十秒；phase_lock 模式下此窗口对同角色 /cache /new_dialog 开放。
++                compressed_result = await self.compress_history(snapshot, lanlan_name, detailed)
+                 if compressed_result is None:
+                     logger.warning(
+                         f"[RecentHistory] {lanlan_name} 摘要失败，跳过本轮压缩以保留原始历史"
+@@ -1206,12 +1315,20 @@ class CompressedRecentHistoryManager:
+                         admission_generation,
+                     )
+                 else:
+-                    # CS-2：读盘 + 定位 + splice + 落盘，一个临界区。
+-                    splice_status = await _await_recent_mutation_to_completion(
+-                        self._splice_compressed_locked,
+-                        file_path, lanlan_name, snapshot, compressed_result[0],
+-                        admission_generation,
+-                    )
++                    # CS-2：读盘 + 定位 + splice + 落盘，一个临界区（= 版本校验后
++                    # 提交：fingerprint 锚点失配即 moot，绝不错切）。
++                    async def _stage_splice():
++                        return await _await_recent_mutation_to_completion(
++                            self._splice_compressed_locked,
++                            file_path, lanlan_name, snapshot, compressed_result[0],
++                            admission_generation,
++                        )
++
++                    if phase_lock is not None:
++                        async with phase_lock:
++                            splice_status = await _stage_splice()
++                    else:
++                        splice_status = await _stage_splice()
+                     # merged / moot 都不需要再跑同一份后台摘要；只有读写失败才触发兜底。
+                     await self._notify_compress_done(
+                         on_compress_done,
+@@ -1225,6 +1342,11 @@ class CompressedRecentHistoryManager:
+             raise
+         except Exception as e:
+             logger.error(f"[RecentHistory] 更新历史记录时出错: {e}", exc_info=True)
++        finally:
++            # in-flight 收口兜底：正常路径 splice/失败通知后、异常/取消路径统一
++            # 在此 set——/new_dialog 的有界等待绝不悬死。
++            if snapshot is not None:
++                self._clear_compress_inflight(lanlan_name)
+ 
+ 
+     # ── Past block 更新 meta（防止"几天前的事还在 summary 里被反复带出来"
+diff --git a/tests/unit/test_settle_lock_refactor.py b/tests/unit/test_settle_lock_refactor.py
+new file mode 100644
+index 00000000..78228089
+--- /dev/null
++++ b/tests/unit/test_settle_lock_refactor.py
+@@ -0,0 +1,380 @@
++# -*- coding: utf-8 -*-
++"""Settle-lock refactor tests (UC3 Final Gate 1a-3, patch 008).
++
++摘要 LLM 移出角色级 settle lock 临界区：update_history(phase_lock=...) 把
++「append 落盘段」与「splice 提交段」各自包进角色锁短临界区，压缩 LLM 夹在
++两段之间（锁外）跑。设计文档 P1-1 必做验收：
++
++- 「摘要执行期间另一入口持续 /cache 与 /recent_history 读取」——并发测试：
++  慢 LLM mock + 并发写不阻塞不超时；
++- splice = 版本校验后提交（fingerprint 锚点）：压缩期间落入的新消息保留；
++- new_dialog 语义保持：in-flight 标记 + 有界等待，绝不读到半压缩状态（也
++  绝不悬死——LLM 失败/异常/取消路径统一收口）；
++- 期间涌入量再次超阈值 → 剩余量留待下次（不循环再压）。
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++from pathlib import Path
++
++import pytest
++
++from memory.recent import CompressedRecentHistoryManager
++from utils.llm_client import AIMessage, HumanMessage, SystemMessage, messages_from_dict
++
++pytestmark = pytest.mark.unit
++
++_LANLAN = "Xiaoba"
++_MASTER = "Master"
++
++_LLM_SECONDS = 0.5          # 慢 LLM mock 的驻留时长
++_BLOCK_ASSERT_BELOW = 0.3   # "不阻塞"断言上限（须明显小于 _LLM_SECONDS）
++
++
++class _FakeConfigManager:
++    def __init__(self, memory_dir: str, recent_log: dict):
++        self.memory_dir = memory_dir
++        self._recent_log = recent_log
++
++    def get_character_data(self):
++        return self.aget_character_data_sync()
++
++    def aget_character_data_sync(self):
++        return (
++            _MASTER, _LANLAN, None, {},
++            {"human": _MASTER, "ai": _LANLAN, "system": "SYSTEM_MESSAGE"},
++            None, None, None, self._recent_log,
++        )
++
++    async def aget_character_data(self):
++        return self.aget_character_data_sync()
++
++
++def _make_manager(tmp_path: Path) -> CompressedRecentHistoryManager:
++    file_path = str(tmp_path / "recent.json")
++    mgr = object.__new__(CompressedRecentHistoryManager)
++    mgr._config_manager = _FakeConfigManager(str(tmp_path), {_LANLAN: file_path})
++    mgr.max_history_length = 10
++    mgr.compress_threshold = 15
++    mgr.log_file_path = {_LANLAN: file_path}
++    mgr.name_mapping = {"human": _MASTER, "ai": _LANLAN, "system": "SYSTEM_MESSAGE"}
++    mgr.user_histories = {}
++    mgr._seq_counters = {}
++    return mgr
++
++
++def _read_disk_messages(file_path: str) -> list:
++    with open(file_path, encoding="utf-8") as f:
++        return messages_from_dict(json.load(f))
++
++
++@pytest.fixture(autouse=True)
++def _patch_cloudsave(monkeypatch):
++    monkeypatch.setattr(
++        "memory.recent.assert_cloudsave_writable", lambda *a, **kw: None,
++    )
++
++
++class _SlowCompress:
++    """慢 LLM mock：记录调用次数、入口放行事件，驻留 _LLM_SECONDS 后返回 memo。"""
++
++    def __init__(self):
++        self.calls = 0
++        self.started = asyncio.Event()
++
++    async def __call__(self, messages, lanlan_name, detailed=False):
++        self.calls += 1
++        self.started.set()
++        await asyncio.sleep(_LLM_SECONDS)
++        return (SystemMessage(content=f"memo #{self.calls}"),)
++
++
++async def _fill_history(mgr, count: int, prefix: str = "seed"):
++    """灌入超过 compress_threshold 的历史（不触发压缩）。"""
++    for i in range(count):
++        await mgr.update_history(
++            [HumanMessage(content=f"{prefix}-{i}")], _LANLAN, compress=False,
++        )
++
++
++# ─────────────────── 1. 摘要期间 /cache 不被阻塞 ───────────────────
++
++
++async def test_cache_write_not_blocked_by_slow_summary_llm(tmp_path):
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++    await _fill_history(mgr, 16)  # threshold=15 → 下一次 update_history 触发压缩
++    slow = _SlowCompress()
++    mgr.compress_history = slow
++
++    lock = asyncio.Lock()
++    loop = asyncio.get_running_loop()
++
++    # /settle 型调用（phase_lock 分段，模拟 routes 的新结构）
++    settle_task = asyncio.create_task(
++        mgr.update_history([], _LANLAN, detailed=True, phase_lock=lock)
++    )
++    await slow.started.wait()  # LLM 已开跑（此时角色锁已释放）
++
++    # 摘要执行期间另一入口的 /cache：routes 侧是锁内短临界区
++    t0 = loop.time()
++    async with lock:
++        await mgr.update_history(
++            [HumanMessage(content="cached during llm")], _LANLAN, compress=False,
++        )
++    elapsed = loop.time() - t0
++    assert elapsed < _BLOCK_ASSERT_BELOW, (
++        f"/cache 在摘要 LLM 期间被阻塞 {elapsed:.2f}s（应 < {_BLOCK_ASSERT_BELOW}s）"
++    )
++
++    await settle_task
++    assert slow.calls == 1
++
++    # 压缩期间落入的消息保留（splice 锚点校验通过，merged 非 moot）
++    final = _read_disk_messages(file_path)
++    assert isinstance(final[0], SystemMessage) and final[0].content == "memo #1"
++    assert any(m.content == "cached during llm" for m in final), (
++        "压缩期间 /cache 落入的消息必须保留在压缩后尾部"
++    )
++
++
++async def test_recent_history_read_not_blocked_by_slow_summary_llm(tmp_path):
++    mgr = _make_manager(tmp_path)
++    await _fill_history(mgr, 16)
++    slow = _SlowCompress()
++    mgr.compress_history = slow
++
++    lock = asyncio.Lock()
++    settle_task = asyncio.create_task(
++        mgr.update_history([], _LANLAN, detailed=True, phase_lock=lock)
++    )
++    await slow.started.wait()
++
++    loop = asyncio.get_running_loop()
++    t0 = loop.time()
++    history = await mgr.aget_recent_history(_LANLAN)
++    elapsed = loop.time() - t0
++    assert len(history) >= 16
++    assert elapsed < _BLOCK_ASSERT_BELOW, (
++        f"/recent_history 读取在摘要期间被阻塞 {elapsed:.2f}s"
++    )
++
++    await settle_task
++
++
++# ─────────────────── 2. new_dialog 语义：in-flight 等待 ───────────────────
++
++
++async def test_new_dialog_waits_for_inflight_compression(tmp_path):
++    mgr = _make_manager(tmp_path)
++    await _fill_history(mgr, 16)
++    slow = _SlowCompress()
++    mgr.compress_history = slow
++
++    lock = asyncio.Lock()
++    settle_task = asyncio.create_task(
++        mgr.update_history([], _LANLAN, detailed=True, phase_lock=lock)
++    )
++    await slow.started.wait()
++    assert mgr.is_compress_inflight(_LANLAN), "LLM 驻留期间应为 in-flight"
++
++    # /new_dialog 侧的等待（routes._new_dialog 的等待原语）挂起且不返回
++    waiter = asyncio.create_task(
++        mgr.wait_compress_settled(_LANLAN, timeout=10.0)
++    )
++    await asyncio.sleep(0.1)
++    assert not waiter.done(), "压缩未收口前等待不得返回"
++
++    await settle_task
++    assert await asyncio.wait_for(waiter, timeout=1.0), "splice 收口后等待应返回"
++    assert not mgr.is_compress_inflight(_LANLAN)
++
++
++async def test_wait_compress_settled_times_out_and_is_consistent(tmp_path):
++    """超时分支：返回 False，调用方读当前状态（完整原文，同样一致）。"""
++    mgr = _make_manager(tmp_path)
++    assert await mgr.wait_compress_settled(_LANLAN, timeout=0.01) is True  # 空闲即返回
++
++    mgr._mark_compress_inflight(_LANLAN)
++    try:
++        assert await mgr.wait_compress_settled(_LANLAN, timeout=0.05) is False
++    finally:
++        mgr._clear_compress_inflight(_LANLAN)
++
++
++async def test_inflight_cleared_on_llm_failure(tmp_path):
++    """摘要失败（返回 None）：跳过压缩保留原文，in-flight 收口。"""
++    mgr = _make_manager(tmp_path)
++    await _fill_history(mgr, 16)
++
++    async def _failing(messages, lanlan_name, detailed=False):
++        await asyncio.sleep(0.05)
++        return None
++
++    mgr.compress_history = _failing
++    await mgr.update_history([], _LANLAN, detailed=True, phase_lock=asyncio.Lock())
++    assert not mgr.is_compress_inflight(_LANLAN)
++    final = _read_disk_messages(mgr.log_file_path[_LANLAN])
++    assert len(final) == 16 and all(not isinstance(m, SystemMessage) for m in final), (
++        "摘要失败必须保留原始历史"
++    )
++
++
++async def test_inflight_cleared_on_llm_exception_and_cancel(tmp_path):
++    mgr = _make_manager(tmp_path)
++    await _fill_history(mgr, 16)
++
++    async def _boom(messages, lanlan_name, detailed=False):
++        await asyncio.sleep(0.05)
++        raise RuntimeError("provider down")
++
++    mgr.compress_history = _boom
++    # 异常路径：update_history 吞掉（记 error log），但 in-flight 必须收口
++    await mgr.update_history([], _LANLAN, detailed=True, phase_lock=asyncio.Lock())
++    assert not mgr.is_compress_inflight(_LANLAN)
++
++    # 取消路径
++    async def _hang(messages, lanlan_name, detailed=False):
++        await asyncio.sleep(60)
++
++    mgr.compress_history = _hang
++    mgr._seq_counters = {}
++    task = asyncio.create_task(
++        mgr.update_history(
++            [HumanMessage(content="cancel me")], _LANLAN, phase_lock=asyncio.Lock(),
++        )
++    )
++    await asyncio.sleep(0.05)
++    assert mgr.is_compress_inflight(_LANLAN)
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++    assert not mgr.is_compress_inflight(_LANLAN), "取消路径也必须收口 in-flight"
++
++
++# ─────────────────── 3. 剩余量留待下次 ───────────────────
++
++
++async def test_influx_during_compression_left_for_next_round(tmp_path):
++    """压缩期间涌入大量消息再次超阈值 → 本轮只压一次，剩余量留待下次。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++    await _fill_history(mgr, 16)
++    slow = _SlowCompress()
++    mgr.compress_history = slow
++
++    lock = asyncio.Lock()
++    settle_task = asyncio.create_task(
++        mgr.update_history([], _LANLAN, detailed=True, phase_lock=lock)
++    )
++    await slow.started.wait()
++    # 压缩期间涌入 12 条（splice 后将再次超过 threshold=15）
++    for i in range(12):
++        async with lock:
++            await mgr.update_history(
++                [HumanMessage(content=f"influx-{i}")], _LANLAN, compress=False,
++            )
++    await settle_task
++
++    assert slow.calls == 1, "本轮不得循环再压（最简单正确方案：留待下次）"
++    final = _read_disk_messages(file_path)
++    assert isinstance(final[0], SystemMessage)
++    assert sum(1 for m in final if m.content.startswith("influx-")) == 12, (
++        "压缩期间涌入的消息全部保留"
++    )
++
++    # 下一次 update_history 处理剩余量
++    await mgr.update_history(
++        [HumanMessage(content="next round")], _LANLAN, phase_lock=lock,
++    )
++    assert slow.calls == 2, "剩余量由下一次压缩处理"
++
++
++# ─────────────────── 4. after_append 顺序语义 ───────────────────
++
++
++async def test_after_append_runs_before_llm_within_lock(tmp_path):
++    """astore（after_append）在 append 段内、压缩 LLM 之前执行（角色锁内）。"""
++    mgr = _make_manager(tmp_path)
++    await _fill_history(mgr, 16)
++
++    order: list[str] = []
++    lock = asyncio.Lock()
++
++    async def _astore():
++        order.append("astore")
++        assert lock.locked(), "after_append 必须仍在角色锁内执行"
++
++    class _OrderedCompress(_SlowCompress):
++        async def __call__(self, messages, lanlan_name, detailed=False):
++            order.append("llm")
++            return await super().__call__(messages, lanlan_name, detailed)
++
++    mgr.compress_history = _OrderedCompress()
++    await mgr.update_history(
++        [], _LANLAN, detailed=True, phase_lock=lock, after_append=_astore,
++    )
++    assert order == ["astore", "llm"]
++
++
++async def test_after_append_skipped_on_stale_identity(tmp_path):
++    """stale 身份（RecentFileDeletedError）在 append 段中断 → astore 不执行。"""
++    from utils.recent_file import RecentFileDeletedError
++
++    mgr = _make_manager(tmp_path)
++    called: list[str] = []
++
++    async def _astore():
++        called.append("should-not-run")
++
++    def _stale_append(*args, **kwargs):
++        raise RecentFileDeletedError("identity replaced")
++
++    mgr._append_and_persist_locked = _stale_append
++    lock = asyncio.Lock()
++    with pytest.raises(RecentFileDeletedError):
++        await mgr.update_history(
++            [HumanMessage(content="stale batch")], _LANLAN,
++            phase_lock=lock, after_append=_astore,
++        )
++    assert called == []
++
++
++# ─────────────────── 5. 无 phase_lock 的旧路径不回归 ───────────────────
++
++
++async def test_legacy_call_without_phase_lock_still_works(tmp_path):
++    """/process 型调用（锁外、无 phase_lock）行为不变：正常压缩+合并。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++    await _fill_history(mgr, 16)
++    slow = _SlowCompress()
++    mgr.compress_history = slow
++
++    await mgr.update_history([HumanMessage(content="process batch")], _LANLAN)
++    assert slow.calls == 1
++    final = _read_disk_messages(file_path)
++    assert isinstance(final[0], SystemMessage)
++    assert any(m.content == "process batch" for m in final)
++    assert not mgr.is_compress_inflight(_LANLAN)
++
++
++async def test_phase_lock_acquire_release_cycle_between_phases(tmp_path):
++    """段间锁确实释放过：压缩 LLM 驻留期间锁可被第三方获取。"""
++    mgr = _make_manager(tmp_path)
++    await _fill_history(mgr, 16)
++    slow = _SlowCompress()
++    mgr.compress_history = slow
++
++    lock = asyncio.Lock()
++    settle_task = asyncio.create_task(
++        mgr.update_history([], _LANLAN, detailed=True, phase_lock=lock)
++    )
++    await slow.started.wait()
++    # LLM 驻留=段1 已结束、段3 未开始 → 锁应可获取
++    acquired = lock.locked() is False
++    async with lock:
++        pass
++    await settle_task
++    assert acquired, "压缩 LLM 驻留期间角色锁必须处于释放状态"
+-- 
+2.43.0
+

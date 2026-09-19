@@ -1,0 +1,978 @@
+From b8723f740ba2ef64719b2ddbf51e9632fba7ddb5 Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 00:32:29 +0800
+Subject: [PATCH 1/3] =?UTF-8?q?feat(memory):=20=E5=9B=A0=E6=9E=9C=E9=A1=BA?=
+ =?UTF-8?q?=E5=BA=8F=E5=A5=91=E7=BA=A6=E2=80=94=E2=80=94/cache=20=E8=BD=AE?=
+ =?UTF-8?q?=E6=AC=A1=E5=85=83=E6=95=B0=E6=8D=AE+=E5=B9=82=E7=AD=89?=
+ =?UTF-8?q?=E8=B7=B3=E8=BF=87+=E6=9B=BF=E4=BB=A3=E6=8C=87=E9=92=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+UC3 完整裁决 1a-2（workplan P1-1 #3）：recent_seq 只解决读侧增量，写侧
+因果此前无契约——写入端每次重新生成 uuid4 event_id（只能标识"这次请求"）
+、recent 纯追加、timeindex 用落库时刻，旧回合晚到即乱序、网络重试双写。
+
+- HistoryRequest 增加可选 metadata：{channel, session_id, turn_uid,
+  client_ts, replaces_turn_uid}，不传=旧行为（向后兼容，旧客户端零感知）。
+  /process /renew /settle 是全量/结算路径不按 turn 幂等，字段存在不消费。
+- /cache 把 turn_uid/client_ts 随消息存入 additional_kwargs（与 recent_seq
+  同一临界区打点：一起可见或一起不可见，幂等检查依赖该原子性）；批内
+  共享同一 turn_uid（一次 /cache=一轮）。
+- 写入端版本检查：同一 turn_uid 重复提交在文件锁临界区内整批幂等跳过
+  （返回 skipped_duplicate_turn + 已落库 seq）；连带 time_indexed/outbox
+  零副作用——重试幂等到端到端。
+- recent_seq 仍按到达序分配（旧回合晚到不重排，已知偏差），乱序由消息上
+  turn_uid/client_ts 追溯；/recent_history 增量端点透出两字段。
+- 替代关系最小实现：corrected 场景（replaces_turn_uid）记入同目录
+  turn_replacements.json 账本（同锁临界区、cap 200、get_turn_replacements
+  读口）——不改 recent 追加语义；facts 侧替代传播是 P2-3 验收项。
+- 守门测试登记：recent_file_lock 锁收口豁免 turn_replacements sidecar
+  （seq_state 先例）。
+
+测试：tests/unit/test_causal_write_contract.py（乱序到达 seq 按到达序+
+因果可追溯/重复 turn_uid 幂等/同 ts 同 uid 单份/同 ts 异 uid 双轮/
+无 metadata 现状/替代指针账本+重复不重记//cache 端点幂等零副作用/
+增量端点透出），10 例；001 契约断言同步扩展 turn_uid/client_ts。
+相关回归 152 passed（file_lock/compress_backup/cache_settle/recent_history）。
+---
+ app/memory_server/routes.py                   |  90 +++-
+ memory/recent.py                              | 229 +++++++++-
+ tests/unit/test_causal_write_contract.py      | 417 ++++++++++++++++++
+ tests/unit/test_recent_file_lock.py           |  12 +-
+ .../test_recent_history_incremental_seq.py    |   6 +-
+ 5 files changed, 730 insertions(+), 24 deletions(-)
+ create mode 100644 tests/unit/test_causal_write_contract.py
+
+diff --git a/app/memory_server/routes.py b/app/memory_server/routes.py
+index a0c1b65e..5acdd383 100644
+--- a/app/memory_server/routes.py
++++ b/app/memory_server/routes.py
+@@ -72,10 +72,52 @@ from .rows import _has_human_messages
+ from .runtime import app
+ 
+ 
++class TurnMetadata(BaseModel):
++    """写入端随 /cache 提交的轮次因果元数据（UC3 完整裁决 1a-2）。
++
++    全部字段可选——不传（旧客户端）即旧行为，向后兼容。语义：
++
++    - ``turn_uid``：稳定轮次标识，**写入端生成、跨网络重试不变**（对比
++      /cache 每次重新生成的 uuid4 event_id——那只能标识"这次请求"，不能
++      标识"这一轮对话"）。同一 turn_uid 重复提交按已落库 seq 幂等跳过；
++    - ``client_ts``：客户端侧发生时间（ISO 字符串）。recent_seq 仍按到达序
++      分配（旧回合晚到不重排，已知偏差），乱序靠消息上的 turn_uid/client_ts
++      追溯；
++    - ``channel``/``session_id``：来源通道（qq/wechat/desktop/terminal…）与
++      通道内会话标识，批次级溯源信息（入日志与替代指针账本，不逐消息打点）；
++    - ``replaces_turn_uid``：corrected 场景的替代指针——本轮替换所指的旧轮。
++      只记入 turn_replacements.json 账本（facts 侧替代传播是 P2-3 验收项），
++      不改 recent 纯追加语义。
++    """
++    channel: str | None = None
++    session_id: str | None = None
++    turn_uid: str | None = None
++    client_ts: str | None = None
++    replaces_turn_uid: str | None = None
++
++
++def _to_turn_write_metadata(request_metadata: TurnMetadata | None):
++    """边界转换：路由层 pydantic 模型 → recent 层纯 dataclass（不依赖 fastapi）。"""
++    if request_metadata is None:
++        return None
++    from memory.recent import TurnWriteMetadata
++    return TurnWriteMetadata(
++        channel=(request_metadata.channel or None),
++        session_id=(request_metadata.session_id or None),
++        turn_uid=(request_metadata.turn_uid or None),
++        client_ts=(request_metadata.client_ts or None),
++        replaces_turn_uid=(request_metadata.replaces_turn_uid or None),
++    )
++
++
+ class HistoryRequest(BaseModel):
+     input_history: str
+     language: str | None = None
+     render_language: str | None = None
++    # 因果契约（patch 007）：/cache 消费（幂等/打点/替代指针）；/process
++    # /renew /settle 是全量/结算路径，不按 turn 幂等（重复 settle 的幂等是
++    # external_id 语义，另行落地），字段存在但不消费。
++    metadata: TurnMetadata | None = None
+ 
+ 
+ class PromptLocalePreferenceRequest(BaseModel):
+@@ -969,11 +1011,35 @@ async def cache_conversation(request: HistoryRequest, lanlan_name: str):
+                 await gates._aclear_review_clean(lanlan_name)
+             logger.info(f"[MemoryServer] cache: {lanlan_name} +{len(input_history)} 条消息")
+             uid = str(uuid4())
++            turn_metadata = _to_turn_write_metadata(request.metadata)
++            turn_outcome = None
+             async with runtime._get_settle_lock(lanlan_name):
+-                await runtime.recent_history_manager.update_history(input_history, lanlan_name, compress=False)
+-                # store_conversation 必须在 lock 内、与 update_history 串行：和
+-                # /process / /renew 路径对偶，确保单角色 db 写顺序一致。
+-                await runtime.time_manager.astore_conversation(uid, input_history, lanlan_name)
++                turn_outcome = await runtime.recent_history_manager.update_history(
++                    input_history, lanlan_name, compress=False,
++                    turn_metadata=turn_metadata,
++                )
++                if not (turn_outcome and turn_outcome.get('turn_skipped')):
++                    # store_conversation 必须在 lock 内、与 update_history 串行：和
++                    # /process / /renew 路径对偶，确保单角色 db 写顺序一致。
++                    await runtime.time_manager.astore_conversation(uid, input_history, lanlan_name)
++            if turn_outcome and turn_outcome.get('turn_skipped'):
++                # 因果契约（patch 007）：重复轮次零连带副作用——time_indexed
++                # （每次新 uuid，无法按 uid 去重，只能随轮跳过）与 outbox 信号
++                # 都不再写。调用方把 skipped 当成功处理（该轮早已完整落库）。
++                md = request.metadata
++                logger.info(
++                    f"[MemoryServer] cache: {lanlan_name} turn_uid="
++                    f"{turn_outcome.get('turn_uid')} 重复提交，幂等跳过"
++                    f"（channel={getattr(md, 'channel', None)}, "
++                    f"session={getattr(md, 'session_id', None)}, "
++                    f"已落库 seq={turn_outcome.get('existing_seq')}）"
++                )
++                return {
++                    "status": "skipped_duplicate_turn",
++                    "turn_uid": turn_outcome.get('turn_uid'),
++                    "existing_seq": turn_outcome.get('existing_seq'),
++                    "count": 0,
++                }
+             # outbox 登记走锁外——它会 spawn background task 跑 LLM，长持锁会
+             # 阻塞下一轮 /cache 写盘。
+             await post_turn._spawn_outbox_post_turn_signals(
+@@ -1217,11 +1283,13 @@ async def incremental_recent_history(
+     只取增量，同一条消息不会被注入两次。
+ 
+     契约：
+-      - ``entries``：seq 升序的 ``{seq, role, speaker, content, ts}``。仅含打点
+-        条目（见 memory/recent.py 模块级 RECENT_SEQ_* 说明）：压缩 memo（system）、
+-        review 改写条目、打点落地前写入的存量旧条目都不在其中。``role`` 是稳定
+-        枚举（user/assistant），``speaker`` 是 name_mapping 解析后的显示名，
+-        ``ts`` 是该条落盘打点时刻（ISO 字符串，可能为 null）。
++      - ``entries``：seq 升序的 ``{seq, role, speaker, content, ts, turn_uid,
++        client_ts}``。仅含打点条目（见 memory/recent.py 模块级 RECENT_SEQ_*
++        说明）：压缩 memo（system）、review 改写条目、打点落地前写入的存量旧
++        条目都不在其中。``role`` 是稳定枚举（user/assistant），``speaker`` 是
++        name_mapping 解析后的显示名，``ts`` 是该条落盘打点时刻（ISO 字符串，
++        可能为 null）。``turn_uid``/``client_ts`` 是写入端随 /cache 提交的轮次
++        因果标识（patch 007）：存量条目为 null，乱序落库可由它们追溯。
+       - ``next_seq``：本次调用后应保存的水位 = 最后一条返回条目的 seq+1；无新
+         条目时 = max(since_seq, 历史最大 seq)+1——对任一调用方单调推进、不回退。
+       - ``instance_id``：与 /health 同源的进程指纹（区分"打到了谁"）。
+@@ -1262,6 +1330,10 @@ async def incremental_recent_history(
+                     'speaker': name_mapping.get(e['type'], e['role']) or e['role'],
+                     'content': e['content'],
+                     'ts': e['ts'],
++                    # 因果契约（patch 007）：写入端随 /cache 提交的轮次标识与
++                    # 客户端时间；存量条目/未提交 metadata 的写入为 null。
++                    'turn_uid': e.get('turn_uid'),
++                    'client_ts': e.get('client_ts'),
+                 }
+                 for e in tail
+             ],
+diff --git a/memory/recent.py b/memory/recent.py
+index fc477349..ecb1b1d0 100644
+--- a/memory/recent.py
++++ b/memory/recent.py
+@@ -24,6 +24,7 @@ import logging
+ import locale
+ import sys
+ from contextlib import suppress
++from dataclasses import dataclass
+ 
+ from config.prompts.prompts_memory import (
+     get_recent_history_manager_prompt, get_detailed_recent_history_manager_prompt,
+@@ -111,6 +112,26 @@ RECENT_SEQ_KWARG = 'recent_seq'
+ RECENT_SEQ_TS_KWARG = 'recent_seq_ts'
+ RECENT_SEQ_STATE_FILENAME = 'recent_seq_state.json'
+ 
++# ── 因果顺序契约（UC3 完整裁决 1a-2）──────────────────────────────────
++# seq 解决「读侧增量」，turn 元数据解决「写侧因果」。写入端（各通道每轮 /cache）
++# 在请求体 metadata 里带上稳定轮次标识 turn_uid（写入端生成、跨网络重试不变）与
++# client_ts（客户端侧发生时间），存储层在落盘临界区内随 recent_seq 一并打点进
++# additional_kwargs：
++#   - recent_seq 仍按**到达序**分配——旧回合晚到（client_ts 乱序）不重排、不回填，
++#     这是数据模型现状下的已知偏差；乱序可由消息上的 turn_uid/client_ts 追溯；
++#   - 同一 turn_uid 重复提交（网络重试、双端竞态、时间相同的双发）在临界区内按
++#     已落库 seq 幂等跳过，绝不双写（写入端版本检查）；
++#   - corrected 场景的替代指针（metadata.replaces_turn_uid）记入同目录
++#     turn_replacements.json 账本——不改 recent 纯追加语义；facts 侧的替代
++#     传播（改错后不再引用旧事实）是 P2-3 验收项，这里只落指针。
++# channel/session_id 是批次级溯源信息：不逐消息打点（turn_uid 已可关联回请求），
++# 落入日志与替代指针账本。
++TURN_UID_KWARG = 'turn_uid'
++CLIENT_TS_KWARG = 'client_ts'
++TURN_REPLACES_KWARG = 'turn_replaces'
++TURN_REPLACEMENTS_FILENAME = 'turn_replacements.json'
++TURN_REPLACEMENTS_MAX_ENTRIES = 200
++
+ 
+ def message_recent_seq(message) -> int | None:
+     """Return the stamped monotonic seq of a message, or None when unstamped."""
+@@ -123,6 +144,36 @@ def message_recent_seq(message) -> int | None:
+     return seq
+ 
+ 
++def message_turn_uid(message) -> str | None:
++    """Return the causal turn id stamped on a message, or None."""
++    kwargs = getattr(message, 'additional_kwargs', None)
++    if not isinstance(kwargs, dict):
++        return None
++    value = kwargs.get(TURN_UID_KWARG)
++    if isinstance(value, str) and value.strip():
++        return value.strip()
++    return None
++
++
++@dataclass(frozen=True)
++class TurnWriteMetadata:
++    """写入端随 /cache 请求提交的轮次因果元数据（UC3 1a-2）。
++
++    recent 层不依赖 fastapi/pydantic：路由层的请求模型在边界处转成这个
++    纯 dataclass。全部字段可选——不传（默认）即旧行为，向后兼容。
++    """
++    channel: str | None = None
++    session_id: str | None = None
++    turn_uid: str | None = None
++    client_ts: str | None = None
++    replaces_turn_uid: str | None = None
++
++    @property
++    def has_causal_identity(self) -> bool:
++        """True when this batch carries a stable turn id (enables idempotency)."""
++        return bool(self.turn_uid and self.turn_uid.strip())
++
++
+ def _entry_text_content(message) -> str:
+     """Flatten a message's content into plain text (multimodal parts joined)."""
+     content = getattr(message, 'content', '')
+@@ -156,6 +207,8 @@ def extract_recent_seq_entries(history: list) -> list[dict]:
+             continue
+         kwargs = getattr(message, 'additional_kwargs', None) or {}
+         ts = kwargs.get(RECENT_SEQ_TS_KWARG)
++        turn_uid = kwargs.get(TURN_UID_KWARG)
++        client_ts = kwargs.get(CLIENT_TS_KWARG)
+         entries.append({
+             'seq': seq,
+             # role: 稳定枚举（user/assistant/…）；type: 存储层原始类型（human/ai）
+@@ -163,6 +216,9 @@ def extract_recent_seq_entries(history: list) -> list[dict]:
+             'type': getattr(message, 'type', ''),
+             'content': _entry_text_content(message),
+             'ts': str(ts) if ts else None,
++            # 因果契约（patch 007）：存量条目/未随请求提交 metadata 的写入为 None
++            'turn_uid': str(turn_uid) if turn_uid else None,
++            'client_ts': str(client_ts) if client_ts else None,
+         })
+     entries.sort(key=lambda e: e['seq'])
+     return entries
+@@ -551,6 +607,110 @@ class CompressedRecentHistoryManager:
+         counters[lanlan_name] = counter
+         self._write_recent_seq_highwater(file_path, counter)
+ 
++    # ── 因果顺序契约：turn 打点 + 幂等 + 替代指针账本（见 TURN_* 注释）────
++    def _stamp_turn_metadata_unlocked(self, new_messages, turn_metadata) -> None:
++        """把批次级 turn 元数据打点到本批对话消息的 additional_kwargs。
++
++        与 ``_stamp_recent_seq_unlocked`` 同一临界区调用（_append_and_persist_
++        locked 内、合并结果落盘之前），保证 seq 与 turn_uid 要么一起可见、
++        要么一起不可见——幂等检查依赖这一点（看到 turn_uid ⟹ 该轮已完整落库）。
++        与 seq 同规则：SystemMessage（压缩 memo）不打；不带 additional_kwargs
++        的对象跳过。
++        """
++        if turn_metadata is None:
++            return
++        turn_uid = (turn_metadata.turn_uid or '').strip() or None
++        client_ts = (turn_metadata.client_ts or '').strip() or None
++        replaces = (turn_metadata.replaces_turn_uid or '').strip() or None
++        if not (turn_uid or client_ts or replaces):
++            return
++        for message in new_messages:
++            if isinstance(message, SystemMessage):
++                continue
++            if not hasattr(message, 'additional_kwargs'):
++                continue
++            if not isinstance(message.additional_kwargs, dict):
++                message.additional_kwargs = {}
++            if TURN_UID_KWARG not in message.additional_kwargs and turn_uid:
++                message.additional_kwargs[TURN_UID_KWARG] = turn_uid
++            if CLIENT_TS_KWARG not in message.additional_kwargs and client_ts:
++                message.additional_kwargs[CLIENT_TS_KWARG] = client_ts
++            if TURN_REPLACES_KWARG not in message.additional_kwargs and replaces:
++                message.additional_kwargs[TURN_REPLACES_KWARG] = replaces
++
++    def _find_turn_uid_seq(
++        self, history, pending, turn_uid: str,
++    ) -> tuple[bool, int | None]:
++        """Locate an already-recorded turn: returns ``(found, seq)``.
++
++        ``found=False`` 表示该 turn_uid 从未落库（正常写入）；``found=True`` 且
++        ``seq`` 为 None 表示条目存在但无 seq（打点前写入的防御分支——按
++        turn_uid 打点与 seq 打点同临界区，正常不会出现）。
++        """
++        for message in list(history) + list(pending):
++            if message_turn_uid(message) == turn_uid:
++                return (True, message_recent_seq(message))
++        return (False, None)
++
++    def _turn_replacements_path(self, file_path: str) -> str:
++        return os.path.join(os.path.dirname(file_path), TURN_REPLACEMENTS_FILENAME)
++
++    def _record_turn_replacement_locked(self, file_path, turn_metadata) -> None:
++        """Append the correction pointer to turn_replacements.json (best-effort).
++
++        必须在持有 recent 文件锁时调用（与 recent.json 写入同一临界区）：账本
++        与 recent.json 同目录，共用这把锁串行化读改写。失败只 WARN——指针账本
++        缺一条不影响 recent 语义，P2-3 传播逻辑落地时以账本存在条目为准。
++        """
++        try:
++            state_path = self._turn_replacements_path(file_path)
++            entries = []
++            try:
++                with open(state_path, encoding='utf-8') as f:
++                    loaded = json.load(f)
++                if isinstance(loaded, list):
++                    entries = [e for e in loaded if isinstance(e, dict)]
++            except FileNotFoundError:
++                pass
++            except Exception as e:
++                logger.debug(f"[RecentHistory] 读取 turn 替代账本失败({state_path}): {e}")
++            entries.append({
++                'turn_uid': (turn_metadata.turn_uid or '').strip(),
++                'replaces_turn_uid': (turn_metadata.replaces_turn_uid or '').strip(),
++                'channel': turn_metadata.channel,
++                'session_id': turn_metadata.session_id,
++                'client_ts': turn_metadata.client_ts,
++                'recorded_at': datetime.now().isoformat(),
++            })
++            if len(entries) > TURN_REPLACEMENTS_MAX_ENTRIES:
++                dropped = len(entries) - TURN_REPLACEMENTS_MAX_ENTRIES
++                entries = entries[-TURN_REPLACEMENTS_MAX_ENTRIES:]
++                logger.info(
++                    f"[RecentHistory] turn 替代账本达上界 {TURN_REPLACEMENTS_MAX_ENTRIES} 条，"
++                    f"丢弃最旧 {dropped} 条"
++                )
++            atomic_write_text(
++                state_path,
++                json.dumps(entries, ensure_ascii=False, indent=2),
++            )
++        except Exception as e:
++            logger.warning(f"[RecentHistory] 记录 turn 替代指针失败: {e}")
++
++    def get_turn_replacements(self, lanlan_name: str) -> list[dict]:
++        """Read the correction-pointer ledger for a character (P2-3 消费口)."""
++        file_path = self._ensure_path_for_character(lanlan_name)
++        state_path = self._turn_replacements_path(file_path)
++        try:
++            with open(state_path, encoding='utf-8') as f:
++                loaded = json.load(f)
++            if isinstance(loaded, list):
++                return [e for e in loaded if isinstance(e, dict)]
++        except FileNotFoundError:
++            return []
++        except Exception as e:
++            logger.debug(f"[RecentHistory] 读取 turn 替代账本失败({state_path}): {e}")
++        return []
++
+     # ── 未落盘批次账本 ────────────────────────────────────────────────
+     def _pending_batches(self, lanlan_name: str) -> list:
+         """Return messages that could not be persisted to this character's file."""
+@@ -817,24 +977,58 @@ class CompressedRecentHistoryManager:
+ 
+     def _append_and_persist_locked(
+         self, file_path, lanlan_name, new_messages, expected_generation=None,
+-    ) -> tuple[list, bool]:
++        turn_metadata=None,
++    ) -> tuple[list, bool, dict | None]:
+         """Read → merge unpersisted batches → append → persist, as one critical section.
+ 
+-        Returns ``(history, persisted)``. ``persisted`` is False when the batch
+-        only made it into memory; those messages are recorded in ``_pending`` so
+-        that the next call re-attaches them instead of letting the on-disk copy
+-        silently win.
++        Returns ``(history, persisted, turn_skip)``. ``persisted`` is False when
++        the batch only made it into memory; those messages are recorded in
++        ``_pending`` so that the next call re-attaches them instead of letting
++        the on-disk copy silently win. ``turn_skip`` is non-None when the batch
++        carried a ``turn_uid`` that is already on disk/pending — the whole batch
++        was skipped idempotently (UC3 1a-2 写入端版本检查), nothing was written.
+         """
+         with recent_file.recent_file_access(
+             file_path, expected_generation=expected_generation,
+         ) as file_path:
+             status, history = self._load_history_unlocked(file_path, lanlan_name)
+             pending = recent_file.get_recent_pending_unlocked(file_path)
++            # 因果契约：同一 turn_uid 重复提交（网络重试/双端竞态/时间相同双发）
++            # 在打点之前整批幂等跳过——不 append、不占 seq、不重记替代指针。
++            # 检查必须在这个临界区内：两个相同 turn_uid 并发到达时，谁先拿到
++            # 文件锁谁落库，后者在此必然看到已落库的打点。
++            turn_skip: dict | None = None
++            if turn_metadata is not None and turn_metadata.has_causal_identity:
++                found, existing_seq = self._find_turn_uid_seq(
++                    history, pending, turn_metadata.turn_uid.strip(),
++                )
++                if found:
++                    turn_skip = {
++                        'turn_uid': turn_metadata.turn_uid.strip(),
++                        'existing_seq': existing_seq,
++                    }
++                    logger.info(
++                        f"[RecentHistory] {lanlan_name} turn_uid={turn_skip['turn_uid']} "
++                        f"重复提交，幂等跳过（已落库 seq={existing_seq}）"
++                    )
++                    return (
++                        self._cache_history_view(
++                            file_path,
++                            lanlan_name,
++                            self._current_cached_disk_history(file_path, lanlan_name),
++                            pending,
++                        ),
++                        True,
++                        turn_skip,
++                    )
+             # p1-1 L1：新消息在临界区内领取单调 seq（见模块级 RECENT_SEQ_* 注释）。
+             # 放在 UNREADABLE 分支之前：读盘失败转入 pending 的消息同样要带 seq。
+             self._stamp_recent_seq_unlocked(
+                 file_path, lanlan_name, history, pending, new_messages,
+             )
++            # 因果契约：turn_uid/client_ts 与 seq 同临界区打点（一起可见或一起
++            # 不可见，幂等检查依赖这个原子性）。
++            self._stamp_turn_metadata_unlocked(new_messages, turn_metadata)
+             if status == RECENT_READ_UNREADABLE:
+                 # 读不到盘上内容 ≠ 盘上是空的。这里一写就是拿这批新消息覆盖掉
+                 # 整段读不出来的历史（重构前的 `except Exception: return []`
+@@ -853,6 +1047,7 @@ class CompressedRecentHistoryManager:
+                         updated_pending,
+                     ),
+                     False,
++                    None,
+                 )
+ 
+             merged = list(history) + list(pending) + list(new_messages)
+@@ -874,11 +1069,15 @@ class CompressedRecentHistoryManager:
+                     list(pending) + list(new_messages),
+                 )
+                 logger.error(f"[RecentHistory] 保存历史记录失败: {e}", exc_info=True)
+-                return (merged, False)
++                return (merged, False, None)
+ 
+             self._set_pending_batches(lanlan_name, [], file_path)
+             self._cache_history_view(file_path, lanlan_name, merged)
+-            return (merged, True)
++            # 因果契约：替代指针（corrected 场景）只在批次真正落盘后记录——
++            # pending/失败路径下指针指向的内容尚不存在，不记。
++            if turn_metadata is not None and (turn_metadata.replaces_turn_uid or '').strip():
++                self._record_turn_replacement_locked(file_path, turn_metadata)
++            return (merged, True, None)
+ 
+     def _splice_compressed_locked(
+         self, file_path, lanlan_name, snapshot, memo, expected_generation=None,
+@@ -927,7 +1126,10 @@ class CompressedRecentHistoryManager:
+             )
+             return 'merged'
+ 
+-    async def update_history(self, new_messages, lanlan_name, detailed=False, compress=True, on_compress_done=None):
++    async def update_history(
++        self, new_messages, lanlan_name, detailed=False, compress=True,
++        on_compress_done=None, turn_metadata=None,
++    ):
+         file_path, admission_generation = self._capture_recent_operation_admission(
+             lanlan_name,
+         )
+@@ -949,13 +1151,22 @@ class CompressedRecentHistoryManager:
+             # CS-1：读盘 + 合并未落盘批次 + append + 落盘，一个临界区。
+             # 先把未压缩状态落盘再进耗时的 compress_history：后者走 LLM，数秒到
+             # 数十秒，期间进程崩溃或 task 被 cancel 会导致本批 new_messages 丢失。
+-            history, persisted = await _await_recent_mutation_to_completion(
++            history, persisted, turn_skip = await _await_recent_mutation_to_completion(
+                 self._append_and_persist_locked,
+                 file_path,
+                 lanlan_name,
+                 list(new_messages),
+                 admission_generation,
++                turn_metadata,
+             )
++            if turn_skip is not None:
++                # 因果契约（UC3 1a-2）：重复轮次已整批幂等跳过，调用方（/cache）
++                # 据此跳过 time_indexed/outbox 等连带写入，返回 skipped 语义。
++                return {
++                    'turn_skipped': True,
++                    'turn_uid': turn_skip['turn_uid'],
++                    'existing_seq': turn_skip.get('existing_seq'),
++                }
+             logger.debug(
+                 f"[RecentHistory] {lanlan_name} 添加了 {len(new_messages)} 条新消息，"
+                 f"当前共 {len(history)} 条（已落盘={persisted}）"
+diff --git a/tests/unit/test_causal_write_contract.py b/tests/unit/test_causal_write_contract.py
+new file mode 100644
+index 00000000..6d468fab
+--- /dev/null
++++ b/tests/unit/test_causal_write_contract.py
+@@ -0,0 +1,417 @@
++# -*- coding: utf-8 -*-
++"""Causal write contract tests (UC3 Final Gate 1a-2, patch 007).
++
++HistoryRequest.metadata = {channel, session_id, turn_uid, client_ts,
++replaces_turn_uid}，向后兼容（不传=现状）。验收用例（设计文档 P1-1「必做
++不裁」）：
++
++1. 旧回合晚到（client_ts 乱序落库）→ recent_seq 仍按**到达序**分配，消息上
++   的 turn_uid/client_ts 可追溯；
++2. 相同 turn_uid 重复提交 → 临界区内幂等跳过（skipped 语义，零双写）；
++3. 时间相同（client_ts 相同）的双提交 → 同 turn_uid 只落一份；不同 turn_uid
++   是两个轮次，各自落库；
++4. corrected 场景（replaces_turn_uid）→ turn_replacements.json 记替代指针，
++   recent 仍是纯追加；
++5. HTTP /cache 端点：重复提交返回 status=skipped_duplicate_turn，连带
++   time_indexed/outbox 零副作用。
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from memory.recent import (
++    CLIENT_TS_KWARG,
++    TURN_REPLACEMENTS_FILENAME,
++    TURN_UID_KWARG,
++    CompressedRecentHistoryManager,
++    TurnWriteMetadata,
++    extract_recent_seq_entries,
++    message_recent_seq,
++)
++from utils.llm_client import AIMessage, HumanMessage
++
++pytestmark = pytest.mark.unit
++
++_LANLAN = "Xiaoba"
++_MASTER = "Master"
++
++
++class _FakeConfigManager:
++    def __init__(self, memory_dir: str, recent_log: dict):
++        self.memory_dir = memory_dir
++        self._recent_log = recent_log
++
++    def get_character_data(self):
++        return self.aget_character_data_sync()
++
++    def aget_character_data_sync(self):
++        return (
++            _MASTER, _LANLAN, None, {},
++            {"human": _MASTER, "ai": _LANLAN, "system": "SYSTEM_MESSAGE"},
++            None, None, None, self._recent_log,
++        )
++
++    async def aget_character_data(self):
++        return self.aget_character_data_sync()
++
++
++def _make_manager(tmp_path: Path) -> CompressedRecentHistoryManager:
++    file_path = str(tmp_path / "recent.json")
++    mgr = object.__new__(CompressedRecentHistoryManager)
++    mgr._config_manager = _FakeConfigManager(str(tmp_path), {_LANLAN: file_path})
++    mgr.max_history_length = 10
++    mgr.compress_threshold = 15
++    mgr.log_file_path = {_LANLAN: file_path}
++    mgr.name_mapping = {"human": _MASTER, "ai": _LANLAN, "system": "SYSTEM_MESSAGE"}
++    mgr.user_histories = {}
++    mgr._seq_counters = {}
++    return mgr
++
++
++def _read_disk_messages(file_path: str) -> list:
++    from utils.llm_client import messages_from_dict
++    with open(file_path, encoding="utf-8") as f:
++        return messages_from_dict(json.load(f))
++
++
++@pytest.fixture(autouse=True)
++def _patch_cloudsave(monkeypatch):
++    monkeypatch.setattr(
++        "memory.recent.assert_cloudsave_writable", lambda *a, **kw: None,
++    )
++
++
++def _turn(uid: str, *, client_ts: str = "2026-09-20T10:00:00", **kw) -> TurnWriteMetadata:
++    return TurnWriteMetadata(turn_uid=uid, client_ts=client_ts, **kw)
++
++
++# ─────────────────── 1. 乱序到达：seq 按到达序，turn_uid 可追溯 ───────────────────
++
++
++def test_late_arriving_turn_keeps_arrival_seq_and_causal_trace(tmp_path):
++    """旧回合（client_ts 更早）晚到：seq 按到达序连号，不按 client_ts 重排。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    # 新回合先到（client_ts 10:02）
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="new turn first"), AIMessage(content="reply new")],
++        _LANLAN, compress=False,
++        turn_metadata=_turn("turn-b", client_ts="2026-09-20T10:02:00"),
++    ))
++    # 旧回合后到（client_ts 10:01）——到达序在后，seq 也应在后
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="old turn late"), AIMessage(content="reply old")],
++        _LANLAN, compress=False,
++        turn_metadata=_turn("turn-a", client_ts="2026-09-20T10:01:00"),
++    ))
++
++    final = _read_disk_messages(file_path)
++    seqs = [message_recent_seq(m) for m in final]
++    assert seqs == [1, 2, 3, 4], f"seq 应按到达序连号，实际 {seqs}"
++    kwargs = [m.additional_kwargs for m in final]
++    assert [k[TURN_UID_KWARG] for k in kwargs] == ["turn-b", "turn-b", "turn-a", "turn-a"]
++    # client_ts 保留客户端发生时间——乱序由此可追溯（落库 ts 见 recent_seq_ts）
++    assert [k[CLIENT_TS_KWARG] for k in kwargs] == [
++        "2026-09-20T10:02:00", "2026-09-20T10:02:00",
++        "2026-09-20T10:01:00", "2026-09-20T10:01:00",
++    ]
++
++    # 增量提取同样透出因果字段
++    entries = extract_recent_seq_entries(final)
++    assert [e["turn_uid"] for e in entries] == ["turn-b", "turn-b", "turn-a", "turn-a"]
++    assert entries[2]["client_ts"] == "2026-09-20T10:01:00"
++
++
++# ─────────────────── 2/3. 幂等：重复 turn_uid 与时间相同双提交 ───────────────────
++
++
++def test_duplicate_turn_uid_is_idempotently_skipped(tmp_path):
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    batch = [HumanMessage(content="dup turn"), AIMessage(content="dup reply")]
++    first = asyncio.run(mgr.update_history(
++        list(batch), _LANLAN, compress=False, turn_metadata=_turn("turn-x"),
++    ))
++    assert first is None, "首次提交正常写入，无 skipped 返回"
++
++    # 同一 turn_uid 重试（内容对象重建——网络重试就是重新序列化的）
++    retry = [HumanMessage(content="dup turn"), AIMessage(content="dup reply")]
++    outcome = asyncio.run(mgr.update_history(
++        retry, _LANLAN, compress=False, turn_metadata=_turn("turn-x"),
++    ))
++    assert outcome == {
++        "turn_skipped": True, "turn_uid": "turn-x", "existing_seq": 1,
++    }
++
++    final = _read_disk_messages(file_path)
++    assert len(final) == 2, "重复提交不得双写"
++    assert [message_recent_seq(m) for m in final] == [1, 2], "幂等跳过不占新 seq"
++
++
++def test_same_client_ts_distinct_turn_uids_both_persisted(tmp_path):
++    """时间相同（client_ts 相同）但 turn_uid 不同 = 两个真实轮次，各自落库。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++    same_ts = "2026-09-20T11:00:00"
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="first at ts")], _LANLAN, compress=False,
++        turn_metadata=_turn("turn-1", client_ts=same_ts),
++    ))
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="second at ts")], _LANLAN, compress=False,
++        turn_metadata=_turn("turn-2", client_ts=same_ts),
++    ))
++
++    final = _read_disk_messages(file_path)
++    assert len(final) == 2
++    assert [m.additional_kwargs[TURN_UID_KWARG] for m in final] == ["turn-1", "turn-2"]
++    assert [message_recent_seq(m) for m in final] == [1, 2]
++
++
++def test_same_turn_uid_same_client_ts_single_copy(tmp_path):
++    """时间相同 + turn_uid 相同的双提交 → 幂等，只落一份。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++    same_ts = "2026-09-20T11:00:00"
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="only once")], _LANLAN, compress=False,
++        turn_metadata=_turn("turn-d", client_ts=same_ts),
++    ))
++    outcome = asyncio.run(mgr.update_history(
++        [HumanMessage(content="only once")], _LANLAN, compress=False,
++        turn_metadata=_turn("turn-d", client_ts=same_ts),
++    ))
++    assert outcome and outcome["turn_skipped"]
++    assert len(_read_disk_messages(file_path)) == 1
++
++
++def test_unstamped_metadata_keeps_legacy_behaviour(tmp_path):
++    """不传 metadata（旧客户端）= 现状：照常追加，无 turn 字段，返回 None。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    for content in ("legacy a", "legacy b", "legacy a"):  # 第三次是相同内容重发
++        outcome = asyncio.run(mgr.update_history(
++            [HumanMessage(content=content)], _LANLAN, compress=False,
++        ))
++        assert outcome is None
++
++    final = _read_disk_messages(file_path)
++    assert len(final) == 3, "无 turn_uid 时无幂等（相同内容是合法的重复发言）"
++    assert all(TURN_UID_KWARG not in m.additional_kwargs for m in final)
++
++
++# ─────────────────── 4. 替代指针账本 ───────────────────
++
++
++def test_replaces_turn_uid_records_pointer_without_touching_recent(tmp_path):
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="original claim")], _LANLAN, compress=False,
++        turn_metadata=_turn("turn-old", channel="qq", session_id="s1"),
++    ))
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="corrected claim")], _LANLAN, compress=False,
++        turn_metadata=_turn(
++            "turn-new", channel="qq", session_id="s1",
++            client_ts="2026-09-20T12:00:00", replaces_turn_uid="turn-old",
++        ),
++    ))
++
++    # recent 仍是纯追加：两条都在，顺序不变
++    final = _read_disk_messages(file_path)
++    assert [m.content for m in final] == ["original claim", "corrected claim"]
++
++    # 替代指针落在账本
++    ledger_path = os.path.join(os.path.dirname(file_path), TURN_REPLACEMENTS_FILENAME)
++    with open(ledger_path, encoding="utf-8") as f:
++        ledger = json.load(f)
++    assert len(ledger) == 1
++    entry = ledger[0]
++    assert entry["turn_uid"] == "turn-new"
++    assert entry["replaces_turn_uid"] == "turn-old"
++    assert entry["channel"] == "qq" and entry["session_id"] == "s1"
++    assert entry["client_ts"] == "2026-09-20T12:00:00"
++    assert entry["recorded_at"]
++
++    # 读口（P2-3 传播逻辑的消费面）
++    assert mgr.get_turn_replacements(_LANLAN)[0]["replaces_turn_uid"] == "turn-old"
++
++
++def test_replacement_pointer_not_recorded_for_duplicate_turn(tmp_path):
++    """重复轮次跳过时不重记替代指针（幂等零副作用）。"""
++    mgr = _make_manager(tmp_path)
++    file_path = mgr.log_file_path[_LANLAN]
++    md = _turn("turn-c", replaces_turn_uid="turn-b")
++
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="c1")], _LANLAN, compress=False, turn_metadata=md,
++    ))
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="c1")], _LANLAN, compress=False, turn_metadata=md,
++    ))
++
++    ledger_path = os.path.join(os.path.dirname(file_path), TURN_REPLACEMENTS_FILENAME)
++    with open(ledger_path, encoding="utf-8") as f:
++        assert len(json.load(f)) == 1
++
++
++# ─────────────────── 5. HTTP /cache 端点 ───────────────────
++
++
++async def _drive_cache_endpoint(tmp_path, bodies):
++    """POST /cache on the real app with hermetic runtime swaps; returns responses."""
++    import httpx
++    from app.memory_server import routes, runtime
++
++    mgr = _make_manager(tmp_path)
++
++    store_calls: list[list] = []
++    outbox_calls: list[str] = []
++
++    class _FakeTimeManager:
++        async def astore_conversation(self, uid, messages, name, timestamp=None):
++            store_calls.append(list(messages))
++
++    async def _fake_outbox(name, messages, **kwargs):
++        outbox_calls.append(name)
++
++    saved = (
++        runtime.recent_history_manager, runtime.time_manager,
++        runtime._config_manager,
++        runtime._memory_runtime_init_completed,
++        runtime._memory_storage_blocked_after_init,
++    )
++    runtime.recent_history_manager = mgr
++    runtime.time_manager = _FakeTimeManager()
++    runtime._config_manager = mgr._config_manager
++    runtime._memory_runtime_init_completed = True
++    runtime._memory_storage_blocked_after_init = False
++    from app.memory_server import post_turn as _post_turn
++    saved_outbox = _post_turn._spawn_outbox_post_turn_signals
++    _post_turn._spawn_outbox_post_turn_signals = _fake_outbox
++    try:
++        transport = httpx.ASGITransport(app=routes.app)
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://127.0.0.1",
++        ) as client:
++            responses = []
++            for body in bodies:
++                responses.append(await client.post(f"/cache/{_LANLAN}", json=body))
++            return responses, mgr, store_calls, outbox_calls
++    finally:
++        (
++            runtime.recent_history_manager, runtime.time_manager,
++            runtime._config_manager,
++            runtime._memory_runtime_init_completed,
++            runtime._memory_storage_blocked_after_init,
++        ) = saved
++        _post_turn._spawn_outbox_post_turn_signals = saved_outbox
++
++
++def _cache_body(contents: list[str], metadata: dict | None = None) -> dict:
++    body = {
++        "input_history": json.dumps([
++            {"type": "human", "data": {"content": c, "type": "human"}}
++            for c in contents
++        ]),
++        "language": "en",
++    }
++    if metadata is not None:
++        body["metadata"] = metadata
++    return body
++
++
++@pytest.mark.asyncio
++async def test_cache_endpoint_duplicate_turn_skips_side_effects(tmp_path):
++    dup_md = {"turn_uid": "turn-ep", "channel": "wechat", "session_id": "w1",
++              "client_ts": "2026-09-20T09:00:00"}
++    responses, mgr, store_calls, outbox_calls = await _drive_cache_endpoint(
++        tmp_path,
++        [
++            _cache_body(["endpoint turn"], dup_md),
++            _cache_body(["endpoint turn"], dup_md),  # 网络重试
++        ],
++    )
++
++    first, retry = (r.json() for r in responses)
++    assert first == {"status": "cached", "count": 1}
++    assert retry["status"] == "skipped_duplicate_turn"
++    assert retry["turn_uid"] == "turn-ep"
++    assert retry["existing_seq"] == 1
++    assert retry["count"] == 0
++
++    # 连带副作用零增加：time_indexed 与 outbox 都只看到首轮
++    assert len(store_calls) == 1
++    assert outbox_calls == [_LANLAN]
++
++    final = _read_disk_messages(mgr.log_file_path[_LANLAN])
++    assert len(final) == 1
++
++
++@pytest.mark.asyncio
++async def test_cache_endpoint_without_metadata_unchanged(tmp_path):
++    responses, mgr, store_calls, _ = await _drive_cache_endpoint(
++        tmp_path, [_cache_body(["plain turn"])],
++    )
++    assert responses[0].json() == {"status": "cached", "count": 1}
++    assert len(store_calls) == 1
++    assert TURN_UID_KWARG not in _read_disk_messages(mgr.log_file_path[_LANLAN])[0].additional_kwargs
++
++
++@pytest.mark.asyncio
++async def test_recent_history_endpoint_exposes_causal_fields(tmp_path):
++    """增量读取端点透出 turn_uid/client_ts（跨端读侧可追溯）。"""
++    import httpx
++    from app.memory_server import routes, runtime
++
++    mgr = _make_manager(tmp_path)
++    asyncio.run(mgr.update_history(
++        [HumanMessage(content="traced turn")], _LANLAN, compress=False,
++        turn_metadata=_turn("turn-read", client_ts="2026-09-20T08:00:00"),
++    ))
++
++    async def _fake_aget(name, **kwargs):
++        import utils.recent_file as recent_file
++        with recent_file.recent_file_access(mgr.log_file_path[_LANLAN]):
++            from utils.llm_client import messages_from_dict
++            with open(mgr.log_file_path[_LANLAN], encoding="utf-8") as f:
++                return messages_from_dict(json.load(f))
++
++    fake_manager = type("FakeManager", (), {"aget_recent_history": staticmethod(_fake_aget)})()
++    saved = (
++        runtime.recent_history_manager, runtime._config_manager,
++        runtime._memory_runtime_init_completed,
++        runtime._memory_storage_blocked_after_init,
++    )
++    runtime.recent_history_manager = fake_manager
++    runtime._config_manager = mgr._config_manager
++    runtime._memory_runtime_init_completed = True
++    runtime._memory_storage_blocked_after_init = False
++    try:
++        transport = httpx.ASGITransport(app=routes.app)
++        async with httpx.AsyncClient(
++            transport=transport, base_url="http://127.0.0.1",
++        ) as client:
++            resp = await client.get(f"/recent_history/{_LANLAN}")
++    finally:
++        (
++            runtime.recent_history_manager, runtime._config_manager,
++            runtime._memory_runtime_init_completed,
++            runtime._memory_storage_blocked_after_init,
++        ) = saved
++
++    entry = resp.json()["entries"][0]
++    assert entry["turn_uid"] == "turn-read"
++    assert entry["client_ts"] == "2026-09-20T08:00:00"
+diff --git a/tests/unit/test_recent_file_lock.py b/tests/unit/test_recent_file_lock.py
+index 3441e168..39b34631 100644
+--- a/tests/unit/test_recent_file_lock.py
++++ b/tests/unit/test_recent_file_lock.py
+@@ -1650,9 +1650,11 @@ def test_no_recent_json_writer_bypasses_the_lock_module():
+     the test.
+ 
+     A write-primitive call counts as a recent.json write when its destination
+-    expression does NOT mention ``meta`` (recent_meta.json is a different file)
+-    or ``seq_state`` (recent_seq_state.json — the per-character seq highwater
+-    sidecar, written only inside the same file lock) and either
++    expression does NOT mention ``meta`` (recent_meta.json is a different file),
++    ``seq_state`` (recent_seq_state.json — the per-character seq highwater
++    sidecar, written only inside the same file lock) or ``turn_replacements``
++    (turn_replacements.json — the correction-pointer ledger, same-lock sidecar,
++    patch 007) and either
+       (a) the destination expression mentions ``recent`` (following one level of
+           local assignment), or
+       (b) the enclosing function — or the class it lives in — mentions the
+@@ -1721,8 +1723,8 @@ def test_no_recent_json_writer_bypasses_the_lock_module():
+             for node in writes:
+                 dest = _segment(lines, node.args[0])
+                 resolved = f"{dest} {assigned.get(dest, '')}".lower()
+-                if "meta" in resolved or "seq_state" in resolved:
+-                    continue  # recent_meta.json / recent_seq_state.json 是另一些文件，不归这把锁管
++                if "meta" in resolved or "seq_state" in resolved or "turn_replacements" in resolved:
++                    continue  # recent_meta.json / recent_seq_state.json / turn_replacements.json 是另一些 sidecar，不归这把锁管
+                 named = set(re.findall(r"[\w-]+\.json", resolved))
+                 if named and "recent.json" not in named:
+                     continue  # 目标表达式明说了是别的文件（如 characters.json）
+diff --git a/tests/unit/test_recent_history_incremental_seq.py b/tests/unit/test_recent_history_incremental_seq.py
+index c403d99c..f4c4a86b 100644
+--- a/tests/unit/test_recent_history_incremental_seq.py
++++ b/tests/unit/test_recent_history_incremental_seq.py
+@@ -290,7 +290,11 @@ async def test_endpoint_returns_contract_shape_and_instance_id(tmp_path):
+     assert isinstance(body["instance_id"], str) and body["instance_id"]
+     assert [e["seq"] for e in body["entries"]] == [1, 2, 3]
+     first = body["entries"][0]
+-    assert set(first.keys()) == {"seq", "role", "speaker", "content", "ts"}
++    # patch 007：因果契约新增 turn_uid/client_ts 两键（未提交 metadata 的写入为 null）
++    assert set(first.keys()) == {
++        "seq", "role", "speaker", "content", "ts", "turn_uid", "client_ts",
++    }
++    assert first["turn_uid"] is None and first["client_ts"] is None
+     # role=稳定枚举；speaker=name_mapping 解析后的显示名
+     assert first["role"] == "user" and first["speaker"] == _MASTER
+     assert body["entries"][1]["role"] == "assistant" and body["entries"][1]["speaker"] == _LANLAN
+-- 
+2.43.0
+
