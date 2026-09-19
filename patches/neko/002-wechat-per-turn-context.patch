@@ -1,4 +1,4 @@
-From bc41bae92c43a1c56d597f13251aea19af9a52df Mon Sep 17 00:00:00 2001
+From f0e955971a0862b874a6c3fec5c4ae971d5d0687 Mon Sep 17 00:00:00 2001
 From: AdamPlatin123 <AdamPlatin123@users.noreply.github.com>
 Date: Sat, 19 Sep 2026 23:51:29 +0800
 Subject: [PATCH 2/2] =?UTF-8?q?feat(wechat):=20=E6=B4=BB=E8=B7=83=E4=BC=9A?=
@@ -26,13 +26,13 @@ system 只有开场那次 /new_dialog，主人在桌面/QQ 的新消息微信侧
 - 测试：plugin_integration 标记——请求形状/status:error 拦截/超时降级/
   新会话对齐不注入/回流过滤/三轮全链路（注入一次、无增量不重复注入）。
 ---
- plugin/plugins/wechat_integration/__init__.py | 123 ++++++++
- .../tests/test_cross_context_injection.py     | 274 ++++++++++++++++++
- 2 files changed, 397 insertions(+)
+ plugin/plugins/wechat_integration/__init__.py | 129 ++++++++
+ .../tests/test_cross_context_injection.py     | 291 ++++++++++++++++++
+ 2 files changed, 420 insertions(+)
  create mode 100644 plugin/plugins/wechat_integration/tests/test_cross_context_injection.py
 
 diff --git a/plugin/plugins/wechat_integration/__init__.py b/plugin/plugins/wechat_integration/__init__.py
-index da0a0599..11cd3580 100644
+index da0a0599..1d34207a 100644
 --- a/plugin/plugins/wechat_integration/__init__.py
 +++ b/plugin/plugins/wechat_integration/__init__.py
 @@ -649,10 +649,20 @@ class WechatIntegrationPlugin(NekoPluginBase):
@@ -56,7 +56,7 @@ index da0a0599..11cd3580 100644
  
              # 构建完整消息列表: system + history (裁剪到窗口上限) + new_user_msg
              messages = [{"role": "system", "content": final_system_prompt}]
-@@ -747,6 +757,119 @@ class WechatIntegrationPlugin(NekoPluginBase):
+@@ -747,6 +757,125 @@ class WechatIntegrationPlugin(NekoPluginBase):
              pass
          return None
  
@@ -129,7 +129,13 @@ index da0a0599..11cd3580 100644
 +                her_name, since_seq=0, limit=1,  # 只需要 next_seq，不需要内容
 +            )
 +            if payload is not None:
-+                session["cross_context_next_seq"] = int(payload.get("next_seq") or 0)
++                # 与下方活跃分支同款防御：畸形 next_seq 不能让 int() 抛异常——
++                # 这里抛出去会被 _generate_wechat_reply 的外层 except 吞掉，
++                # 整轮无回复。对齐失败就保持水位 0，下一轮活跃分支重试取。
++                try:
++                    session["cross_context_next_seq"] = int(payload.get("next_seq") or 0)
++                except (TypeError, ValueError):
++                    session["cross_context_next_seq"] = 0
 +            return None
 +
 +        payload = await self._fetch_recent_history_increment(her_name, since_seq=watermark)
@@ -178,10 +184,10 @@ index da0a0599..11cd3580 100644
          """缓存增量对话到 Memory Server"""
 diff --git a/plugin/plugins/wechat_integration/tests/test_cross_context_injection.py b/plugin/plugins/wechat_integration/tests/test_cross_context_injection.py
 new file mode 100644
-index 00000000..85482ac5
+index 00000000..5c7ed89d
 --- /dev/null
 +++ b/plugin/plugins/wechat_integration/tests/test_cross_context_injection.py
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,291 @@
 +# -*- coding: utf-8 -*-
 +"""跨端上下文每轮增量注入的测试（p1-1 L1，workplan P1-1 #2）。
 +
@@ -318,6 +324,23 @@ index 00000000..85482ac5
 +    assert session["cross_context_next_seq"] == 10
 +    # 对齐水位只需要 next_seq：limit=1
 +    assert client.get.await_args.kwargs["params"] == {"since_seq": 0, "limit": 1}
++
++
++async def test_new_session_align_survives_malformed_next_seq():
++    """畸形 next_seq（非空字符串等）不能让 int() 抛出——否则异常被
++    _generate_wechat_reply 外层 except 吞掉，该轮整轮无回复（审查 F1）。"""
++    plugin = _make_plugin()
++    session = {"history": []}
++    payload = {"status": "ok", "entries": [], "next_seq": "garbage"}
++    client = _client_mock(get_responses=[_resp(payload)])
++
++    with patch("httpx.AsyncClient", return_value=client):
++        block = await plugin._refresh_cross_context(
++            session, _HER, "hi", baseline_context="persona ctx",
++        )
++
++    assert block is None
++    assert session["cross_context_next_seq"] == 0, "对齐失败保持水位 0，下轮重试"
 +
 +
 +async def test_active_session_injects_increment_and_filters_own_messages():
