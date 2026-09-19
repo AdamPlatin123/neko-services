@@ -11,6 +11,10 @@
 - `opencode-integration/`：opencode 终端入口的人格与记忆接入层
 - `docs/`：工作计划、整合宪章、技术方案与接口审计（中文）
 
+## 架构
+
+![系统架构](docs/architecture.svg)
+
 ## 快速开始
 
 待 P0-0 完成后补充（runbook 见 `README-RUNBOOK.md`，四端冒烟见 `scripts/smoke.sh`）。
