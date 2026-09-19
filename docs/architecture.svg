@@ -1,0 +1,185 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 560" width="100%" height="100%">
+  <defs>
+    <style>
+      .bg { fill: #0d1117; }
+      .node-card { fill: #161b22; transition: all 0.2s ease; }
+      .text-title { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; font-weight: 700; fill: #f0f6fc; }
+      .text-subtitle { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; fill: #8b949e; }
+      .text-tag { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; font-weight: 600; }
+      .text-bullet { font-family: system-ui, -apple-system, sans-serif; font-size: 11.5px; fill: #c9d1d9; }
+      .label-anno { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; font-weight: 500; }
+      .conn-line { fill: none; stroke-width: 1.4; }
+    </style>
+
+    <!-- 箭头标记 -->
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#58a6ff" />
+    </marker>
+    <marker id="arr-purple" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#bc8cff" />
+    </marker>
+    <marker id="arr-gray" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#484f58" />
+    </marker>
+
+    <!-- 细网格背景图样 -->
+    <pattern id="grid-dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="0.8" fill="#21262d" />
+    </pattern>
+
+    <!-- ZMQ渐变边框 -->
+    <linearGradient id="zmq-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#bc8cff" />
+      <stop offset="50%" stop-color="#58a6ff" />
+      <stop offset="100%" stop-color="#3fb950" />
+    </linearGradient>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="820" height="560" class="bg" />
+  <rect width="820" height="560" fill="url(#grid-dots)" />
+
+  <!-- ================= 顶层：Prompt 层 & 四大入口 ================= -->
+  <!-- monika 人格协议虚线外框 -->
+  <rect x="35" y="20" width="750" height="92" rx="8" fill="rgba(188, 140, 255, 0.03)" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 4" />
+  
+  <!-- monika 标签标牌 -->
+  <rect x="48" y="10" width="186" height="20" rx="4" fill="#1f182c" stroke="#bc8cff" stroke-width="1" />
+  <text x="141" y="24" text-anchor="middle" class="text-tag" fill="#d2a8ff">monika 人格协议 (Prompt 层)</text>
+
+  <!-- 入口 1: 桌面客户端 -->
+  <g transform="translate(48, 40)">
+    <rect width="168" height="60" rx="6" class="node-card" stroke="#58a6ff" stroke-width="1.2" />
+    <text x="84" y="26" text-anchor="middle" class="text-title">桌面客户端</text>
+    <text x="84" y="45" text-anchor="middle" class="text-subtitle">launcher</text>
+  </g>
+
+  <!-- 入口 2: QQ -->
+  <g transform="translate(234, 40)">
+    <rect width="168" height="60" rx="6" class="node-card" stroke="#58a6ff" stroke-width="1.2" />
+    <text x="84" y="26" text-anchor="middle" class="text-title">QQ 接入</text>
+    <text x="84" y="45" text-anchor="middle" class="text-subtitle">qq_auto_reply 插件</text>
+  </g>
+
+  <!-- 入口 3: 微信 -->
+  <g transform="translate(420, 40)">
+    <rect width="168" height="60" rx="6" class="node-card" stroke="#58a6ff" stroke-width="1.2" />
+    <text x="84" y="26" text-anchor="middle" class="text-title">微信接入</text>
+    <text x="84" y="45" text-anchor="middle" class="text-subtitle">wechat_integration 插件</text>
+  </g>
+
+  <!-- 入口 4: opencode 终端 -->
+  <g transform="translate(606, 40)">
+    <rect width="168" height="60" rx="6" class="node-card" stroke="#58a6ff" stroke-width="1.2" />
+    <text x="84" y="26" text-anchor="middle" class="text-title">opencode 终端</text>
+    <text x="84" y="45" text-anchor="middle" class="text-subtitle">agent 寄生</text>
+  </g>
+
+  <!-- ================= 顶层 -> 中层 连接流 ================= -->
+  <path d="M 132 100 V 134 H 240 V 172" class="conn-line" stroke="#58a6ff" marker-end="url(#arr-blue)" />
+  <path d="M 318 100 V 172" class="conn-line" stroke="#58a6ff" marker-end="url(#arr-blue)" />
+  <path d="M 504 100 V 172" class="conn-line" stroke="#58a6ff" marker-end="url(#arr-blue)" />
+  <path d="M 690 100 V 134 H 580 V 172" class="conn-line" stroke="#58a6ff" marker-end="url(#arr-blue)" />
+
+  <!-- 汇聚通道说明 -->
+  <rect x="330" y="124" width="160" height="20" rx="4" fill="#161b22" stroke="#30363d" />
+  <text x="410" y="138" text-anchor="middle" class="label-anno" fill="#8b949e">统一事件接入 / 指令下发</text>
+
+  <!-- ================= 中层：N.E.K.O 主进程 ================= -->
+  <g transform="translate(140, 174)">
+    <rect width="540" height="78" rx="8" class="node-card" stroke="#58a6ff" stroke-width="1.8" />
+    
+    <!-- 主标题与端口标牌 -->
+    <text x="24" y="32" class="text-title" font-size="16">N.E.K.O 主进程</text>
+    
+    <rect x="375" y="18" width="145" height="22" rx="4" fill="#13233a" stroke="#58a6ff" stroke-width="1" />
+    <text x="447" y="33" text-anchor="middle" class="text-tag" fill="#58a6ff">Python 3.11 · :48911</text>
+    
+    <!-- 职责功能说明 -->
+    <text x="24" y="58" class="text-bullet" fill="#8b949e">
+      核心调度中枢 · 对话状态机 · 会话上下文维护 · 意图感知与决策路由
+    </text>
+  </g>
+
+  <!-- ================= 中层 -> 下层 连接流 ================= -->
+  <!-- 左连线 (到 memory_server) -->
+  <path d="M 250 252 V 274 H 198 V 300" class="conn-line" stroke="#bc8cff" marker-end="url(#arr-purple)" />
+  <rect x="150" y="265" width="116" height="18" rx="3" fill="#161b22" stroke="#30363d" />
+  <text x="208" y="278" text-anchor="middle" class="label-anno" fill="#d2a8ff">记忆存储 / 信任更新</text>
+
+  <!-- 右连线 (到 a-memorix-service) -->
+  <path d="M 570 252 V 274 H 622 V 300" class="conn-line" stroke="#58a6ff" marker-end="url(#arr-blue)" />
+  <rect x="554" y="265" width="116" height="18" rx="3" fill="#161b22" stroke="#30363d" />
+  <text x="612" y="278" text-anchor="middle" class="label-anno" fill="#79c0ff">语义索引 / 知识召回</text>
+
+  <!-- ================= 下层两服务 ================= -->
+  <!-- 下层左：memory_server -->
+  <g transform="translate(35, 302)">
+    <rect width="325" height="128" rx="8" class="node-card" stroke="#bc8cff" stroke-width="1.6" />
+    
+    <!-- 头部信息 -->
+    <text x="20" y="30" class="text-title">memory_server</text>
+    <rect x="250" y="16" width="58" height="20" rx="4" fill="#261b36" stroke="#bc8cff" stroke-width="1" />
+    <text x="279" y="30" text-anchor="middle" class="text-tag" fill="#d2a8ff">:48912</text>
+    
+    <text x="20" y="52" class="text-tag" fill="#bc8cff">语义层：五维记忆 / 信任</text>
+    
+    <!-- 核心功能项 -->
+    <text x="20" y="80" class="text-bullet">• 五维空间：工作 / 短期 / 长期 / 剧集 / 情感记忆</text>
+    <text x="20" y="104" class="text-bullet">• 评估机制：动态信任矩阵计算 · 交互萃取沉淀</text>
+  </g>
+
+  <!-- 下层右：a-memorix-service -->
+  <g transform="translate(460, 302)">
+    <rect width="325" height="128" rx="8" class="node-card" stroke="#58a6ff" stroke-width="1.6" />
+    
+    <!-- 头部信息 -->
+    <text x="20" y="30" class="text-title">a-memorix-service</text>
+    <rect x="180" y="16" width="128" height="20" rx="4" fill="#13233a" stroke="#58a6ff" stroke-width="1" />
+    <text x="244" y="30" text-anchor="middle" class="text-tag" fill="#58a6ff">Python 3.12 · :48921</text>
+    
+    <text x="20" y="52" class="text-tag" fill="#58a6ff">检索层：向量 + 图谱</text>
+    
+    <!-- 核心功能项 -->
+    <text x="20" y="80" class="text-bullet">• 稠密检索：Embedding 向量化索引 · Top-K 召回</text>
+    <text x="20" y="104" class="text-bullet">• 知识图谱：Graph RAG 实体漫游 · 关联激活</text>
+  </g>
+
+  <!-- ================= 两服务间双向交互箭头 ================= -->
+  <!-- 左 -> 右: settle 后 ingest -->
+  <path d="M 360 346 H 452" class="conn-line" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-purple)" />
+  <rect x="366" y="328" width="88" height="16" rx="3" fill="#0d1117" />
+  <text x="410" y="340" text-anchor="middle" class="label-anno" fill="#d2a8ff">settle 后 ingest →</text>
+
+  <!-- 右 -> 左: 检索融合 -->
+  <path d="M 460 388 H 368" class="conn-line" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr-blue)" />
+  <rect x="375" y="392" width="70" height="16" rx="3" fill="#0d1117" />
+  <text x="410" y="404" text-anchor="middle" class="label-anno" fill="#58a6ff">← 检索融合</text>
+
+  <!-- ================= 下层 -> ZMQ 消息面 连接 ================= -->
+  <!-- 左服务下连 -->
+  <path d="M 198 430 V 476" class="conn-line" stroke="#bc8cff" stroke-dasharray="4 3" marker-end="url(#arr-purple)" />
+  <rect x="144" y="445" width="108" height="18" rx="3" fill="#161b22" stroke="#30363d" />
+  <text x="198" y="458" text-anchor="middle" class="label-anno" fill="#d2a8ff">事件广播 / 沉淀通知</text>
+
+  <!-- 右服务下连 -->
+  <path d="M 622 430 V 476" class="conn-line" stroke="#58a6ff" stroke-dasharray="4 3" marker-end="url(#arr-blue)" />
+  <rect x="568" y="445" width="108" height="18" rx="3" fill="#161b22" stroke="#30363d" />
+  <text x="622" y="458" text-anchor="middle" class="label-anno" fill="#79c0ff">变更同步 / 任务流</text>
+
+  <!-- ================= 底部：ZMQ 消息面横条 ================= -->
+  <g transform="translate(35, 478)">
+    <rect width="750" height="58" rx="8" class="node-card" stroke="url(#zmq-grad)" stroke-width="1.6" />
+    
+    <!-- 标题与端口 -->
+    <text x="24" y="28" class="text-title">ZMQ 消息面</text>
+    
+    <rect x="125" y="14" width="112" height="20" rx="4" fill="#1f242c" stroke="#3fb950" stroke-width="1" />
+    <text x="181" y="28" text-anchor="middle" class="text-tag" fill="#3fb950">:38865 - :38867</text>
+    
+    <!-- 详细属性 -->
+    <text x="24" y="48" class="text-bullet" fill="#8b949e">
+      PUB / SUB 分布式事件解耦 · ROUTER / DEALER 高吞吐异步传输管道 · 跨进程通信总线
+    </text>
+  </g>
+</svg>
