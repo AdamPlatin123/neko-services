@@ -17,3 +17,10 @@
 - P3：F4 水位在 fetch 成功即推进（非 LLM 消费后）——语义选择记账
 - P3：F5 角色目录整体删除重建后 seq 从 1 重来，残留会话旧水位静默跳过——注释记账
 - P3：F6 成功注入 INFO 日志补 request_id；新端点登记进 neko-access-audit §1 端点表
+
+## P0-1b 跟进项（代审通过后遗留）
+- P2：embedding extra_params 白名单过滤或改 extra_body=（防类型化签名 TypeError 报废候选模型）
+- P2：enqueue_feedback_task 刻意不暴露——audit/route 文档加备注
+- P2：stats 双键形（ready 复数 vs disabled 单数）——README/audit 加注
+- P2：pyproject 注释「锁版本在 P0-1b」与现实矛盾——锁版本或改注释
+- P3：timeout_ms<=0 应 400/422 非 500；/health model_config 快照不随 reload 刷新；504 路径无测试；admin 13 组件全量遍历测试
