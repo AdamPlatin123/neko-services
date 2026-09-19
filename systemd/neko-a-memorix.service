@@ -1,0 +1,32 @@
+# =============================================================================
+# neko-a-memorix.service — a-memorix 记忆检索服务（占位 unit）
+# 状态：占位，P0-1「a-memorix 服务化」完成前不会实际运行——
+#   ConditionPathExists 不满足时 start 会显示 skipped（绿色跳过），neko.target
+#   的 Wants 弱依赖不受影响；服务化落地后无需改 target，仅需：
+#     1. 在 /mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/ 下
+#        完成实现并 `uv sync`（Python 3.12）生成 .venv；
+#     2. 修正下方 ConditionPathExists 与 ExecStart 的入口模块名（现为占位
+#        a_memorix_service，以 P0-1 定稿为准）；
+#     3. systemctl --user daemon-reload && systemctl --user start neko-a-memorix
+# 部署路径不同时，替换 /mnt/shared/_Projects/N.E.K.O 前缀（同 neko-memory.service）。
+# =============================================================================
+
+[Unit]
+Description=N.E.K.O a-memorix memory retrieval service (P0-1 placeholder)
+Documentation=file:///mnt/shared/_Projects/N.E.K.O/neko-services/README.md
+After=neko-memory.service
+# P0-1 落地前该路径不存在 → 本 unit start 自动跳过（显示 skipped，非失败）
+ConditionPathExists=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python
+
+[Service]
+Type=exec
+WorkingDirectory=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service
+# 入口模块名为占位，P0-1 定稿后修正
+ExecStart=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python -m a_memorix_service
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+# 服务地址需与 scripts/lib.sh 的 NEKO_AMEMORIX_URL（默认 http://127.0.0.1:48921）一致
+
+[Install]
+WantedBy=default.target
