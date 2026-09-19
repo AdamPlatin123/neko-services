@@ -9,6 +9,7 @@
 | 组件 | 当前版本 | 数据格式版本 | 升级兼容性说明 | 备份属性 |
 | --- | --- | --- | --- | --- |
 | **N.E.K.O 上游基线**（`/mnt/shared/_Projects/N.E.K.O/N.E.K.O`） | `a3c82b5a`（tag `nightly-4-ga3c82b5a`，2026-09-17 上游线，PR #3127） | —（见「memory 数据」行） | 分叉姿态=钉死版本、被动跟进：仅 QQ 协议/NapCat 破坏性变更时拉取；每次拉取按 `patches/neko/*.patch` 重放并跑回归三绿（runbook 第 4 节）。基线变更后同步更新 BASELINE.md 与本表 | 代码可随 git 回退，无需备份 |
+| **Python 运行时与依赖锁定** | N.E.K.O 上游：Python **3.11.\***（pyproject 锁定），依赖以 `$NEKO_SRC/uv.lock` 为准；a-memorix-service：Python **3.12**（uv venv，P0-1 落地时补记精确版本与 lock 文件路径）；neko-services 自有脚本：系统 bash/python3 | — | 上游升级跨 3.11→3.12 等大版本时属破坏性变更，按 runbook 第 3 节故障 3 流程处理；`uv sync` 以 lock 文件为准，不要手动改依赖 | lock 文件随各仓库 git 管理 |
 | **本地补丁序列**（`patches/neko/*.patch`） | 随本仓库 git 历史 | — | 补丁针对特定上游基线制作；上游基线前进后重放冲突=需要人工重做补丁 | 随仓库 git 管理 |
 | **NapCat**（QQ 协议端，插件托管） | pin 记录在 BASELINE.md（P0-0 #5 落盘；当前本机 `$NEKO_SRC/plugin/plugins/qq_auto_reply/NapCat.Shell/` 尚未安装，首次安装后立即在此补记版本号） | — | **协议风险主源**。自动更新可能破坏 QQ 链路；升级前必查 changelog（巡检入口在 BASELINE.md），升级后跑 runbook 第 3 节故障 3 流程 | 安装包可重下，登录态会话数据看情况备份 |
 | **memory 数据**（`$NEKO_DATA_ROOT/memory/<角色>/`） | 跟随写入它的 N.E.K.O 基线 commit（上游无独立 schema 版本号，格式由上游 `memory/` 代码决定） | 随上游基线演进；`_reserved` 角色卡分层 schema 现为 v2（上游 `config/character_fields.py`） | **升级退路的核心**：数据格式跟代码走，代码升级后新版可能以新格式写入；回滚代码必须连数据一起回滚到升级前备份（见第 3 节演练） | **必备份**（角色记忆不可再生） |
@@ -19,6 +20,8 @@
 | **本仓库**（`/mnt/shared/_Projects/N.E.K.O/neko-services`） | 见 `git log`，每阶段 commit 即版本 | — | — | 随 git |
 
 ## 2. 必备份 vs 可重建清单
+
+> 下述路径以 `$NEKO_DATA_ROOT` 为准；执行备份前先按 runbook 第 0 节探测实际运行数据根（可能被 `NEKO_STORAGE_SELECTED_ROOT` 或 storage policy 改写）。
 
 **必备份**（丢失不可再生，升级前必须 tar）：
 
@@ -34,17 +37,27 @@
 
 > 核心原则：**代码与数据必须同代**。新版进程一旦启动并写过记忆，回滚代码时数据不能沿用（旧代码读不懂新写入的格式），必须连数据备份一起恢复。这就是升级前必做备份的原因。
 
-### 第 1 步：升级前记录
+### 第 1 步：升级前记录（三个 commit 一个都不能少）
 
 ```bash
-# 记下当前基线（应与本表第 1 行一致）
+# ① 上游基线（应与本表第 1 行一致）
 git -C /mnt/shared/_Projects/N.E.K.O/N.E.K.O log --oneline -1
-cat $NEKO_SERVICES/patches/neko/BASELINE.md
+# ② 集成仓库 commit（决定「当时的补丁集合」——回滚时重放的是它，不是最新补丁）
+git -C $NEKO_SERVICES log --oneline -1
+# ③ 补丁基线声明
+cat $NEKO_SERVICES/patches/neko/BASELINE.md    # p0-0-governance 分支合入后可用
+# 把 ①②③ 的输出记到安全的地方（升级出问题时你要靠它们还原）
 ```
 
-### 第 2 步：停服务 + 备份
+### 第 2 步：探测实际数据根 + 停服务 + 备份
 
 ```bash
+# 先探测实际运行数据根（可能被 NEKO_STORAGE_SELECTED_ROOT 或 storage policy 改写，
+# 详见 runbook 第 0 节；探测结果若非默认值，重新 export NEKO_DATA_ROOT=<探测结果>）
+echo "NEKO_STORAGE_SELECTED_ROOT=$NEKO_STORAGE_SELECTED_ROOT"
+cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O && uv run python -c \
+  "from utils.config_manager import get_config_manager; print(get_config_manager().app_docs_dir)"
+
 systemctl --user stop neko.target    # 手动模式则停掉 launcher 进程
 mkdir -p $HOME/neko-backup
 tar --exclude='*/logs' -czf $HOME/neko-backup/neko-data-$(date +%Y%m%d-%H%M%S).tar.gz \
@@ -52,21 +65,25 @@ tar --exclude='*/logs' -czf $HOME/neko-backup/neko-data-$(date +%Y%m%d-%H%M%S).t
 ls -lh $HOME/neko-backup/    # 确认 tar 存在且体积合理
 ```
 
-### 第 3 步：升级（代码面）
+### 第 3 步：升级（代码面，此时服务保持停止）
 
 ```bash
 cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O
 git fetch origin && git checkout <新基线commit>
-cd $NEKO_SERVICES && ./scripts/replay-patches.sh
-cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O && uv run pytest -m plugin_unit,plugin_integration
-cd $NEKO_SERVICES && ./scripts/smoke.sh    # 三绿才算升级成功
+cd $NEKO_SERVICES && ./scripts/replay-patches.sh    # p0-0-governance 分支合入后可用
+cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O && uv run pytest -m 'plugin_unit or plugin_integration'
 ```
 
-### 第 4 步：升级后验证（数据面）
+### 第 4 步：起服务 + 升级后验证（代码面冒烟 + 数据面人工）
 
 ```bash
-systemctl --user start neko.target
+systemctl --user start neko.target    # 手动模式：cd $NEKO_SRC && uv run launcher.py
 curl -s http://127.0.0.1:48912/health    # status ok、instance_id 与 48911 一致
+
+# 四端冒烟（smoke.sh 需要服务在运行；p0-0-scripts 分支合入后可用，
+# 脚本若声明自带起停则以脚本为准）
+cd $NEKO_SERVICES && ./scripts/smoke.sh
+
 # 然后人工验证：
 #   1. QQ 发一条消息，确认正常回复（新代码能读旧数据）
 #   2. 问角色一件升级前聊过的旧事，确认记忆还在
@@ -81,16 +98,21 @@ curl -s http://127.0.0.1:48912/health    # status ok、instance_id 与 48911 一
 # 1. 停服务
 systemctl --user stop neko.target
 
-# 2. 代码回旧基线 + 重放当时的补丁
-cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O
-git checkout <升级前记录的旧基线commit>
-cd $NEKO_SERVICES && ./scripts/replay-patches.sh
+# 2. 代码回滚 = 上游旧基线 + 「升级前那个集成仓库 commit」的补丁集
+#    （不是重放最新补丁！第 1 步记录的 ①② 就是用在这里）
+cd /mnt/shared/_Projects/N.E.K.O/N.E.K.O && git checkout <第1步记录的上游基线>
+cd $NEKO_SERVICES && git checkout <第1步记录的集成仓库commit> && ./scripts/replay-patches.sh
 
 # 3. 数据回备份（新版若启动过，此步 mandatory，不可跳过）
 mv $NEKO_DATA_ROOT ${NEKO_DATA_ROOT}.broken-$(date +%Y%m%d%H%M%S)
 tar -xzf $HOME/neko-backup/neko-data-<备份时间戳>.tar.gz -C "$(dirname $NEKO_DATA_ROOT)"
 
-# 4. 起服务 + 重跑第 4 步验证
+# 4. a-memorix 派生索引处理（P0-1 完成后生效，届时补精确路径与命令）：
+#    索引从 memory_server 事实源派生、可重建——升级/回滚后若检索结果异常，
+#    停 a-memorix unit → 清空其索引目录 → 重启 → 触发全量重 ingest 重建。
+#    （占位：具体目录与重建命令在 P0-1 落地时补写）
+
+# 5. 起服务 + 重跑第 4 步验证
 systemctl --user start neko.target
 ```
 
