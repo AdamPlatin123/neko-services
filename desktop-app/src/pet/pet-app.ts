@@ -355,7 +355,7 @@ export class PetApp {
   private directionTo(pt: { x: number; y: number }): { x: number; y: number } {
     const model = this.stage.model;
     if (!model) return { x: 0, y: 0 };
-    const r = (this.stage.app.view as HTMLCanvasElement).getBoundingClientRect();
+    const r = this.stage!.app!.view.getBoundingClientRect();
     const cx = r.left + model.x;
     const cy = r.top + model.y - this.config.height / 2;
     const half = Math.max(1, r.width / 2);
@@ -402,7 +402,7 @@ export class PetApp {
 
   getBounds(): { x: number; y: number; width: number; height: number } {
     const m = this.stage.model as unknown as { getBounds?: () => { x: number; y: number; width: number; height: number } } | null;
-    const r = (this.stage.app.view as HTMLCanvasElement).getBoundingClientRect();
+    const r = this.stage!.app!.view.getBoundingClientRect();
     if (m?.getBounds) {
       try {
         const b = m.getBounds();
@@ -416,7 +416,7 @@ export class PetApp {
 
   setInteractive(mode: 'all' | 'none'): void {
     this.interactive = mode === 'all';
-    const canvas = this.stage.app.view as HTMLCanvasElement;
+    const canvas = this.stage!.app!.view;
     canvas.style.pointerEvents = mode === 'all' ? 'auto' : 'none';
     if (mode === 'none') this.slowBlink.leave(performance.now());
     this.log(`[pet] interactive=${mode}（原生壳 setIgnoreMouseEvents 的页面侧配合）`);

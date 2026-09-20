@@ -1,3 +1,5 @@
+/** 模型变换点的最小形状（PIXI.ObservablePoint 替身）。 */
+interface ObsPoint { set(x?: number, y?: number): void; x: number; y: number; }
 /**
  * 模型加载器——pixi 应用（透明背景）+ Live2D 模型 + 降级占位 + 拖拽/点击/悬停命中。
  *
@@ -10,8 +12,6 @@
  * - 点击：按下且未拖动、仍在模型上 → onClick(hitAreas)
  * - 悬停：指针位于模型包围盒内且未按下 → onHoverChange(inside)（慢眨眼协议的输入）
  */
-
-import * as PIXI from 'pixi.js';
 
 /**
  * Cubism 2 web 运行时（live2d.min.js）。
@@ -62,9 +62,9 @@ export function loadScript(src: string): Promise<void> {
 }
 
 interface Cubism2Model {
-  anchor: PIXI.ObservablePoint;
-  position: PIXI.ObservablePoint;
-  scale: PIXI.ObservablePoint;
+  anchor: ObsPoint;
+  position: ObsPoint;
+  scale: ObsPoint;
   x: number;
   y: number;
   width: number;
@@ -83,6 +83,23 @@ interface Cubism2Model {
     originalWidth: number;
   };
   on: (event: string, fn: (...args: unknown[]) => void) => unknown;
+}
+
+/** script 注入的全局 PIXI（与模型同实例）的最小形状。 */
+interface GlobalPIXI {
+  Application: new (opts: Record<string, unknown>) => unknown;
+  live2d: {
+    Live2DModel: Cubism2ModelCtor;
+    SoundManager: { volume: number };
+  };
+}
+
+/** PetStage.app 的最小形状（全局 PIXI.Application 实例）。 */
+interface PIXIApplication {
+  renderer: { width: number; height: number; resolution: number };
+  view: HTMLCanvasElement;
+  stage: { addChild: (m: unknown) => void };
+  destroy: (a?: boolean, o?: Record<string, unknown>) => void;
 }
 
 /** window.PIXI.live2d.Live2DModel 构造器（cubism2 UMD）的最小形状。 */
@@ -116,7 +133,8 @@ const PLACEHOLDER_CSS = `
 `;
 
 export class PetStage {
-  readonly app: PIXI.Application;
+  /** 全局（script 注入的）PIXI 实例上的 Application；init() 前为 null。 */
+  app: PIXIApplication | null = null;
   readonly container: HTMLElement;
   model: Cubism2Model | null = null;
   private isFallback = false;
@@ -131,20 +149,9 @@ export class PetStage {
   constructor(opts: PetStageOptions) {
     this.opts = opts;
     this.container = opts.container;
-    this.app = new PIXI.Application({
-      backgroundAlpha: 0, // 透明背景：桌宠浮在桌面上
-      resolution: Math.min(2, window.devicePixelRatio || 1),
-      autoDensity: true,
-      width: opts.container.clientWidth || 320,
-      height: opts.container.clientHeight || 360,
-    });
-    const canvas = this.app.view as HTMLCanvasElement;
-    canvas.style.width = '100%';
-    canvas.style.height = '100%';
-    canvas.style.touchAction = 'none';
-    this.container.appendChild(canvas);
-    // pixi-live2d-display 的自动更新依赖全局 PIXI.Ticker
-    (window as unknown as { PIXI: unknown }).PIXI = PIXI;
+    // 注意：不在此创建 PIXI.Application——运行时是 init() 里 script 注入的全局
+    // PIXI，构造期它可能尚不存在。ESM import 的 pixi 与全局 pixi 是两个实例，
+    // 混用导致模型挂不上 stage（2026-09-21 排障实锤）。
     this.bindPointerEvents();
   }
 
@@ -181,9 +188,8 @@ export class PetStage {
         }
       }
       // 静音：DESIGN「桌宠默认安静」；模型 voice 缺失时也避免加载报错噪音
-      const { Live2DModel, SoundManager } = (
-        window as unknown as { PIXI: { live2d: { Live2DModel: Cubism2ModelCtor; SoundManager: { volume: number } } } }
-      ).PIXI.live2d;
+      const g = (window as unknown as { PIXI: GlobalPIXI }).PIXI;
+      const { Live2DModel, SoundManager } = g.live2d;
       SoundManager.volume = 0;
       const model = (await Live2DModel.from(this.opts.modelUrl, {
         autoInteract: false, // 交互由本引擎自己调度（FSM + 慢眨眼），不用库的默认 focus/tap
@@ -191,16 +197,30 @@ export class PetStage {
       })) as unknown as Cubism2Model;
 
       if (this.destroyed) return;
+      // 全局 PIXI 上创建 Application（与模型同一实例——双实例即碎片根因）
+      this.app = new g.Application({
+        backgroundAlpha: 0,
+        resolution: Math.min(2, window.devicePixelRatio || 1),
+        autoDensity: true,
+        width: this.container.clientWidth || 320,
+        height: this.container.clientHeight || 360,
+      }) as PIXIApplication;
+      const canvas = (this.app as unknown as { view: HTMLCanvasElement }).view;
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      canvas.style.touchAction = 'none';
+      this.container.appendChild(canvas);
+
       this.model = model;
-      this.app.stage.addChild(model as unknown as PIXI.DisplayObject);
+      (this.app!.stage as unknown as { addChild: (m: unknown) => void }).addChild(model);
 
       // 缩放到目标高度，anchor 底部中心
       const targetH = this.opts.height ?? 220;
       const scale = targetH / model.height;
       model.scale.set(scale);
       model.anchor.set(0.5, 1);
-      const w = this.app.renderer.width / (this.app.renderer.resolution || 1);
-      const h = this.app.renderer.height / (this.app.renderer.resolution || 1);
+      const w = (this.app?.renderer.width ?? this.container.clientWidth) / (this.app?.renderer.resolution || 1);
+      const h = (this.app?.renderer.height ?? this.container.clientHeight) / (this.app?.renderer.resolution || 1);
       model.x = this.opts.x ?? w - targetH * 0.45;
       model.y = this.opts.y ?? h;
     } catch (err) {
@@ -232,7 +252,7 @@ export class PetStage {
   // ---------- 指针交互：拖拽 / 点击 / 悬停 ----------
 
   private bindPointerEvents(): void {
-    const canvas = this.app.view as HTMLCanvasElement;
+    const canvas = this.app!.view;
     const rectOf = () => canvas.getBoundingClientRect();
 
     const onDown = (e: PointerEvent) => {
@@ -320,13 +340,13 @@ export class PetStage {
 
   private pointOnModel(lx: number, ly: number): boolean {
     if (!this.model) return false;
-    const b = (this.model as unknown as PIXI.DisplayObject).getBounds();
+    const b = (this.model as unknown as { getBounds: () => { x: number; y: number; width: number; height: number } }).getBounds();
     return lx >= b.x && lx <= b.x + b.width && ly >= b.y && ly <= b.y + b.height;
   }
 
   /** 模型头顶的页面坐标（speech overlay 定位用；占位模式下取容器顶部中心） */
   headScreenPos(): { x: number; y: number } {
-    const r = (this.app.view as HTMLCanvasElement).getBoundingClientRect();
+    const r = this.app!.view.getBoundingClientRect();
     if (!this.model) return { x: r.left + r.width / 2, y: r.top + 24 };
     const h = this.model.height;
     return { x: r.left + this.model.x, y: r.top + this.model.y - h - 12 };
@@ -372,7 +392,7 @@ export class PetStage {
     for (const fn of this.cleanupFns) fn();
     this.cleanupFns = [];
     try {
-      this.app.destroy(true, { children: true });
+      this.app?.destroy(true, { children: true });
     } catch {
       /* 忽略 */
     }
