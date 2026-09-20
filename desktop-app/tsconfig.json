@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "useDefineForClassFields": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
@@ -8,11 +9,13 @@
     "strict": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "skipLibCheck": true,
     "noUnusedLocals": true,
-    "noUnusedParameters": true
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "vite.config.ts"]
+  "include": ["src", "pet-demo.html", "vite.config.ts", "scripts"]
 }
