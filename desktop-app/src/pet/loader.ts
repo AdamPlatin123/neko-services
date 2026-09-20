@@ -194,7 +194,7 @@ export class PetStage {
       const { Live2DModel, SoundManager } = g.live2d;
       SoundManager.volume = 0;
       const model = (await Live2DModel.from(this.opts.modelUrl, {
-        autoInteract: false, // 交互由本引擎自己调度（FSM + 慢眨眼），不用库的默认 focus/tap
+        autoHitTest: false, // 交互由本引擎自己调度（FSM + 慢眨眼）；fork v0.5 以 autoHitTest 取代 autoInteract
         autoUpdate: true,
       })) as unknown as Cubism2Model;
 
@@ -202,12 +202,16 @@ export class PetStage {
       // 全局 PIXI 上创建 Application（与模型同一实例——双实例即碎片根因）
       const cw = this.container.clientWidth || 320;
       const ch = this.container.clientHeight || 360;
+      // 与 min-test-fork 完全一致：预先创建 canvas 传入 view（pixi 自建 canvas 在
+      // fork+v7 组合下渲染不显示——2026-09-21 用户浏览器对照实锤）
+      const viewEl = document.createElement('canvas');
       this.app = new g.Application({
-        transparent: true, // 复刻 min-test 成功组合（resolution/autoDensity 与手工 CSS 打架致渲染丢帧）
+        view: viewEl,
+        transparent: true,
         width: cw,
         height: ch,
       }) as PIXIApplication;
-      const canvas = (this.app as unknown as { view: HTMLCanvasElement }).view;
+      const canvas = viewEl;
       canvas.style.width = `${cw}px`;
       canvas.style.height = `${ch}px`;
       canvas.style.touchAction = 'none';
