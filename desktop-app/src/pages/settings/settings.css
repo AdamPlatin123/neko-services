@@ -1,0 +1,199 @@
+/* 纸质配置页——880px 单列流式登记表（Operate：安静仪器）。 */
+@import "../../styles/base.css";
+
+body {
+  padding-bottom: 80px;
+}
+
+.sheet-wrap {
+  max-width: var(--neko-sheet-width);
+  margin: 40px auto 0;
+  padding: 0 var(--neko-space-md);
+}
+
+.sheet-note {
+  margin-bottom: var(--neko-space-md);
+}
+
+/* 章节内的低语说明（褪色小字） */
+.chapter-note {
+  font-size: 13px;
+  color: var(--neko-ink-faded);
+  margin-top: 14px;
+  line-height: 1.7;
+}
+
+/* 按钮行 */
+.actions {
+  display: flex;
+  gap: var(--neko-space-sm);
+  margin-top: var(--neko-space-sm);
+}
+
+/* 回忆册的搜索框用文楷（她说的话） */
+.blank-wenkai {
+  font-family: var(--neko-font-display);
+  font-feature-settings: normal;
+  font-size: 15px;
+}
+
+/* 房间状态行 */
+.where {
+  margin-top: 26px;
+  font-size: 14px;
+  color: var(--neko-ink-faded);
+}
+
+/* ---- 四、桌面陪伴：纸面偏好（选中态用墨点，朱砂不参与） ---- */
+.pref-row {
+  display: flex;
+  align-items: center;
+  gap: var(--neko-space-md);
+  padding: 13px 2px;
+  border-bottom: 1px dotted var(--neko-line-dotted-soft);
+}
+.pref-name {
+  flex-shrink: 0;
+  width: 5.5em;
+  color: var(--neko-ink-faded);
+}
+.pref-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.pref-check input {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 1px dotted var(--neko-line-dotted);
+  border-radius: var(--neko-rounded-sm);
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+}
+.pref-check input:checked::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  background: var(--neko-ink);
+  border-radius: 2px;
+}
+.pref-check-label { font-size: 15px; }
+
+/* 滑杆：点线轨道 + 墨点滑钮 */
+.pref-range {
+  flex: 1;
+  appearance: none;
+  height: 22px;
+  background: transparent;
+  cursor: pointer;
+}
+.pref-range::-webkit-slider-runnable-track {
+  height: 1px;
+  border-bottom: 1px dotted var(--neko-line-dotted);
+  background: transparent;
+}
+.pref-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--neko-ink);
+  margin-top: -7px;
+}
+.pref-range::-moz-range-track {
+  height: 1px;
+  border-bottom: 1px dotted var(--neko-line-dotted);
+}
+.pref-range::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border: none;
+  border-radius: 50%;
+  background: var(--neko-ink);
+}
+.pref-value {
+  flex-shrink: 0;
+  font-size: 12.5px;
+  color: var(--neko-ink-faded);
+  min-width: 4em;
+  text-align: right;
+}
+
+/* 位置偏好：点圈 + 墨点 */
+.pref-corners {
+  display: flex;
+  gap: var(--neko-space-lg);
+  flex-wrap: wrap;
+}
+.pref-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.pref-radio input {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px dotted var(--neko-line-dotted);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+  flex-shrink: 0;
+}
+.pref-radio input:checked::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  background: var(--neko-ink);
+  border-radius: 50%;
+}
+.corner-name { font-size: 13.5px; }
+
+/* 免打扰：文楷小连词 + 等宽时间 */
+.dnd { font-size: 14px; color: var(--neko-ink-faded); }
+.blank-time {
+  width: 6.5em;
+  padding: 2px;
+}
+
+/* ---- 五、关于 ---- */
+.about-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: var(--neko-space-lg);
+}
+.about-info p { font-size: 14px; margin-bottom: 4px; }
+.seal {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+}
+.seal svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.seal text {
+  font-family: var(--neko-font-display);
+}
+
+/* 回忆册结果 */
+#memory-results { margin-top: var(--neko-space-sm); }
+.memory-empty {
+  padding: 14px 2px;
+  font-family: var(--neko-font-display);
+  font-size: 14px;
+  color: var(--neko-ink-faded);
+}
+
+@media (max-width: 720px) {
+  .about-row { flex-direction: column; align-items: flex-start; }
+  .seal { align-self: flex-end; }
+}
