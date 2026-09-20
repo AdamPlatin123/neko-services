@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>N.E.K.O 桌宠引擎演示 — 行为状态机 / 慢眨眼 / 手写浮现</title>
+  <!-- 霞鹜文楷：她执笔的字体（DESIGN Typography）；加载失败回退思源宋体 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/style.css" />
+  <style>
+    /* 夜间墨色纸（DESIGN Colors：夜=墨色纸 #241E17，墨字反转 #D8CDBA） */
+    :root {
+      --ink-paper: #241E17;
+      --ink-text: #D8CDBA;
+      --ink-muted: #857867;
+      --cinnabar: #B5452C; /* 朱砂不变——纸变深了，印章还是那枚印章 */
+      --moss: #5B7A4A;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: var(--ink-paper);
+      color: var(--ink-text);
+      font-family: "LXGW WenKai", "Noto Serif SC", serif;
+      overflow: hidden;
+    }
+    .label { font-family: "Noto Sans SC", sans-serif; font-size: 12px; letter-spacing: 0.06em; color: var(--ink-muted); }
+
+    /* 桌宠舞台：右下偏好（DESIGN Layout），透明底 */
+    #pet-stage {
+      position: fixed; right: 48px; bottom: 36px;
+      width: 320px; height: 380px;
+      z-index: 10;
+      cursor: grab;
+    }
+    #pet-stage:active { cursor: grabbing; }
+    /* 角色自投影（DESIGN Elevation：深色底 + 椭圆阴影 opacity .32） */
+    #pet-stage::after {
+      content: ""; position: absolute; left: 50%; bottom: 4px;
+      width: 170px; height: 22px; transform: translateX(-50%);
+      background: radial-gradient(ellipse at center, rgba(0,0,0,0.5), transparent 70%);
+      opacity: 0.32; pointer-events: none;
+    }
+
+    /* 状态面板（左上）：她在哪个状态、呼吸多快、注意什么 */
+    #state-panel {
+      position: fixed; top: 28px; left: 32px; width: 300px;
+      border: 1px solid color-mix(in srgb, var(--ink-text) 14%, transparent);
+      border-radius: 8px;
+      padding: 16px 18px;
+      background: #2E2820; /* 夜间表面：表面略浮于底 */
+    }
+    #state-panel h1 { font-size: 15px; font-weight: 500; letter-spacing: 0.1em; margin-bottom: 12px; }
+    #state-panel .row { display: flex; justify-content: space-between; font-size: 13px; line-height: 2; }
+    #state-panel .row b { font-weight: 500; color: var(--ink-text); }
+    #state-panel .row .v { font-family: "Sarasa Mono SC", "IBM Plex Mono", monospace; font-size: 12px; }
+    #state-badge { color: var(--cinnabar); }
+
+    /* 事件注入（左下） */
+    #controls {
+      position: fixed; left: 32px; bottom: 32px; width: 320px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    #controls .btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      font-family: "Noto Sans SC", sans-serif; font-size: 12px; letter-spacing: 0.04em;
+      color: var(--ink-text);
+      background: transparent;
+      border: 1px solid color-mix(in srgb, var(--ink-text) 30%, transparent);
+      border-radius: 4px;
+      padding: 6px 12px;
+      cursor: pointer;
+      transition: border-color 120ms ease-out, color 120ms ease-out;
+    }
+    button:hover { border-color: var(--cinnabar); color: #fff; }
+    button.primary { border-color: var(--cinnabar); color: var(--cinnabar); }
+    button.primary:hover { background: var(--cinnabar); color: #FBF7EC; }
+    .toggle-row { display: flex; align-items: center; gap: 8px; }
+    .toggle-row input { accent-color: var(--cinnabar); }
+
+    /* 状态转换日志（右侧）：验收观测口 */
+    #log-panel {
+      position: fixed; top: 28px; right: 32px; bottom: 32px; width: 380px;
+      display: flex; flex-direction: column;
+      border: 1px solid color-mix(in srgb, var(--ink-text) 14%, transparent);
+      border-radius: 8px;
+      background: #2E2820;
+      overflow: hidden;
+    }
+    #log-panel header { padding: 12px 16px; border-bottom: 1px solid color-mix(in srgb, var(--ink-text) 10%, transparent); }
+    #log {
+      flex: 1; overflow-y: auto; padding: 10px 14px;
+      font-family: "Sarasa Mono SC", "IBM Plex Mono", monospace;
+      font-size: 11.5px; line-height: 1.85;
+    }
+    #log .fsm { color: var(--ink-text); }
+    #log .slow-blink { color: #C98A2E; } /* 猫眼琥珀：只属于角色的活物色 */
+    #log .sys { color: var(--ink-muted); }
+    #log .speech { color: var(--moss); }
+    #log time { color: var(--ink-muted); margin-right: 8px; }
+
+    /* 慢眨眼操作提示 */
+    #hint {
+      position: fixed; bottom: 36px; left: 50%; transform: translateX(-50%);
+      font-size: 13px; color: var(--ink-muted); letter-spacing: 0.08em;
+      pointer-events: none;
+    }
+    @media (max-width: 1100px) { #log-panel { display: none; } }
+  </style>
+</head>
+<body>
+  <div id="state-panel">
+    <h1>她现在的状态</h1>
+    <div class="row"><span class="label">状态</span><b id="state-badge">sleeping</b></div>
+    <div class="row"><span class="label">呼吸周期</span><span class="v" id="breath">8.0s</span></div>
+    <div class="row"><span class="label">眼睛</span><span class="v" id="eye">闭合</span></div>
+    <div class="row"><span class="label">闲置</span><span class="v" id="idle">0s</span></div>
+    <div class="row"><span class="label">时辰</span><span class="v" id="hour">--</span></div>
+    <div class="row"><span class="label">记忆 next_seq</span><span class="v" id="seq">未连接</span></div>
+  </div>
+
+  <div id="controls">
+    <div class="label" style="margin-bottom:2px">事件注入（验证迁移表）</div>
+    <div class="btn-row">
+      <button id="btn-input">模拟输入</button>
+      <button id="btn-msg" class="primary">模拟终端消息</button>
+      <button id="btn-idle-4m">闲置4分钟</button>
+      <button id="btn-idle-10m">闲置10分钟</button>
+    </div>
+    <div class="btn-row">
+      <button id="btn-night">设为深夜 23 时</button>
+      <button id="btn-noon">设为正午 12 时</button>
+      <button id="btn-realtime">恢复真实时钟</button>
+    </div>
+    <div class="btn-row">
+      <button id="btn-say">让她说话（手写浮现）</button>
+      <button id="btn-sleep-now">立即入睡</button>
+    </div>
+    <label class="toggle-row"><input type="checkbox" id="chk-manual" checked />
+      <span class="label">手动事件模式（屏蔽真实键鼠，防止演示被打断）</span></label>
+  </div>
+
+  <div id="log-panel">
+    <header><span class="label">状态转换日志 / 静音观察一分钟，能分辨她在陪伴、注意、思考还是睡觉</span></header>
+    <div id="log"></div>
+  </div>
+
+  <div id="pet-stage"></div>
+  <div id="hint">把鼠标停在她身上 2 秒——不点击、不拖动——她会抬眼看你，然后极慢地眨一次眼。</div>
+
+  <script type="module" src="/src/pet/pet-demo.ts"></script>
+</body>
+</html>

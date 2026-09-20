@@ -6,3 +6,11 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 data/
+
+# desktop-app（fe-pet / fe-skeleton 并行分支共用）
+desktop-app/node_modules/
+desktop-app/dist/
+
+# Live2D 模型与 Cubism2 运行时不入仓库（scripts/fetch-model.sh 下载；授权红线见 DESIGN.md 桌宠模型选型）
+desktop-app-assets/models/
+desktop-app-assets/vendor/

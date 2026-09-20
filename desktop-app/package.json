@@ -1,0 +1,25 @@
+{
+  "name": "neko-desktop-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "N.E.K.O Companion Desktop — 桌宠引擎（src/pet/）+ 演示页。fe-pet 分支只含桌宠引擎；配置页由 fe-skeleton 分支并行开发，合并时拼接。",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fetch-model": "bash scripts/fetch-model.sh"
+  },
+  "dependencies": {
+    "pixi-live2d-display": "^0.4.0",
+    "pixi.js": "^6.5.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.1"
+  }
+}
