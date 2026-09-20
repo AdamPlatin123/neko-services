@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import nekoBackend from "./src/server/plugin.ts";
 
-const here = fileURLToPath(new URL(".", import.meta.url));
+const here = fileURLToPath(new URL(".", import.meta.url).href);
 
 export default defineConfig({
   plugins: [nekoBackend()],
