@@ -198,16 +198,16 @@ export class PetStage {
 
       if (this.destroyed) return;
       // 全局 PIXI 上创建 Application（与模型同一实例——双实例即碎片根因）
+      const cw = this.container.clientWidth || 320;
+      const ch = this.container.clientHeight || 360;
       this.app = new g.Application({
-        backgroundAlpha: 0,
-        resolution: Math.min(2, window.devicePixelRatio || 1),
-        autoDensity: true,
-        width: this.container.clientWidth || 320,
-        height: this.container.clientHeight || 360,
+        transparent: true, // 复刻 min-test 成功组合（resolution/autoDensity 与手工 CSS 打架致渲染丢帧）
+        width: cw,
+        height: ch,
       }) as PIXIApplication;
       const canvas = (this.app as unknown as { view: HTMLCanvasElement }).view;
-      canvas.style.width = '100%';
-      canvas.style.height = '100%';
+      canvas.style.width = `${cw}px`;
+      canvas.style.height = `${ch}px`;
       canvas.style.touchAction = 'none';
       this.container.appendChild(canvas);
       this.bindPointerEvents(); // canvas 就绪，绑定指针（原在构造函数，app 尚未创建）
