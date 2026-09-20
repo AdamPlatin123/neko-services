@@ -152,7 +152,7 @@ export class PetStage {
     // 注意：不在此创建 PIXI.Application——运行时是 init() 里 script 注入的全局
     // PIXI，构造期它可能尚不存在。ESM import 的 pixi 与全局 pixi 是两个实例，
     // 混用导致模型挂不上 stage（2026-09-21 排障实锤）。
-    this.bindPointerEvents();
+    // 指针绑定移至 init()（canvas 需等 app 创建）。
   }
 
   /** 初始化：加载运行时与模型；失败则降级为呼吸圆点占位。
@@ -210,6 +210,7 @@ export class PetStage {
       canvas.style.height = '100%';
       canvas.style.touchAction = 'none';
       this.container.appendChild(canvas);
+      this.bindPointerEvents(); // canvas 就绪，绑定指针（原在构造函数，app 尚未创建）
 
       this.model = model;
       (this.app!.stage as unknown as { addChild: (m: unknown) => void }).addChild(model);
