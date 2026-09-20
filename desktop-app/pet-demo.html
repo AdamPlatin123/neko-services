@@ -1,4 +1,4 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
@@ -106,6 +106,8 @@
     }
     @media (max-width: 1100px) { #log-panel { display: none; } }
   </style>
+
+<!-- 纯静态分发：绕开 vite ESM（渲染栈与 min-test-fork 完全一致） -->
 </head>
 <body>
   <div id="state-panel">
@@ -147,6 +149,12 @@
   <div id="pet-stage"></div>
   <div id="hint">把鼠标停在她身上 2 秒——不点击、不拖动——她会抬眼看你，然后极慢地眨一次眼。</div>
 
-  <script type="module" src="/src/pet/pet-demo.ts"></script>
+  
+
+<script src="/vendor/pixi7.min.js"></script>
+<script src="/vendor/pixi-sound.min.js"></script>
+<script src="/vendor/live2d.min.js"></script>
+<script src="/vendor/cubism2.min.js"></script>
+<script src="/vendor/pet-demo-bundle.js"></script>
 </body>
 </html>
