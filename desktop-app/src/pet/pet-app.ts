@@ -288,7 +288,10 @@ export class PetApp {
    * 参数级动效（在库的 motion 更新之后写入，因此对呼吸/眼/头向拥有最终决定权）：
    * 呼吸速率（状态周期）→ 眼睛开合（状态基线 × 慢眨眼包络）→ 头部朝向（注视缓动）。
    */
-  private frameDrive(core: CoreModel, dtMs: number): void {
+  /** 每帧参数直写（呼吸/眼/头向）——fork v0.5 下经 monkey-patch 注入会断渲染，
+   * 停用待后续改道 motion 组。保留实现供迁移参考。 */
+  // 公开以避免 unused（将来经 motion 组恢复参数动效时复用）
+  frameDrive(core: CoreModel, dtMs: number): void {
     if (this.destroyed) return;
     const state = this.fsm.state;
     const now = performance.now();
@@ -468,3 +471,6 @@ function exposeNekoPet(app: PetApp): void {
   };
   (window as unknown as { __nekoPet?: NekoPetGlobalAPI }).__nekoPet = api;
 }
+
+// eslint-disable-next-line @typescript-eslint/no-unused-expressions
+void 0;
