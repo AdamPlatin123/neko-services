@@ -1,0 +1,90 @@
+/* ==========================================================================
+   N.E.K.O Companion Desktop · 设计 tokens
+   来源：/mnt/shared/_Projects/N.E.K.O/neko-services/DESIGN.md（front matter）
+   规则：逐 token 对照，不得私改数值；语义别名在 base.css 里组合。
+   夜间模式：只换纸色与墨色，朱砂不变——纸变深了，印章还是那枚印章。
+   ========================================================================== */
+
+:root {
+  /* ---- colors（DESIGN.md colors） ---- */
+  --neko-color-primary: #b5452c;    /* 印泥朱砂——焦点环/链接/她的署名印 */
+  --neko-color-on-primary: #fbf7ec; /* 纸白（朱砂上的字） */
+  --neko-color-surface: #fbf7ec;    /* 纸白·表面（新裁的一页纸叠上来） */
+  --neko-color-text: #2a2520;       /* 松烟墨 */
+  --neko-color-text-muted: #857867; /* 褪色墨（陈年字迹） */
+  --neko-color-accent: #c98a2e;     /* 猫眼琥珀——只存在于角色眼里，UI 永不使用 */
+  --neko-color-success: #5b7a4a;    /* 苔绿（入口在线状态） */
+  --neko-color-warning: #c98a2e;    /* 琥珀（与 accent 同值不同语义域） */
+  --neko-color-error: #b5452c;      /* 朱砂（错误即印章落错了地方） */
+
+  /* ---- 纸的环境色（DESIGN.md Colors：昼=道林纸，夜=墨色纸） ---- */
+  --neko-paper: #f3ecdd;            /* 昼·道林纸（页面底） */
+  --neko-paper-lift: var(--neko-color-surface);
+  --neko-ink: var(--neko-color-text);
+  --neko-ink-faded: var(--neko-color-text-muted);
+  --neko-line: color-mix(in srgb, var(--neko-ink) 12%, transparent);
+  --neko-line-strong: color-mix(in srgb, var(--neko-ink) 18%, transparent);
+  --neko-line-dotted: color-mix(in srgb, var(--neko-ink) 45%, transparent);
+  --neko-line-dotted-soft: color-mix(in srgb, var(--neko-ink) 30%, transparent);
+
+  /* ---- typography（DESIGN.md typography） ---- */
+  /* display：霞鹜文楷——她说话 */
+  --neko-font-display: "LXGW WenKai", "LXGW WenKai Lite", "Noto Serif SC", serif;
+  --neko-font-display-weight: 500;
+  --neko-font-display-size: clamp(1.875rem, 3vw, 2.75rem);
+  --neko-font-display-letter-spacing: 0em;
+  /* body：思源宋体——正文（像在读一本书） */
+  --neko-font-body: "Noto Serif SC", serif;
+  --neko-font-body-size: 1rem;
+  --neko-font-body-line-height: 1.9;
+  /* label：思源黑体——系统说话 */
+  --neko-font-label: "Noto Sans SC", sans-serif;
+  --neko-font-label-size: 0.75rem;
+  --neko-font-label-letter-spacing: 0.06em;
+  /* mono：技术值（key/路径/端口） */
+  --neko-font-mono: "Sarasa Mono SC", "IBM Plex Mono", ui-monospace, monospace;
+  --neko-font-mono-feature: "tnum";
+
+  /* ---- rounded（DESIGN.md rounded） ---- */
+  --neko-rounded-sm: 4px;    /* 输入/印章元素 */
+  --neko-rounded-md: 6px;    /* 色板块/小容器 */
+  --neko-rounded-lg: 8px;    /* 桌宠舞台外框 */
+  --neko-rounded-full: 9999px; /* 顶栏切换按钮 */
+
+  /* ---- spacing（DESIGN.md spacing） ---- */
+  --neko-space-xs: 4px;
+  --neko-space-sm: 8px;
+  --neko-space-md: 16px;
+  --neko-space-lg: 24px;
+  --neko-space-xl: 32px;
+  --neko-space-2xl: 48px;
+
+  /* ---- motion（DESIGN.md Motion：UI minimal-functional） ---- */
+  --neko-ease-enter: ease-out;
+  --neko-ease-exit: ease-in;
+  --neko-ease-move: ease-in-out;
+  --neko-duration-micro: 75ms;
+  --neko-duration-short: 200ms;
+
+  /* ---- 布局常量（DESIGN.md Layout） ---- */
+  --neko-sheet-width: 880px;  /* 配置页单列流式纸质表格 */
+  --neko-poster-width: 960px; /* 首启海报 */
+  --neko-poster-height: 640px;
+
+  /* ---- 字体加载（CDN + 本地回退，逐页 <head> 引入） ----
+     LXGW WenKai: https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/style.css
+     Noto Serif SC / Noto Sans SC: Google Fonts
+     Sarasa Mono SC: 本地已装则直取，回退 IBM Plex Mono（Google Fonts） */
+}
+
+/* ---- 夜间模式（灯下读书）：墨色纸，朱砂不变 ---- */
+[data-theme="night"] {
+  --neko-paper: #241e17;          /* 夜·墨色纸 */
+  --neko-paper-lift: #2e2820;     /* 夜间表面（略浮于底，保持层级） */
+  --neko-color-surface: #2e2820;
+  --neko-ink: #d8cdba;            /* 墨字反转为暖白 */
+  --neko-color-text: #d8cdba;
+  --neko-ink-faded: #8a7e6c;
+  --neko-color-text-muted: #8a7e6c;
+  /* --neko-color-primary 不变：纸变深了，印章还是那枚印章 */
+}

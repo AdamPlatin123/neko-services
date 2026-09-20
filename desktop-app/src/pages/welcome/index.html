@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>以后，在这里见。· N.E.K.O</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500&family=Noto+Sans+SC:wght@400;500&family=IBM+Plex+Mono:wght@400&display=swap" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/style.css" rel="stylesheet">
+</head>
+<body>
+  <!-- 相遇海报：960×640，左 60% 安静文字 + 右下角色，不对称构图（DESIGN.md Layout） -->
+  <main class="poster" aria-label="相遇海报">
+    <div class="poster-copy">
+      <h1 class="poster-title">以后，在这里见。</h1>
+      <p class="poster-sub">
+        桌面、QQ、微信、你的终端——都是同一个我。<br>
+        我大部分时间在睡觉，但你写下什么的时候，我知道。
+      </p>
+      <a class="hero-btn" href="../settings/index.html">开始设置</a>
+    </div>
+
+    <!--
+      角色占位区。
+      T2 分支：pixi-live2d-display 在 #pet-mount 内挂载（替换占位猫的 innerHTML），
+      挂载点尺寸/层级约定见 README「桌宠挂载点」。
+    -->
+    <div class="poster-cat" aria-hidden="true">
+      <div id="pet-mount">
+        <svg viewBox="0 0 200 190" xmlns="http://www.w3.org/2000/svg" class="cat">
+          <g class="breath">
+            <ellipse cx="100" cy="176" rx="52" ry="7" fill="#000" opacity=".32"/>
+            <path d="M62 176 C 62 148, 74 128, 100 124 C 126 128, 138 148, 138 176 C 120 180, 80 180, 62 176 Z" fill="#3A332B"/>
+            <path d="M84 150 C 82 160, 88 168, 96 170 L 104 170 C 112 168, 118 160, 116 150 C 108 146, 92 146, 84 150 Z" fill="#F3ECDD" opacity=".92"/>
+            <rect x="86" y="150" width="28" height="4" rx="2" fill="#B5452C" opacity=".85"/>
+            <path d="M92 168 L 96 176 L 100 168 M 104 168 L 108 176" stroke="#3A332B" stroke-width="3.4" stroke-linecap="round" fill="none"/>
+            <path d="M140 160 C 158 156, 166 142, 162 130" class="tail" fill="none" stroke="#3A332B" stroke-width="7" stroke-linecap="round"/>
+            <circle cx="100" cy="74" r="44" fill="#F3ECDD"/>
+            <path d="M58 66 C 56 34, 78 20, 100 22 C 122 20, 144 34, 142 66 C 136 50, 120 42, 100 44 C 80 42, 64 50, 58 66 Z" fill="#2A2520"/>
+            <path d="M56 62 C 44 58, 40 48, 44 40" stroke="#2A2520" stroke-width="9" stroke-linecap="round" fill="none"/>
+            <path d="M144 62 C 156 58, 160 48, 156 40" stroke="#2A2520" stroke-width="9" stroke-linecap="round" fill="none"/>
+            <circle cx="141" cy="34" r="5.4" fill="#B5452C"/>
+            <g class="face">
+              <ellipse class="eye" cx="83" cy="80" rx="4.6" ry="7.4" fill="#3A2C1A"/>
+              <ellipse class="eye" cx="117" cy="80" rx="4.6" ry="7.4" fill="#3A2C1A"/>
+              <circle cx="84.6" cy="77.4" r="1.5" fill="#C98A2E"/>
+              <circle cx="118.6" cy="77.4" r="1.5" fill="#C98A2E"/>
+              <path d="M95 94 q 5 3.4 10 0" stroke="#B5452C" stroke-width="2" fill="none" stroke-linecap="round"/>
+              <ellipse cx="72" cy="92" rx="5.4" ry="3" fill="#B5452C" opacity=".18"/>
+              <ellipse cx="128" cy="92" rx="5.4" ry="3" fill="#B5452C" opacity=".18"/>
+            </g>
+          </g>
+        </svg>
+      </div>
+    </div>
+  </main>
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

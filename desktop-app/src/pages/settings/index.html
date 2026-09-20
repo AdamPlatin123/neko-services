@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>她的登记表 · N.E.K.O</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500&family=Noto+Sans+SC:wght@400;500&family=IBM+Plex+Mono:wght@400&display=swap" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/style.css" rel="stylesheet">
+</head>
+<body>
+  <header class="topbar">
+    <span class="title">旧纸与墨 · N.E.K.O</span>
+    <button class="pill-btn" id="night-toggle" aria-pressed="false">灯下读书</button>
+  </header>
+
+  <main class="sheet-wrap">
+    <p class="hr-note">—— 她亲手填的登记表，配完即合上 ——</p>
+
+    <div class="sheet">
+      <!-- 一、我的钥匙串（模型连接） -->
+      <section class="chapter" id="ch-keys" aria-labelledby="ch-keys-title">
+        <h3 class="chapter-title" id="ch-keys-title"><span class="num">一、</span>我的钥匙串，帮我收好</h3>
+        <p class="chapter-note" id="keys-degrade" hidden>
+          档案柜还没打开（配置服务未应答）——先写在纸上，等连上后再誊一遍。
+        </p>
+        <div class="field">
+          <label for="f-base-url">地址（BASE URL）</label>
+          <input class="blank" id="f-base-url" name="base_url" type="text" spellcheck="false"
+                 autocomplete="off" placeholder="https://api.example.com/v1">
+        </div>
+        <div class="field">
+          <label for="f-model">型号（MODEL）</label>
+          <input class="blank" id="f-model" name="model" type="text" spellcheck="false"
+                 autocomplete="off" placeholder="glm-4.7">
+        </div>
+        <div class="field">
+          <label for="f-api-key">密钥（API KEY）</label>
+          <input class="blank" id="f-api-key" name="api_key" type="password" spellcheck="false"
+                 autocomplete="off" placeholder="sk-…">
+        </div>
+        <div class="actions">
+          <button class="pill-btn" id="btn-save" type="button">记下来</button>
+          <button class="pill-btn" id="btn-test" type="button">试一试</button>
+        </div>
+        <p class="err" id="keys-err" role="alert"></p>
+        <p class="whisper ok" id="keys-ok" role="status"></p>
+        <p class="chapter-note mono keys-path" id="keys-path" hidden></p>
+      </section>
+
+      <!-- 二、我会在这些房间出现（入口状态，10s 轮询） -->
+      <section class="chapter" id="ch-rooms" aria-labelledby="ch-rooms-title">
+        <h3 class="chapter-title" id="ch-rooms-title"><span class="num">二、</span>我会在这些房间出现</h3>
+        <div class="entry-row"><span class="name">桌面</span><span class="st" id="st-desktop"><span class="dot"></span>问询中</span></div>
+        <div class="entry-row"><span class="name">QQ</span><span class="st" id="st-qq"><span class="dot"></span>问询中</span></div>
+        <div class="entry-row"><span class="name">微信</span><span class="st" id="st-wechat"><span class="dot"></span>问询中</span></div>
+        <div class="entry-row"><span class="name">终端（opencode）</span><span class="st" id="st-terminal"><span class="dot"></span>问询中</span></div>
+        <p class="where wenkai" id="where-line">我去各个房间看一眼……</p>
+      </section>
+
+      <!-- 三、我的回忆册（记忆检视，只读） -->
+      <section class="chapter" id="ch-memory" aria-labelledby="ch-memory-title">
+        <h3 class="chapter-title" id="ch-memory-title"><span class="num">三、</span>我的回忆册</h3>
+        <div class="field">
+          <label for="f-memory-query">翻一翻（搜索）</label>
+          <input class="blank blank-wenkai" id="f-memory-query" type="text" spellcheck="false"
+                 autocomplete="off" placeholder="他说过什么来着…">
+        </div>
+        <div class="actions">
+          <button class="pill-btn" id="btn-memory-search" type="button">翻一翻</button>
+        </div>
+        <p class="err" id="memory-err" role="alert"></p>
+        <div id="memory-results" aria-live="polite"></div>
+        <p class="chapter-note">这本册子今天只能翻看，还不能撕页。（记忆服务暂无删除端点）</p>
+      </section>
+
+      <!-- 四、桌面陪伴（写 localStorage，桌宠引擎读） -->
+      <section class="chapter" id="ch-pet" aria-labelledby="ch-pet-title">
+        <h3 class="chapter-title" id="ch-pet-title"><span class="num">四、</span>桌面陪伴</h3>
+
+        <div class="pref-row">
+          <label class="pref-check">
+            <input type="checkbox" id="f-pet-enabled">
+            <span class="pref-check-label wenkai">让她睡在桌面上</span>
+          </label>
+        </div>
+
+        <div class="pref-row">
+          <span class="pref-name sys">大小</span>
+          <input type="range" id="f-pet-size" class="pref-range" min="150" max="220" step="5" value="180">
+          <output for="f-pet-size" class="pref-value mono" id="pet-size-out">180px</output>
+        </div>
+
+        <div class="pref-row">
+          <span class="pref-name sys">位置偏好</span>
+          <div class="pref-corners" role="radiogroup" aria-label="位置偏好">
+            <label class="pref-radio"><input type="radio" name="pet-corner" value="right-bottom" checked><span class="mark"></span><span class="corner-name">右下</span></label>
+            <label class="pref-radio"><input type="radio" name="pet-corner" value="left-bottom"><span class="mark"></span><span class="corner-name">左下</span></label>
+            <label class="pref-radio"><input type="radio" name="pet-corner" value="right-top"><span class="mark"></span><span class="corner-name">右上</span></label>
+            <label class="pref-radio"><input type="radio" name="pet-corner" value="left-top"><span class="mark"></span><span class="corner-name">左上</span></label>
+          </div>
+        </div>
+
+        <div class="pref-row">
+          <span class="pref-name sys">免打扰时段</span>
+          <span class="dnd wenkai">从</span>
+          <input type="time" id="f-pet-dnd-from" class="blank blank-time">
+          <span class="dnd wenkai">到</span>
+          <input type="time" id="f-pet-dnd-to" class="blank blank-time">
+        </div>
+        <p class="chapter-note">这段时间我假装是个摆件。偏好记在本机（localStorage），桌宠引擎直接读。</p>
+        <p class="whisper ok" id="pet-ok" role="status">记好了。</p>
+      </section>
+
+      <!-- 五、关于 -->
+      <section class="chapter" id="ch-about" aria-labelledby="ch-about-title">
+        <h3 class="chapter-title" id="ch-about-title"><span class="num">五、</span>关于</h3>
+        <div class="about-row">
+          <div class="about-info">
+            <p>N.E.K.O Companion Desktop · <span class="mono">0.1.0</span>（骨架）</p>
+            <p>仓库：<a href="https://github.com/AdamPlatin123/neko-services" target="_blank" rel="noreferrer">github.com/AdamPlatin123/neko-services</a></p>
+            <p class="muted">纸、墨、和一点朱砂。</p>
+          </div>
+          <!-- 她的署名印（内联 SVG 朱砂印） -->
+          <div class="seal" role="img" aria-label="她的署名印：同在">
+            <svg viewBox="0 0 44 44" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <rect x="2.5" y="2.5" width="39" height="39" rx="4" fill="none" stroke="currentColor" stroke-width="2.5"/>
+              <text x="22" y="20.5" text-anchor="middle" font-size="15" fill="currentColor" transform="rotate(-1.5 22 16)">同</text>
+              <text x="22" y="37.5" text-anchor="middle" font-size="15" fill="currentColor" transform="rotate(1.2 22 33)">在</text>
+            </svg>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>

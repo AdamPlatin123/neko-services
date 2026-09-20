@@ -1,0 +1,245 @@
+/* ==========================================================================
+   N.E.K.O · base.css —— 字体接入 / 纸质元件（组件规范见 DESIGN.md Components）
+   字体经 CDN 加载（HTML <head> 引入）+ 本地回退；此处只声明栈。
+   ========================================================================== */
+@import "./tokens.css";
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  background: var(--neko-paper);
+  color: var(--neko-ink);
+  font-family: var(--neko-font-body);
+  font-size: var(--neko-font-body-size);
+  line-height: var(--neko-font-body-line-height);
+  transition: background var(--neko-duration-short) var(--neko-ease-move),
+    color var(--neko-duration-short) var(--neko-ease-move);
+}
+
+/* 朱砂焦点环——全站唯一强调色出现处之一 */
+:focus-visible {
+  outline: 2px solid var(--neko-color-primary);
+  outline-offset: 2px;
+}
+
+::placeholder { color: var(--neko-ink-faded); opacity: 0.75; }
+
+a {
+  color: var(--neko-color-primary); /* 朱砂·链接 */
+  text-decoration-color: color-mix(in srgb, var(--neko-color-primary) 45%, transparent);
+  text-underline-offset: 3px;
+}
+a:hover { text-decoration-color: var(--neko-color-primary); }
+
+/* ---- 谁在说话（DESIGN.md Typography 规则） ---- */
+.wenkai { font-family: var(--neko-font-display); font-weight: var(--neko-font-display-weight); }
+.mono   { font-family: var(--neko-font-mono); font-feature-settings: var(--neko-font-mono-feature); }
+.sys    { font-family: var(--neko-font-label); font-size: var(--neko-font-label-size); letter-spacing: var(--neko-font-label-letter-spacing); }
+
+/* ---- 顶栏 ---- */
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px var(--neko-space-2xl);
+  border-bottom: 1px solid var(--neko-line);
+}
+.topbar .title {
+  font-family: var(--neko-font-label);
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  color: var(--neko-ink-faded);
+}
+
+/* ---- 按钮 ---- */
+/* pill：次级操作（系统说话·黑体），顶栏切换/试运行类 */
+.pill-btn {
+  background: none;
+  border: 1px solid color-mix(in srgb, var(--neko-ink) 25%, transparent);
+  color: var(--neko-ink);
+  border-radius: var(--neko-rounded-full);
+  padding: 6px 16px;
+  font-size: 13px;
+  font-family: var(--neko-font-label);
+  letter-spacing: var(--neko-font-label-letter-spacing);
+  cursor: pointer;
+  transition: border-color var(--neko-duration-short) var(--neko-ease-move);
+}
+.pill-btn:hover { border-color: color-mix(in srgb, var(--neko-ink) 55%, transparent); }
+.pill-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* hero-btn：唯一实心按钮（朱砂底纸白字），文案用文楷（她执笔） */
+.hero-btn {
+  display: inline-block;
+  background: var(--neko-color-primary);
+  color: var(--neko-color-on-primary);
+  font-family: var(--neko-font-display);
+  font-weight: var(--neko-font-display-weight);
+  font-size: 16px;
+  letter-spacing: 0.08em;
+  padding: 12px 36px;
+  border: none;
+  border-radius: var(--neko-rounded-sm);
+  cursor: pointer;
+  transition: transform var(--neko-duration-micro) var(--neko-ease-enter);
+}
+.hero-btn:hover { transform: translateY(-1px); }
+.hero-btn:active { transform: translateY(0); }
+.hero-btn:disabled { opacity: 0.55; cursor: default; transform: none; }
+
+/* ---- 纸质登记表（sheet：唯一卡片级容器，不嵌套） ---- */
+.sheet {
+  background: var(--neko-paper-lift);
+  border: 1px solid var(--neko-line);
+  border-radius: var(--neko-rounded-sm);
+  padding: 56px 64px;
+  position: relative;
+  transition: background var(--neko-duration-short) var(--neko-ease-move);
+}
+
+/* 章节：汉字数字「一、二、三」+ 细墨线 */
+.sheet section.chapter { margin-bottom: 44px; }
+.sheet section.chapter:last-of-type { margin-bottom: 12px; }
+.sheet h3.chapter-title {
+  font-family: var(--neko-font-display);
+  font-weight: var(--neko-font-display-weight);
+  font-size: 19px;
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--neko-line-strong);
+  margin-bottom: var(--neko-space-lg);
+}
+.sheet h3.chapter-title .num {
+  font-family: var(--neko-font-body);
+  font-size: 14px;
+  color: var(--neko-ink-faded);
+}
+
+/* ---- 填空（input-blank：纸上是填空线，不是盒子） ---- */
+.field { margin-bottom: 22px; }
+.field label {
+  display: block;
+  font-family: var(--neko-font-label);
+  font-size: var(--neko-font-label-size);
+  letter-spacing: var(--neko-font-label-letter-spacing);
+  color: var(--neko-ink-faded);
+  margin-bottom: 6px;
+}
+.blank {
+  border: none;
+  border-bottom: 1px dotted var(--neko-line-dotted);
+  background: transparent;
+  color: var(--neko-ink);
+  font-family: var(--neko-font-mono);
+  font-feature-settings: var(--neko-font-mono-feature);
+  font-size: 14px;
+  padding: 6px 2px;
+  width: 100%;
+  border-radius: 0; /* 纸上是线，不是圆角矩形 */
+  transition: border-color var(--neko-duration-short) var(--neko-ease-move);
+}
+.blank:focus {
+  outline: none;
+  border-bottom: 1.5px solid var(--neko-color-primary); /* 点线变朱砂实线 */
+}
+.blank[aria-invalid="true"] { border-bottom-color: color-mix(in srgb, var(--neko-color-error) 65%, transparent); }
+
+/* 她的报错（文楷人格化） */
+.err {
+  font-family: var(--neko-font-display);
+  color: var(--neko-color-error);
+  font-size: 14px;
+  margin-top: 6px;
+  display: none;
+}
+.err.show { display: block; }
+/* 她的低语（成功/提示，也是文楷但不喊） */
+.whisper {
+  font-family: var(--neko-font-display);
+  color: var(--neko-ink-faded);
+  font-size: 14px;
+  margin-top: 6px;
+  display: none;
+}
+.whisper.show { display: block; }
+.whisper.ok { color: var(--neko-color-success); }
+
+/* ---- 入口行（entry-row：点线分隔，在线态苔绿圆点） ---- */
+.entry-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 2px;
+  border-bottom: 1px dotted var(--neko-line-dotted-soft);
+  font-size: 14px;
+}
+.entry-row .st {
+  font-family: var(--neko-font-label);
+  font-size: 12px;
+  letter-spacing: var(--neko-font-label-letter-spacing);
+  color: var(--neko-ink-faded);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.entry-row .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--neko-ink-faded); opacity: 0.55; }
+.entry-row .st.on { color: var(--neko-color-success); }
+.entry-row .st.on .dot { background: var(--neko-color-success); opacity: 1; }
+
+/* ---- 朱砂署名印（seal：她的署名，hover 微微洇开） ---- */
+.seal {
+  border: 2px solid var(--neko-color-primary);
+  color: var(--neko-color-primary);
+  font-family: var(--neko-font-display);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--neko-rounded-sm);
+  transform: rotate(-3deg);
+  opacity: 0.85;
+  transition: opacity 400ms var(--neko-ease-move), transform 400ms var(--neko-ease-move);
+  cursor: default;
+  user-select: none;
+}
+.seal:hover { opacity: 1; transform: rotate(-3deg) scale(1.06); }
+
+/* ---- 回忆册条目（点线分隔的流水记录） ---- */
+.memory-item {
+  padding: 14px 2px;
+  border-bottom: 1px dotted var(--neko-line-dotted-soft);
+}
+.memory-item .content { font-size: 14.5px; }
+.memory-item .meta {
+  font-family: var(--neko-font-label);
+  font-size: 11px;
+  letter-spacing: var(--neko-font-label-letter-spacing);
+  color: var(--neko-ink-faded);
+  margin-top: 4px;
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+/* ---- 通用 ---- */
+.muted { color: var(--neko-ink-faded); }
+.hr-note {
+  font-family: var(--neko-font-label);
+  font-size: 13px;
+  color: var(--neko-ink-faded);
+  text-align: center;
+  letter-spacing: 0.1em;
+}
+
+@media (max-width: 720px) {
+  .topbar { padding: 16px var(--neko-space-md); }
+  .sheet { padding: 36px 28px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}

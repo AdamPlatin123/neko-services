@@ -1,0 +1,79 @@
+/* 首启海报——一次相遇的仪式（Persuade）。
+   960×640：左 60% 安静文字 + 右下角色，不对称构图；窄屏单列堆叠。 */
+@import "../../styles/base.css";
+
+body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--neko-space-lg);
+}
+
+.poster {
+  width: min(var(--neko-poster-width), 100%);
+  aspect-ratio: 960 / 640;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 40px;
+}
+
+.poster-copy {
+  max-width: 34em;
+}
+
+.poster-title {
+  font-family: var(--neko-font-display);
+  font-weight: var(--neko-font-display-weight);
+  font-size: clamp(30px, 4.2vw, 44px);
+  line-height: 1.5;
+  letter-spacing: var(--neko-font-display-letter-spacing);
+}
+
+.poster-sub {
+  margin-top: 20px;
+  color: var(--neko-ink-faded);
+  font-size: 16px;
+  line-height: var(--neko-font-body-line-height);
+}
+
+.poster-copy .hero-btn {
+  margin-top: 36px;
+  text-decoration: none;
+}
+
+/* 角色占位区（T2 接管 #pet-mount） */
+.poster-cat {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-end;
+}
+#pet-mount {
+  width: 150px;
+}
+#pet-mount .cat {
+  width: 100%;
+  height: auto;
+  display: block;
+  overflow: visible;
+}
+
+/* 占位猫的呼吸——自然节奏，不抢戏 */
+.breath { animation: breath 4.6s ease-in-out infinite; transform-origin: 50% 100%; }
+@keyframes breath { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.014); } }
+.eye { animation: blink 7s infinite; transform-origin: center; transform-box: fill-box; }
+@keyframes blink { 0%, 94%, 100% { transform: scaleY(1); } 96% { transform: scaleY(0.06); } }
+.tail { animation: tailsway 5.2s ease-in-out infinite; transform-origin: 8% 82%; transform-box: fill-box; }
+@keyframes tailsway { 0%, 100% { transform: rotate(0deg); } 40% { transform: rotate(7deg); } 70% { transform: rotate(-4deg); } }
+
+@media (max-width: 720px) {
+  body { align-items: flex-start; }
+  .poster {
+    aspect-ratio: auto;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--neko-space-lg);
+  }
+  #pet-mount { width: 130px; align-self: flex-end; }
+}
