@@ -43,14 +43,17 @@ body {
   text-decoration: none;
 }
 
-/* 角色占位区（T2 接管 #pet-mount） */
+/* 角色区：#pet-mount 挂载点（非 static 定位——MOUNTING.md 约定）。
+   尺寸给足 170px 模型 + 头顶手写字余量；无 JS 时由内部静态猫撑起视觉。 */
 .poster-cat {
   flex-shrink: 0;
   display: flex;
   align-items: flex-end;
 }
 #pet-mount {
-  width: 150px;
+  position: relative;
+  width: 180px;
+  height: 200px;
 }
 #pet-mount .cat {
   width: 100%;
@@ -75,5 +78,5 @@ body {
     align-items: flex-start;
     gap: var(--neko-space-lg);
   }
-  #pet-mount { width: 130px; align-self: flex-end; }
+  #pet-mount { width: 140px; height: 165px; align-self: flex-end; }
 }

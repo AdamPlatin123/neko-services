@@ -32,6 +32,7 @@ npm run dev
 | `speech.ts` | 手写字浮现（DOM overlay）：文楷逐字淡入、如墨迹干涸消散、无气泡框、台词库 |
 | `pet-app.ts` | 总装：事件→FSM→模型动作映射（motion 组优先，无 motion 走参数级动效）；`window.__nekoPet` 原生壳 API |
 | `pet-demo.ts` + `/pet-demo.html` | 独立演示页（暗底全屏、状态面板、事件注入、转换日志） |
+| `pet-mount.ts` → `/vendor/pet-mount-bundle.js` | 页面挂载入口（welcome/settings 共用）：`#pet-mount` + `data-pet-height` → `PetApp.mount()` |
 | `behavior.test.ts` / `slow-blink.test.ts` | vitest 纯逻辑单测（33 条） |
 
 ## 3. 挂载到任意页面（3 步）
@@ -62,6 +63,15 @@ await pet.mount();
   轮询 `POST {base}/recent_history`，响应含 `next_seq`（number）；前进即发
   `TERMINAL_MESSAGE`（→ watching 8s）。服务不在/失败静默。
 - ③ 卸载：`pet.destroy()`（移除 canvas、定时器、监听器）。
+
+### 3.1 页面静态分发（welcome / settings 现行方式）
+
+配置页与首启海报走共享通道，不引 ESM：页面加 5 个经典 script 标签
+（`/vendor/` 四件套 + `pet-mount-bundle.js`），入口 `src/pet/pet-mount.ts`
+（DOM ready → `#pet-mount` → `PetApp.mount()`；模型高度读挂载点
+`data-pet-height`，手写字墨色随昼夜主题）。构建：`npm run build:pet`
+（esbuild 双入口：pet-demo 与 pet-mount 同参数打成 IIFE，`build` 依赖它）。
+无 JS 降级：welcome 挂载点内的静态墨猫 SVG 在 bundle 启动时才移除。
 
 ## 4. 状态 → 动作映射（摘）
 

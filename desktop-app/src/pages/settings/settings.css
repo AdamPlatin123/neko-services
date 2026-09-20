@@ -193,7 +193,20 @@ body {
   color: var(--neko-ink-faded);
 }
 
+/* ---- 桌宠挂载点：陪着她配钥匙（DESIGN 桌宠=Experience；配置页角落的一只） ----
+   右下 fixed、120px 小尺寸（data-pet-height），非 static 定位（MOUNTING.md 约定）。 */
+#pet-mount {
+  position: fixed;
+  right: 28px;
+  bottom: 20px;
+  width: 132px;
+  height: 140px;
+  z-index: 40;
+}
+
 @media (max-width: 720px) {
   .about-row { flex-direction: column; align-items: flex-start; }
   .seal { align-self: flex-end; }
+  /* 窄屏不让她叠在登记表上（引擎照常挂载，仅视觉隐藏） */
+  #pet-mount { display: none; }
 }

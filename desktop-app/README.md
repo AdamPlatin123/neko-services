@@ -84,11 +84,20 @@ desktop-app/
 4. **桌面陪伴**——开关/大小 150–220px/位置偏好/免打扰时段，写 localStorage
 5. **关于**——版本、仓库链接、她的署名印（内联 SVG 朱砂印「同在」）
 
-### 桌宠挂载点
+### 桌宠挂载点（welcome / settings 共用）
 
-首启海报右侧 `#pet-mount`（`src/pages/welcome/index.html`）是角色占位区，
-当前内含一只占位墨猫 SVG；T2 分支用 pixi-live2d-display 替换其内容即可，
-外层尺寸/布局约定不变（150–220px 高，右下偏好见 `src/lib/pet-prefs.ts`）。
+两个页面通过同一套静态分发挂载桌宠：HTML 里四个经典 `<script>` 标签注入
+`/vendor/` 渲染栈四件套（pixi7 / pixi-sound / live2d / cubism2）+
+`/vendor/pet-mount-bundle.js`（`src/pet/pet-mount.ts` 经 `npm run build:pet`
+打成 IIFE）。script 标签 vite 原样保留，与页面 ESM 模块并行不冲突
+（loader 对全局 PIXI 幂等）。
+
+- welcome：`#pet-mount`（`data-pet-height="170"`）内保留占位墨猫 SVG 作为
+  无 JS 时的静态降级——bundle 启动即移除，由 Live2D 模型接管；引擎加载失败
+  再降级为呼吸圆点（loader 内置），即三级降级链。
+- settings：右下角 fixed 挂载点（`data-pet-height="120"`，窄屏隐藏）——
+  陪着她配钥匙的小小一只。
+- 模型地址/记忆服务的覆盖方式见 `src/pet/MOUNTING.md`；桌面偏好见 `src/lib/pet-prefs.ts`。
 
 ## 字体
 
