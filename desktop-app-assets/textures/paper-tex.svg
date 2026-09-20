@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <filter id="dowling-paper-texture" x="0" y="0" width="256" height="256" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <!-- 纸浆细微颗粒微噪点 (频率 64/256 = 0.25) -->
+      <feTurbulence type="fractalNoise" baseFrequency="0.25" numOctaves="4" stitchTiles="stitch" result="pulpGrain"/>
+      
+      <!-- 极淡横向纸张纤维丝络 (频率 X: 8/256=0.03125, Y: 32/256=0.125) -->
+      <feTurbulence type="turbulence" baseFrequency="0.03125 0.125" numOctaves="3" stitchTiles="stitch" result="fiberH"/>
+      
+      <!-- 极淡纵向交织纤维 (频率 X: 32/256=0.125, Y: 8/256=0.03125) -->
+      <feTurbulence type="turbulence" baseFrequency="0.125 0.03125" numOctaves="3" stitchTiles="stitch" result="fiberV"/>
+      
+      <!-- 混合经纬交织纤维丝络 -->
+      <feComposite in="fiberH" in2="fiberV" operator="arithmetic" k1="0" k2="0.5" k3="0.5" k4="0" result="fibers"/>
+      
+      <!-- 融合纸浆噪点与丝络纤维结构 -->
+      <feComposite in="pulpGrain" in2="fibers" operator="arithmetic" k1="0" k2="0.68" k3="0.32" k4="0" result="rawTexture"/>
+      
+      <!-- 映射至暖米色 #F3ECDD (243, 236, 221)，总起伏幅度严格控制在 2.5% 以内 (≤ 3%) -->
+      <feColorMatrix type="matrix" in="rawTexture"
+        values="0.0083 0.0083 0.0084 0 0.9404
+                0.0083 0.0083 0.0084 0 0.9130
+                0.0083 0.0083 0.0084 0 0.8542
+                0      0      0      0 1.0000"/>
+    </filter>
+  </defs>
+  <rect width="256" height="256" fill="#F3ECDD" filter="url(#dowling-paper-texture)"/>
+</svg>
