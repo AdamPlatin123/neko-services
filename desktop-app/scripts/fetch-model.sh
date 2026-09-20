@@ -96,3 +96,11 @@ cat <<'EOF'
   演示页：npm run dev → http://localhost:5190/pet-demo.html
   提醒：xiaomai 为动漫衍生角色，仅限个人自用，请勿再分发模型文件。
 EOF
+
+
+# 复制渲染三件套到 vendor（pixi v6 + cubism2 UMD——与 loader 的本地 script 注入配套）
+VENDOR_DIR="$ASSETS_ROOT/vendor"
+mkdir -p "$VENDOR_DIR"
+cp -f "$APP_ROOT/node_modules/pixi.js/dist/browser/pixi.min.js" "$VENDOR_DIR/pixi.min.js" 2>/dev/null || echo "[warn] pixi.min.js 复制失败（npm install 了吗？）"
+cp -f "$APP_ROOT/node_modules/pixi-live2d-display/dist/cubism2.min.js" "$VENDOR_DIR/cubism2.min.js" 2>/dev/null || echo "[warn] cubism2.min.js 复制失败"
+echo "[vendor] 渲染三件套就绪（pixi.min.js / live2d.min.js / cubism2.min.js）"

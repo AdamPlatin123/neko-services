@@ -85,6 +85,12 @@ interface Cubism2Model {
   on: (event: string, fn: (...args: unknown[]) => void) => unknown;
 }
 
+/** window.PIXI.live2d.Live2DModel 构造器（cubism2 UMD）的最小形状。 */
+type Cubism2ModelCtor = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  from: (url: string, opts?: Record<string, unknown>) => Promise<any>;
+};
+
 const PLACEHOLDER_CSS = `
 .neko-pet-placeholder {
   position: absolute; inset: 0;
@@ -142,11 +148,22 @@ export class PetStage {
     this.bindPointerEvents();
   }
 
-  /** 初始化：加载运行时与模型；失败则降级为呼吸圆点占位。运行时本地优先、CDN 兜底。 */
+  /** 初始化：加载运行时与模型；失败则降级为呼吸圆点占位。
+   *
+   * 三件全走本地 /vendor/（fetch-model.sh / npm postinstall 复制）：
+   * pixi.min.js → live2d.min.js → cubism2.min.js，共享同一全局 PIXI 实例。
+   * 不用 ESM import pixi-live2d-display——vite 会解析出第二份 pixi 实例，
+   * 渲染器与模型分离导致碎片渲染（2026-09-20 排障实锤）。CDN 兜底仅限直连环境。
+   */
   async init(): Promise<void> {
     const localUrl = this.opts.live2dRuntimeLocalUrl ?? LIVE2D_RUNTIME_LOCAL;
     const cdnUrl = this.opts.live2dRuntimeUrl ?? LIVE2D_RUNTIME_CDN;
+    const V = '/vendor';
     try {
+      if (!(window as unknown as { PIXI?: unknown }).PIXI) {
+        try { await loadScript(`${V}/pixi.min.js`); }
+        catch { await loadScript('https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js'); }
+      }
       try {
         await loadScript(localUrl);
       } catch {
@@ -156,8 +173,17 @@ export class PetStage {
       if (!(window as unknown as { Live2D?: unknown }).Live2D) {
         throw new Error('live2d.min.js 加载完成但 window.Live2D 缺失');
       }
+      if (!(window as unknown as { PIXI?: { live2d?: unknown } }).PIXI?.live2d) {
+        try { await loadScript(`${V}/cubism2.min.js`); }
+        catch { await loadScript('https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism2.min.js'); }
+        if (!(window as unknown as { PIXI?: { live2d?: unknown } }).PIXI?.live2d) {
+          throw new Error('cubism2.min.js 加载完成但 PIXI.live2d 缺失');
+        }
+      }
       // 静音：DESIGN「桌宠默认安静」；模型 voice 缺失时也避免加载报错噪音
-      const { Live2DModel, SoundManager } = await import('pixi-live2d-display/cubism2');
+      const { Live2DModel, SoundManager } = (
+        window as unknown as { PIXI: { live2d: { Live2DModel: Cubism2ModelCtor; SoundManager: { volume: number } } } }
+      ).PIXI.live2d;
       SoundManager.volume = 0;
       const model = (await Live2DModel.from(this.opts.modelUrl, {
         autoInteract: false, // 交互由本引擎自己调度（FSM + 慢眨眼），不用库的默认 focus/tap

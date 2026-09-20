@@ -85,3 +85,11 @@ export function resolvePetConfig(overrides?: Partial<PetConfig>): PetConfig {
   }
   return cfg;
 }
+
+/** cubism2 UMD 暴露的模型构造器（window.PIXI.live2d.Live2DModel）的最小形状。 */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare type Cubism2ModelCtor = {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  from: (url: string, opts?: Record<string, unknown>) => Promise<any>;
+};
