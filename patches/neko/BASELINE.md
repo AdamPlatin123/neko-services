@@ -48,3 +48,7 @@ MAIBOT_BASELINE_COMMIT=65b31f916d1b846469d72d01b22e79f69cb4ec41
 MAIBOT_BASELINE_DATE=2026-09-18
 BASELINE_RECORDED=2026-09-19
 ```
+
+## 实机应用记录
+- 2026-09-21：013 已直接 `git am` 到实机（实机处于 012 应用态 10219880 → f5521027）。
+  整组重放仍以基线 a3c82b5a 为准；增量应用时用 `git am patches/neko/013-*.patch` 单补丁方式。
