@@ -142,7 +142,9 @@ export class PetApp {
       this.log(`[pet] 初始状态 ${this.fsm.state}（占位模式——行为状态机照常运行）`);
     } else {
       this.log(`[pet] 模型就绪，初始状态 ${this.fsm.state}`);
-      this.stage.onModelUpdate((core, dt) => this.frameDrive(core, dt));
+      // 2026-09-21 排障：monkey-patch internal.update 在 fork v0.5 下疑似阻断渲染管线。
+      // 停用参数直写，改由 FSM 状态查询（视觉差异后续经 motion 组表达）。
+      // this.stage.onModelUpdate((core, dt) => this.frameDrive(core, dt));
       this.applyStateEnter(this.fsm.state, null);
     }
     this.events.start();

@@ -207,7 +207,7 @@ export class PetStage {
       const viewEl = document.createElement('canvas');
       this.app = new g.Application({
         view: viewEl,
-        transparent: true,
+        backgroundAlpha: 0, // v7 透明写法（transparent 是 v6 API，v7 下被忽略成黑底——排障实锤）
         width: cw,
         height: ch,
       }) as PIXIApplication;
