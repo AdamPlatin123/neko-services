@@ -168,8 +168,10 @@ export class PetStage {
     const V = '/vendor';
     try {
       if (!(window as unknown as { PIXI?: unknown }).PIXI) {
-        try { await loadScript(`${V}/pixi.min.js`); }
-        catch { await loadScript('https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js'); }
+        try { await loadScript(`${V}/pixi7.min.js`); }
+        catch { await loadScript('https://cdn.jsdelivr.net/npm/pixi.js@7.4.3/dist/pixi.min.js'); }
+        // fork cubism2 的 UMD 依赖 @pixi/sound（全局 PIXI 上补挂）
+        try { await loadScript(`${V}/pixi-sound.min.js`); } catch { /* 声音已静音，缺失可容 */ }
       }
       try {
         await loadScript(localUrl);
@@ -182,7 +184,7 @@ export class PetStage {
       }
       if (!(window as unknown as { PIXI?: { live2d?: unknown } }).PIXI?.live2d) {
         try { await loadScript(`${V}/cubism2.min.js`); }
-        catch { await loadScript('https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism2.min.js'); }
+        catch { await loadScript('https://cdn.jsdelivr.net/npm/pixi-live2d-display-advanced@1.1.0/dist/cubism2.min.js'); }
         if (!(window as unknown as { PIXI?: { live2d?: unknown } }).PIXI?.live2d) {
           throw new Error('cubism2.min.js 加载完成但 PIXI.live2d 缺失');
         }

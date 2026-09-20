@@ -101,6 +101,7 @@ EOF
 # 复制渲染三件套到 vendor（pixi v6 + cubism2 UMD——与 loader 的本地 script 注入配套）
 VENDOR_DIR="$ASSETS_ROOT/vendor"
 mkdir -p "$VENDOR_DIR"
-cp -f "$APP_ROOT/node_modules/pixi.js/dist/browser/pixi.min.js" "$VENDOR_DIR/pixi.min.js" 2>/dev/null || echo "[warn] pixi.min.js 复制失败（npm install 了吗？）"
-cp -f "$APP_ROOT/node_modules/pixi-live2d-display/dist/cubism2.min.js" "$VENDOR_DIR/cubism2.min.js" 2>/dev/null || echo "[warn] cubism2.min.js 复制失败"
-echo "[vendor] 渲染三件套就绪（pixi.min.js / live2d.min.js / cubism2.min.js）"
+cp -f "$APP_ROOT/node_modules/pixi.js/dist/pixi.min.js" "$VENDOR_DIR/pixi7.min.js" 2>/dev/null || echo "[warn] pixi7 复制失败"
+cp -f "$APP_ROOT/node_modules/@pixi/sound/dist/pixi-sound.js" "$VENDOR_DIR/pixi-sound.min.js" 2>/dev/null || echo "[warn] sound 复制失败"
+cp -f "$APP_ROOT/node_modules/pixi-live2d-display-advanced/dist/cubism2.min.js" "$VENDOR_DIR/cubism2.min.js" 2>/dev/null || echo "[warn] cubism2(fork) 复制失败"
+echo "[vendor] 渲染四件套就绪（pixi7 / pixi-sound / live2d / cubism2-fork）"

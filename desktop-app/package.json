@@ -14,8 +14,9 @@
     "fetch-model": "bash scripts/fetch-model.sh"
   },
   "dependencies": {
-    "pixi-live2d-display": "^0.4.0",
-    "pixi.js": "^6.5.10"
+    "pixi.js": "^7.4.3",
+    "@pixi/sound": "^5.2.3",
+    "pixi-live2d-display-advanced": "^1.1.0"
   },
   "devDependencies": {
     "typescript": "^5.6.3",
