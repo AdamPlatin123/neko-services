@@ -1,0 +1,888 @@
+From ca359f24d4ae45d3e62ee526e4dc36f9a8fe904f Mon Sep 17 00:00:00 2001
+From: AdamPlatin123 <154926636+AdamPlatin123@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 04:25:21 +0800
+Subject: [PATCH] =?UTF-8?q?feat(qq):=20open-platform=20pre-switch=20fixes?=
+ =?UTF-8?q?=20=E2=80=94=20intents/msg=5Fseq/ark/markdown=20guards?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+QQ 官方开放平台备胎启用前的必修缺陷修复（调研见
+neko-services/docs/qq-open-platform-research.md §5.2/§6）：
+
+P1 必修：
+1. intents 去掉 1<<12（DIRECT_MESSAGE/频道私信）：连接器不消费该事件，
+   官方对订阅无权限 intents 的处置是直接关闭 WS——未申请频道私信权限
+   的机器人会鉴权被拒循环重连。Identify 只订阅 GROUP_AND_C2C_EVENT。
+2. 被动回复 msg_seq 递增：官方按 (msg_id, msg_seq) 去重且缺省 msg_seq=1，
+   同一 msg_id 的第二条被动回复必被拒（40054005）。连接实例维护
+   per-msg_id 计数器（惰性清理过期条目），被动回复自动携带递增 msg_seq；
+   主动消息不带被动字段。
+3. ark 提示词收敛：投递层无 ark 实现（按未投递记账），提示词却鼓励
+   <ark> 输出——用户只会看到 bot「想说卡片」却什么都没收到。从
+   FORMAT_PROMPT_SECTION_OPEN_PLATFORM 删除 ark 标签/示例，顺带清理
+   与 sticker 新规则矛盾的旧行；投递层对偶发 ark 的未投递防御保留。
+
+次要修复：
+4. keyboard label 截 10 字符：官方 render_data.label 上限 10 字符，
+   超限整条拒收（40034029）。label/visited_label 截断，action.data
+   （点击回传指令）保留原文。
+5. Markdown 自动检测加开关：无 Markdown 权限的机器人遇 MD 标记文本
+   整条失败（304036/40034127）。新增配置 qq_open_markdown_enabled
+   （默认 True 保持既有行为），连接器经回调控现读、改完即生效不必
+   重连；显式 keyboard 载荷仍走 markdown 消息（官方按钮只作用于富文本）。
+6. 发送失败日志带错误码差异化：官方业务失败回 HTTP 4xx + JSON code，
+   httpx 不抛异常——频控/去重/拒收/无权限此前全部静默返回 None。新增
+   错误码提示表（40034100 频控 / 40054005 去重 / 40054013 拒收 /
+   40054002 禁言 / 40034029 按钮超限 / 304036 等 Markdown 权限），
+   群/私聊两路径统一拼装带 HTTP status + code + message + 含义的日志行。
+
+测试：新增 tests/unit/test_qq_open_plat_send_path.py（22 例，mock
+WS/HTTP 断言 Identify intents、msg_seq 序列、markdown 开关、keyboard
+截断、错误码日志、提示词收敛、save 链路透传）；qq_open 既有测试
+（convert_event/actor_identity/identity_scope）与受影响模块定向回归
+共 925 passed / 2 skipped。
+---
+ plugin/plugins/qq_auto_reply/__init__.py      |   9 +-
+ plugin/plugins/qq_auto_reply/config_store.py  |   5 +
+ .../qq_auto_reply/dashboard_service.py        |   2 +
+ .../prompt_fragment_templates.py              |   6 +-
+ plugin/plugins/qq_auto_reply/qq_open_plat.py  | 171 ++++++-
+ .../plugins/qq_auto_reply/settings_service.py |  10 +
+ tests/unit/test_qq_open_plat_send_path.py     | 438 ++++++++++++++++++
+ 7 files changed, 622 insertions(+), 19 deletions(-)
+ create mode 100644 tests/unit/test_qq_open_plat_send_path.py
+
+diff --git a/plugin/plugins/qq_auto_reply/__init__.py b/plugin/plugins/qq_auto_reply/__init__.py
+index 6ee61561..a1ff92d4 100644
+--- a/plugin/plugins/qq_auto_reply/__init__.py
++++ b/plugin/plugins/qq_auto_reply/__init__.py
+@@ -219,6 +219,11 @@ class QQAutoReplyPlugin(QQAutoReplySessionMixin, QQAutoReplyPromptingMixin, QQAu
+                 identity_probe=lambda: bool(
+                     (self._qq_settings or {}).get("qq_open_identity_probe_enabled", False)
+                 ),
++                # Markdown 自动检测开关同惯例现读：无 Markdown 权限的机器人
++                # 关掉后保底纯文本，权限补齐后再打开，都不必重连。
++                markdown_enabled=lambda: bool(
++                    (self._qq_settings or {}).get("qq_open_markdown_enabled", True)
++                ),
+                 # 取证行要同时进 UI 的「运行日志」页，不能只落文件。
+                 emit_log=self._emit_log,
+             )
+@@ -1162,7 +1167,7 @@ class QQAutoReplyPlugin(QQAutoReplySessionMixin, QQAutoReplyPromptingMixin, QQAu
+         return Ok({"stickers": items, "total": len(items)})
+ 
+     @ui.action(id="save_settings", label=tr("entries.save_settings.name", default="保存 QQ 自动回复设置"), refresh_context=True)
+-    @plugin_entry(id="save_settings", name=tr("entries.save_settings.name", default="保存 QQ 自动回复设置"), description=tr("entries.save_settings.description", default="保存 QQ 插件当前的 OneBot 地址、Token、NapCat 路径、回复概率和 backlog 标签等设置。"), input_schema={"type": "object", "properties": {"onebot_url": {"type": "string"}, "token": {"type": "string"}, "napcat_directory": {"type": "string"}, "show_napcat_window": {"type": "boolean"}, "reply_mode": {"type": "string", "enum": ["text", "voice", "both"]}, "show_onboarding": {"type": "boolean"}, "guide_step_napcat_done": {"type": "boolean"}, "guide_step_config_done": {"type": "boolean"}, "guide_step_runtime_done": {"type": "boolean"}, "normal_relay_probability": {"type": "number"}, "truth_reply_probability": {"type": "number"}, "backlog_labels": {"type": "array", "items": {"type": "object"}}, "strategy_mode": {"type": "string", "enum": ["neko_dynamic", "neko_scene"]}, "qq_connection_mode": {"type": "string", "enum": ["napcat", "napcat_forward", "open_platform"]}, "qq_open_app_id": {"type": "string"}, "qq_open_client_secret": {"type": "string"}, "qq_open_identity_probe_enabled": {"type": "boolean"}, "retroactive_review_max_messages": {"type": "integer"}, "retroactive_review_max_reply": {"type": "integer"}, "group_memory_enabled": {"type": "boolean"}, "group_member_memory_enabled": {"type": "boolean"}, "private_participant_memory_enabled": {"type": "boolean"}, "allow_cross_group_context": {"type": "boolean"}}, "additionalProperties": False})
++    @plugin_entry(id="save_settings", name=tr("entries.save_settings.name", default="保存 QQ 自动回复设置"), description=tr("entries.save_settings.description", default="保存 QQ 插件当前的 OneBot 地址、Token、NapCat 路径、回复概率和 backlog 标签等设置。"), input_schema={"type": "object", "properties": {"onebot_url": {"type": "string"}, "token": {"type": "string"}, "napcat_directory": {"type": "string"}, "show_napcat_window": {"type": "boolean"}, "reply_mode": {"type": "string", "enum": ["text", "voice", "both"]}, "show_onboarding": {"type": "boolean"}, "guide_step_napcat_done": {"type": "boolean"}, "guide_step_config_done": {"type": "boolean"}, "guide_step_runtime_done": {"type": "boolean"}, "normal_relay_probability": {"type": "number"}, "truth_reply_probability": {"type": "number"}, "backlog_labels": {"type": "array", "items": {"type": "object"}}, "strategy_mode": {"type": "string", "enum": ["neko_dynamic", "neko_scene"]}, "qq_connection_mode": {"type": "string", "enum": ["napcat", "napcat_forward", "open_platform"]}, "qq_open_app_id": {"type": "string"}, "qq_open_client_secret": {"type": "string"}, "qq_open_identity_probe_enabled": {"type": "boolean"}, "qq_open_markdown_enabled": {"type": "boolean"}, "retroactive_review_max_messages": {"type": "integer"}, "retroactive_review_max_reply": {"type": "integer"}, "group_memory_enabled": {"type": "boolean"}, "group_member_memory_enabled": {"type": "boolean"}, "private_participant_memory_enabled": {"type": "boolean"}, "allow_cross_group_context": {"type": "boolean"}}, "additionalProperties": False})
+     async def save_settings(
+         self,
+         onebot_url: Optional[str] = None,
+@@ -1201,6 +1206,7 @@ class QQAutoReplyPlugin(QQAutoReplySessionMixin, QQAutoReplyPromptingMixin, QQAu
+         qq_open_app_id: Optional[str] = None,
+         qq_open_client_secret: Optional[str] = None,
+         qq_open_identity_probe_enabled: Optional[bool] = None,
++        qq_open_markdown_enabled: Optional[bool] = None,
+         local_stt_url: Optional[str] = None,
+         **_,
+     ):
+@@ -1241,6 +1247,7 @@ class QQAutoReplyPlugin(QQAutoReplySessionMixin, QQAutoReplyPromptingMixin, QQAu
+             qq_open_app_id=qq_open_app_id,
+             qq_open_client_secret=qq_open_client_secret,
+             qq_open_identity_probe_enabled=qq_open_identity_probe_enabled,
++            qq_open_markdown_enabled=qq_open_markdown_enabled,
+             local_stt_url=local_stt_url,
+         )
+ 
+diff --git a/plugin/plugins/qq_auto_reply/config_store.py b/plugin/plugins/qq_auto_reply/config_store.py
+index 58e0e776..c2a19641 100644
+--- a/plugin/plugins/qq_auto_reply/config_store.py
++++ b/plugin/plugins/qq_auto_reply/config_store.py
+@@ -106,6 +106,11 @@ class QQAutoReplyConfigStore:
+             # 关：打开后每条群/私聊事件都会往持久日志里写一行标识符字段，只有
+             # 维护者做那次取证时才需要。
+             "qq_open_identity_probe_enabled": False,
++            # open_platform 群消息 Markdown 自动检测（文本带 MD 标记时切
++            # msg_type=2）。未向平台申请 Markdown 权限的机器人整条消息会失败
++            # （304036/40034127，失败日志现在带错误码）——关掉即保底纯文本。
++            # 默认开：保持既有行为，权限缺失的用户按需关闭。
++            "qq_open_markdown_enabled": True,
+             "trusted_users": [],
+             "trusted_groups": [],
+             # 全局 per-QQ 信赖度演化账本；群与私聊 participant 共池。
+diff --git a/plugin/plugins/qq_auto_reply/dashboard_service.py b/plugin/plugins/qq_auto_reply/dashboard_service.py
+index 928776f5..3ba5d98f 100644
+--- a/plugin/plugins/qq_auto_reply/dashboard_service.py
++++ b/plugin/plugins/qq_auto_reply/dashboard_service.py
+@@ -213,6 +213,7 @@ class QQDashboardService:
+         qq_open_app_id: Optional[str] = None,
+         qq_open_client_secret: Optional[str] = None,
+         qq_open_identity_probe_enabled: Optional[bool] = None,
++        qq_open_markdown_enabled: Optional[bool] = None,
+         local_stt_url: Optional[str] = None,
+     ):
+         try:
+@@ -253,6 +254,7 @@ class QQDashboardService:
+                 qq_open_app_id=qq_open_app_id,
+                 qq_open_client_secret=qq_open_client_secret,
+                 qq_open_identity_probe_enabled=qq_open_identity_probe_enabled,
++                qq_open_markdown_enabled=qq_open_markdown_enabled,
+                 local_stt_url=local_stt_url,
+             )
+         except ValueError as exc:
+diff --git a/plugin/plugins/qq_auto_reply/prompt_fragment_templates.py b/plugin/plugins/qq_auto_reply/prompt_fragment_templates.py
+index f89964cf..b29fe6f8 100644
+--- a/plugin/plugins/qq_auto_reply/prompt_fragment_templates.py
++++ b/plugin/plugins/qq_auto_reply/prompt_fragment_templates.py
+@@ -119,23 +119,21 @@ FORMAT_PROMPT_SECTION_OPEN_PLATFORM = """\
+   * `<at>QQ号</at>` → @群里的某个人
+   * `<reply>消息ID</reply>` → 引用回复某条消息
+   * `<sticker>表情包ID</sticker>` → 发送自定义表情包，可和文字组合（先发文字，表情包自动跟发）。适合配图时偶尔使用。可用ID和描述：
+-  * `<ark title="标题" desc="描述" btn="按钮" url="链接">正文</ark>` → 富卡片（仅群聊）。适合状态面板、图文摘要。
+   可用表情包ID和描述：
+ {sticker_catalog}
+ 
+ ### 使用原则
+ - **默认使用 Markdown**：每条回复都应该适当用 `**粗体**` 或 `*斜体*` 增强可读性
+ - 当需要用户做选择时，**优先使用 `<keyboard>` 按钮**而非文字列举
+-- 如果用户**明确要求**某种格式（如"发个表情包""用卡片展示""给我按钮选"），直接使用对应标签
++- 如果用户**明确要求**某种格式（如"发个表情包""给我按钮选"），直接使用对应标签
+ - 如果用户问"你能发图片吗""支持按钮吗"之类，**直接用对应标签展示效果**，而不是文字回答"我可以"
+ - 引用对方的话时用 `> 引用`
+-- `<sticker>` 和 `<ark>` 不能与文字混用；其他标签都可以组合
++- 其他标签都可以自由组合
+ - 表情包可以在有情绪表达需求时自然地使用，文字和表情包搭配效果更好。
+   示例：
+   - `**没问题！** > 你说得对`
+   - `要看看哪个？<keyboard>查看状态 | 查看配置 | 查看日志</keyboard>`
+   - `<reply>114514</reply> **收到~** *马上处理*`
+-  - `<ark title="运行状态" desc="已在线 3 小时">当前一切正常</ark>`
+ """
+ 
+ FORMAT_PROMPT_SECTION_NEKO_DYNAMIC = """\
+diff --git a/plugin/plugins/qq_auto_reply/qq_open_plat.py b/plugin/plugins/qq_auto_reply/qq_open_plat.py
+index 037a77e7..202110c8 100644
+--- a/plugin/plugins/qq_auto_reply/qq_open_plat.py
++++ b/plugin/plugins/qq_auto_reply/qq_open_plat.py
+@@ -15,6 +15,75 @@ from .qq_connection import QQConnectionBase
+ 
+ _CQ_CODE_RE = _re.compile(r"\[CQ:(\w+),([^\]]+)\]")
+ 
++# ==========================================
++# 发送侧官方约束常量与错误码表
++# ==========================================
++
++#: Identify 订阅的 intents 位。GROUP_AND_C2C_EVENT = 1 << 25，覆盖
++#: C2C_MESSAGE_CREATE + GROUP_AT_MESSAGE_CREATE——_receive_loop 只消费这两类。
++#: **不要**再按位或 1 << 12（DIRECT_MESSAGE，频道私信）：本连接器不处理
++#: DIRECT_MESSAGE_CREATE，而官方事件订阅页明示「传递了无权限的 intents，
++#: websocket 会报错并直接关闭连接」——未申请频道私信权限的机器人会卡在
++#: 鉴权被拒的循环重连里。
++_OPEN_INTENTS_GROUP_AND_C2C = 1 << 25
++
++#: keyboard 按钮 render_data.label 的官方字符上限，超限整条消息拒收
++#: （错误码 40034029）。action.data 是点击后回传的指令文本，不受此限。
++_KEYBOARD_LABEL_MAX_CHARS = 10
++
++#: 被动回复计数器的保留窗口。官方被动回复 msg_id 有效期：群 5 分钟（C2C
++#: 文档页首写 60 分钟但字段表写 5 分钟，自相矛盾，按 5 分钟保守设计）。
++#: 取 2 倍兜底——窗口之外的 msg_id 已不能用于被动回复，计数自然无意义。
++_PASSIVE_SEQ_WINDOW_SECONDS = 600.0
++
++#: 官方错误码 → 排障提示（发送侧高频项）。来源：bot.q.qq.com 错误码表 +
++#: 群/C2C 消息发送页（2026-09 核对）。未收录的 code 照原样打 code+message。
++_OPEN_SEND_ERROR_HINTS: dict[int, str] = {
++    304003: "机器人无 Markdown/模板权限，可在设置里关闭 Markdown 自动检测",
++    304036: "机器人无 Markdown/模板权限，可在设置里关闭 Markdown 自动检测",
++    40034127: "机器人无 Markdown/模板权限，可在设置里关闭 Markdown 自动检测",
++    40034100: "触发主动消息频控（单关系 20 条/分钟、每群每天 1000 条）",
++    40034006: "消息内容审核不通过",
++    40034029: "keyboard 按钮超限（每条最多 4 个，label 最多 10 字符）",
++    40054002: "机器人被禁言",
++    40054005: "msg_id+msg_seq 去重拒绝（同一条消息的被动回复次数超限或重复）",
++    40054010: "不允许发送该 URL",
++    40054013: "用户拒收消息",
++}
++
++
++def _describe_send_failure(direction: str, resp: Any, data: Any) -> str:
++    """把一次发送失败的 HTTP 响应拼成带错误码与含义的日志行。
++
++    官方网关对业务失败同样回 HTTP 4xx + JSON body（``{"code": ..., "message": ...}``），
++    httpx 不会抛异常——所以旧的 ``except`` 分支只兜得住网络错误，频控/去重/
++    无权限这类业务失败一律静默返回 None，排障只能靠「消息没到」反推。这里
++    至少把 code 翻译成人话，四种高频故障（频控/去重/拒收/无 Markdown 权限）
++    各自有可辨识的日志。
++    """
++    status = int(getattr(resp, "status_code", 0) or 0)
++    code_raw: Any = None
++    message = ""
++    if isinstance(data, dict):
++        code_raw = data.get("code")
++        message = str(data.get("message") or "")
++    parts = [f"[QQOpenPlatform] 发送{direction}失败: HTTP {status}"]
++    code_txt = str(code_raw).strip() if code_raw is not None else ""
++    if code_txt:
++        parts.append(f"code={code_txt}")
++        hint = ""
++        try:
++            hint = _OPEN_SEND_ERROR_HINTS.get(int(code_txt), "")
++        except (TypeError, ValueError):
++            hint = ""
++        if message:
++            parts.append(message)
++        if hint:
++            parts.append(f"（{hint}）")
++    elif message:
++        parts.append(message)
++    return " ".join(parts)
++
+ # ==========================================
+ # R11 身份作用域：已判定
+ # （docs/design/speaker-trust-entity-semantics.md §2.15.4）
+@@ -160,11 +229,17 @@ class QQOpenPlatformConnection(QQConnectionBase):
+         logger: Any = None,
+         message_queue_size: int = 100,
+         identity_probe: Any = None,
++        markdown_enabled: Any = None,
+         emit_log: Any = None,
+     ):
+         #: 零参回调，返回真时才记录 R11 取证日志（见模块顶部）。做成回调而不是
+         #: 布尔值，是为了让开关改完立刻生效，不必重连。
+         self._identity_probe = identity_probe
++        #: 零参回调，返回真时才启用「文本自动检测 Markdown 标记 → msg_type=2」。
++        #: 同样做成回调而非布尔：未申请 Markdown 权限的机器人在后台补申请/换
++        #: 资质后改开关即生效，不必断开重连。缺省（None/非可调用）= 启用，
++        #: 保持既有行为。
++        self._markdown_enabled = markdown_enabled
+         #: 插件的内存日志环（UI「运行日志」页读的就是它）。缺省无操作，与
+         #: QQClient 同惯例。
+         self._emit_log = emit_log or (lambda level, msg: None)
+@@ -189,6 +264,11 @@ class QQOpenPlatformConnection(QQConnectionBase):
+         self._last_seq = 0
+         self._session_id = ""  # Resume 重连所需
+         self._sent_message_ids: dict[str, float] = {}
++        #: 被动回复的 per-msg_id 计数器：msg_id → (已用次数, 最近一次时间戳)。
++        #: 官方按 (msg_id, msg_seq) 去重，msg_seq 不填默认 1——同一 msg_id 的
++        #: 第二次被动回复若仍不带 msg_seq 必被拒（40054005）。人味多块纠正、
++        #: 引用块连发都会触发。挂连接实例上跨发送单调递增。
++        self._passive_seq: dict[str, tuple[int, float]] = {}
+         self._message_queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, message_queue_size))
+ 
+     @property
+@@ -275,7 +355,11 @@ class QQOpenPlatformConnection(QQConnectionBase):
+         await self._ws.send(json.dumps({
+             "op": 2, "d": {
+                 "token": f"QQBot {self._access_token}",
+-                "intents": (1 << 25) | (1 << 12),
++                # 只订阅本连接器真正消费的 GROUP_AND_C2C_EVENT。曾按位或过
++                # 1 << 12（DIRECT_MESSAGE/频道私信）：连接器不处理该事件，而
++                # 官方对「订阅了无权限 intents」的处置是直接关闭 WS——没申请
++                # 频道私信权限的机器人会鉴权被拒循环重连。见常量注释。
++                "intents": _OPEN_INTENTS_GROUP_AND_C2C,
+                 "shard": [0, 1],
+             },
+         }))
+@@ -466,6 +550,28 @@ class QQOpenPlatformConnection(QQConnectionBase):
+         self, group_id: str, segments: list[dict[str, Any]], *, record_sent: bool = True, keyboard: str = ""
+     ) -> Optional[str]:
+         """将 OneBot segments 转换为 QQ 开放平台格式并发送"""
++
++        def _markdown_detection_enabled() -> bool:
++            # 回调缺省/非可调用 = 启用（保持既有行为）。开关只管「把普通文本
++            # 自动升级为 msg_type=2」这一支；显式 keyboard 载荷必须挂在
++            # markdown 消息上（官方按钮只作用于富文本），不受此开关影响。
++            cb = getattr(self, "_markdown_enabled", None)
++            return bool(cb()) if callable(cb) else True
++
++        def _next_passive_msg_seq(msg_id: str) -> int:
++            # 官方按 (msg_id, msg_seq) 去重且 msg_seq 不填默认 1：同一 msg_id
++            # 的第二条被动回复必须显式递增，否则 40054005。惰性清理过期
++            # 计数（被动回复窗口见常量注释），防长连接上无限增长。
++            now = time.time()
++            if len(self._passive_seq) > 64:
++                for stale in [
++                    k for k, (_, ts) in self._passive_seq.items()
++                    if now - ts > _PASSIVE_SEQ_WINDOW_SECONDS
++                ]:
++                    self._passive_seq.pop(stale, None)
++            seq = self._passive_seq.get(msg_id, (0, 0.0))[0] + 1
++            self._passive_seq[msg_id] = (seq, now)
++            return seq
+         content_parts: list[str] = []
+         reply_msg_id = ""
+         at_user_id = ""
+@@ -509,10 +615,14 @@ class QQOpenPlatformConnection(QQConnectionBase):
+                     content = "[图片]"
+                 body["content"] = content
+         else:
+-            # 自动检测 Markdown 语法（仅识别明确的格式标记，避免误判普通文本）
++            # 自动检测 Markdown 语法（仅识别明确的格式标记，避免误判普通文本）。
++            # 可经回调整体关闭：无 Markdown 权限的机器人切到 msg_type=2 会整条
++            # 失败（304036/40034127），关掉后保底纯文本。
+             _MD_PATTERNS = (r'\*\*[^*]+\*\*', r'\*[^*]+\*', r'~~[^~]+~~', r'^> ', r'`[^`]+`', r'\[.+\]\(.+\)', r'^#{1,3} ')
+             import re as _re
+-            is_md = any(_re.search(p, content, _re.MULTILINE) for p in _MD_PATTERNS)
++            is_md = _markdown_detection_enabled() and any(
++                _re.search(p, content, _re.MULTILINE) for p in _MD_PATTERNS
++            )
+             if is_md:
+                 body["msg_type"] = 2
+                 body["markdown"] = {"content": content}
+@@ -521,6 +631,10 @@ class QQOpenPlatformConnection(QQConnectionBase):
+ 
+         if reply_msg_id:
+             body["msg_id"] = reply_msg_id
++            # 被动回复必须带互不相同的 msg_seq（不填默认 1，重复组合被去重
++            # 拒绝，40054005）。人味 quote_previous 多段纠正、voice 路径的
++            # 引用都可能对同一条用户消息回多次。
++            body["msg_seq"] = _next_passive_msg_seq(reply_msg_id)
+ 
+         if keyboard and body.get("msg_type") == 7:
+             # 富媒体（图片）载荷挂不了按钮：按钮只在 type-2 富文本上有效，
+@@ -543,7 +657,14 @@ class QQOpenPlatformConnection(QQConnectionBase):
+                             "buttons": [
+                                 {
+                                     "id": f"btn_{i}",
+-                                    "render_data": {"label": b, "visited_label": b},
++                                    # label/visited_label 是渲染文本，官方上限
++                                    # 10 字符，超限整条拒收（40034029）——截断
++                                    # 优于发不出去。action.data 是点击后回传的
++                                    # 指令原文，不截（截了会改变按钮语义）。
++                                    "render_data": {
++                                        "label": b[:_KEYBOARD_LABEL_MAX_CHARS],
++                                        "visited_label": b[:_KEYBOARD_LABEL_MAX_CHARS],
++                                    },
+                                     "action": {"type": 2, "permission": {"type": 2}, "data": b, "unsupport_tips": "请升级QQ版本"},
+                                 }
+                                 for i, b in enumerate(buttons)
+@@ -561,14 +682,25 @@ class QQOpenPlatformConnection(QQConnectionBase):
+                 json=body,
+                 headers=self._auth_headers(),
+             )
+-            data = resp.json()
++            try:
++                data = resp.json()
++            except Exception:
++                data = {}
++            if not isinstance(data, dict):
++                data = {}
+             msg_id = str(data.get("id") or "")
+-            if msg_id and record_sent:
+-                self.record_sent_message_id(msg_id)
+-            return msg_id if msg_id else None
++            if msg_id:
++                if record_sent:
++                    self.record_sent_message_id(msg_id)
++                return msg_id
++            # 官方业务失败也回 JSON（code/message），httpx 不抛异常——必须
++            # 在这里看 code，except 分支兜不住。
++            if self.logger:
++                self.logger.warning(_describe_send_failure("群消息", resp, data))
++            return None
+         except Exception as e:
+             if self.logger:
+-                self.logger.warning(f"[QQOpenPlatform] 发送群消息失败: {e}")
++                self.logger.warning(f"[QQOpenPlatform] 发送群消息失败(网络/协议异常): {e}")
+             return None
+ 
+     async def send_message(self, user_id: str, message: str) -> Optional[str]:
+@@ -642,14 +774,25 @@ class QQOpenPlatformConnection(QQConnectionBase):
+                 json={"content": content},
+                 headers=self._auth_headers(),
+             )
+-            data = resp.json()
++            try:
++                data = resp.json()
++            except Exception:
++                data = {}
++            if not isinstance(data, dict):
++                data = {}
+             msg_id = str(data.get("id") or "")
+-            if msg_id and record_sent:
+-                self.record_sent_message_id(msg_id)
+-            return msg_id if msg_id else None
++            if msg_id:
++                if record_sent:
++                    self.record_sent_message_id(msg_id)
++                return msg_id
++            # 与群路径同判据：C2C 的高频失败（用户拒收 40054013、频控 40034100）
++            # 都是 HTTP 4xx + code，不走异常分支。
++            if self.logger:
++                self.logger.warning(_describe_send_failure("私聊消息", resp, data))
++            return None
+         except Exception as e:
+             if self.logger:
+-                self.logger.warning(f"[QQOpenPlatform] 发送私聊失败: {e}")
++                self.logger.warning(f"[QQOpenPlatform] 发送私聊失败(网络/协议异常): {e}")
+             return None
+ 
+     async def send_group_poke(self, group_id: str, user_id: str) -> Optional[str]:
+diff --git a/plugin/plugins/qq_auto_reply/settings_service.py b/plugin/plugins/qq_auto_reply/settings_service.py
+index b93dee5c..da8a363e 100644
+--- a/plugin/plugins/qq_auto_reply/settings_service.py
++++ b/plugin/plugins/qq_auto_reply/settings_service.py
+@@ -942,6 +942,16 @@ class QQSettingsService:
+         # qq_open_identity_probe_enabled 不在这里就地写：它和记忆开关同族，
+         # 是「一打开就开始把别人的 ID 落进持久日志」的采集授权，必须走下面
+         # 那套延迟发布（开启只在写盘成功后才对运行时可见）。
++        # qq_open_markdown_enabled 则是纯发送行为开关（关掉=保底纯文本），
++        # 没有不对称授权问题，就地写即可；连接器每条消息现读回调。
++        qq_open_markdown_enabled = kwargs.get("qq_open_markdown_enabled")
++        if qq_open_markdown_enabled is not None:
++            self.plugin._qq_settings["qq_open_markdown_enabled"] = bool(qq_open_markdown_enabled)
++            self.plugin._emit_log(
++                "INFO",
++                "开放平台 Markdown 自动检测已"
++                + ("开启" if bool(qq_open_markdown_enabled) else "关闭（保底纯文本）"),
++            )
+         local_stt_url = kwargs.get("local_stt_url")
+         if local_stt_url is not None:
+             self.plugin._qq_settings["local_stt_url"] = str(local_stt_url or "").strip()
+diff --git a/tests/unit/test_qq_open_plat_send_path.py b/tests/unit/test_qq_open_plat_send_path.py
+new file mode 100644
+index 00000000..5f5eab7e
+--- /dev/null
++++ b/tests/unit/test_qq_open_plat_send_path.py
+@@ -0,0 +1,438 @@
++"""Send-path guards for the QQ Open Platform connector.
++
++The receive/identity layers had ~2000 lines of dedicated tests; the send
++path had none. Everything pinned here is a documented platform rule the
++connector used to violate:
++
++- intents: subscribing to a bit the bot has no permission for makes the
++  gateway close the WS during auth (official event-subscribe page). The
++  old handshake OR-ed in ``1 << 12`` (guild DMs) which this connector
++  never even dispatches.
++- msg_seq: the platform dedupes on (msg_id, msg_seq) and defaults an
++  absent msg_seq to 1, so the *second* passive reply to the same user
++  message was deterministically rejected (40054005) -- humanized
++  multi-block corrections and quote fixes hit this.
++- keyboard label: render_data.label is capped at 10 chars; a longer one
++  rejects the whole message (40034029).
++- markdown autodetection: a bot without markdown permission fails the
++  entire message when the text happens to contain MD marks, so the
++  detection needed an opt-out that stays live without reconnecting.
++- error reporting: business failures come back as HTTP 4xx + JSON
++  ``{"code": ...}`` which httpx does not raise on -- rate limits,
++  dedup rejections and refusals used to vanish into a silent ``None``.
++- ark: the prompt encouraged ``<ark>`` output while the delivery layer
++  has no ark implementation, so the model kept "sending" cards the user
++  never received. The prompt no longer advertises the tag; the delivery
++  side keeps treating a stray ``<ark>`` as undelivered (unchanged).
++"""
++
++import json
++import time
++
++import pytest
++
++from plugin.plugins.qq_auto_reply.prompt_fragment_templates import (
++    FORMAT_PROMPT_SECTION_OPEN_PLATFORM,
++)
++from plugin.plugins.qq_auto_reply.qq_open_plat import QQOpenPlatformConnection
++
++
++class _RecordingLogger:
++    def __init__(self):
++        self.warnings: list[str] = []
++
++    def info(self, msg):
++        pass
++
++    def warning(self, msg):
++        self.warnings.append(str(msg))
++
++    def error(self, msg):
++        pass
++
++
++class _FakeResponse:
++    def __init__(self, status_code: int, payload: dict | None = None, *, broken_json: bool = False):
++        self.status_code = status_code
++        self._payload = payload
++        self._broken_json = broken_json
++
++    def json(self):
++        if self._broken_json:
++            raise ValueError("not json")
++        return self._payload
++
++
++class _FakeHttp:
++    def __init__(self, responses: list[_FakeResponse]):
++        self._responses = list(responses)
++        self.requests: list[tuple[str, dict]] = []
++
++    async def post(self, url, **kw):
++        self.requests.append((url, kw))
++        return self._responses.pop(0)
++
++
++class _FakeWS:
++    def __init__(self, incoming: list[dict]):
++        self._incoming = list(incoming)
++        self.sent: list[dict] = []
++
++    async def recv(self):
++        return json.dumps(self._incoming.pop(0))
++
++    async def send(self, raw):
++        self.sent.append(json.loads(raw))
++
++
++def _conn(**kwargs) -> tuple[QQOpenPlatformConnection, _RecordingLogger]:
++    logger = _RecordingLogger()
++    conn = QQOpenPlatformConnection(
++        app_id="app-1", client_secret="secret", logger=logger, **kwargs
++    )
++    # 跳过 token 刷新（不发真实 HTTP）：只测发送体构造。
++    conn._token_expires_at = time.time() + 3600.0
++    return conn, logger
++
++
++def _bind_http(conn: QQOpenPlatformConnection, responses: list[_FakeResponse]) -> _FakeHttp:
++    http = _FakeHttp(responses)
++    conn._http = http
++    return http
++
++
++def _ok_response(msg_id: str = "ret-1") -> _FakeResponse:
++    return _FakeResponse(200, {"id": msg_id})
++
++
++def _group_text(text: str, reply_id: str = "") -> list[dict]:
++    segments = []
++    if reply_id:
++        segments.append({"type": "reply", "data": {"id": reply_id}})
++    segments.append({"type": "text", "data": {"text": text}})
++    return segments
++
++
++# ── 修复 1：intents 只订阅 GROUP_AND_C2C_EVENT ──────────────────────
++
++
++async def test_identify_intents_subscribe_only_group_and_c2c():
++    conn, _ = _conn()
++    ws = _FakeWS([
++        {"op": 10, "d": {"heartbeat_interval": 30000}},
++        {"op": 0, "t": "READY", "d": {"user": {"id": "u1", "username": "bot"}, "session_id": "s1"}},
++    ])
++    conn._ws = ws
++    conn._access_token = "tok"
++
++    await conn._handshake(is_reconnect=False)
++
++    identify = ws.sent[0]
++    assert identify["op"] == 2
++    # 1 << 12（DIRECT_MESSAGE/频道私信）必须消失：连接器不消费该事件，且
++    # 官方对「订阅了无权限的 intents」的处置是直接关闭 WS。
++    assert identify["d"]["intents"] == 1 << 25
++    assert identify["d"]["intents"] & (1 << 12) == 0
++
++
++# ── 修复 2：被动回复 msg_seq 按 msg_id 递增 ─────────────────────────
++
++
++async def test_passive_reply_msg_seq_increments_per_msg_id():
++    conn, _ = _conn()
++    http = _bind_http(conn, [_ok_response(), _ok_response(), _ok_response()])
++
++    await conn.send_group_message_segments("g1", _group_text("第一条", reply_id="m-1"))
++    await conn.send_group_message_segments("g1", _group_text("第二条", reply_id="m-1"))
++    await conn.send_group_message_segments("g1", _group_text("别的消息", reply_id="m-2"))
++
++    bodies = [kw["json"] for _, kw in http.requests]
++    # 同一 msg_id 的两次被动回复：msg_seq 必须互不相同（不填默认 1，重复
++    # 组合被去重拒绝 40054005）。
++    assert bodies[0]["msg_id"] == "m-1" and bodies[0]["msg_seq"] == 1
++    assert bodies[1]["msg_id"] == "m-1" and bodies[1]["msg_seq"] == 2
++    # 不同 msg_id 各自从 1 开始。
++    assert bodies[2]["msg_id"] == "m-2" and bodies[2]["msg_seq"] == 1
++
++
++async def test_passive_seq_counter_prunes_expired_entries():
++    conn, _ = _conn()
++    # 塞满过期计数（超过 64 条触发惰性清理），新 msg_id 不得受污染。
++    now = time.time()
++    conn._passive_seq = {
++        f"old-{i}": (9, now - 7200.0) for i in range(70)
++    }
++    http = _bind_http(conn, [_ok_response()])
++
++    await conn.send_group_message_segments("g1", _group_text("hi", reply_id="fresh-1"))
++
++    body = http.requests[0][1]["json"]
++    assert body["msg_seq"] == 1
++    assert "old-0" not in conn._passive_seq
++
++
++async def test_non_reply_group_message_carries_no_msg_fields():
++    conn, _ = _conn()
++    http = _bind_http(conn, [_ok_response()])
++
++    await conn.send_group_message_segments("g1", _group_text("主动消息"))
++
++    body = http.requests[0][1]["json"]
++    # 主动消息（无 msg_id）不携带被动回复字段——不能把 msg_seq 泄漏到
++    # 主动载荷里（平台会按 msg_seq 去重干扰正常发送语义）。
++    assert "msg_id" not in body
++    assert "msg_seq" not in body
++
++
++# ── 修复 5：Markdown 自动检测开关 ───────────────────────────────────
++
++
++async def test_markdown_detection_enabled_by_default():
++    conn, _ = _conn()
++    http = _bind_http(conn, [_ok_response()])
++
++    await conn.send_group_message_segments("g1", _group_text("**加粗**内容"))
++
++    body = http.requests[0][1]["json"]
++    assert body["msg_type"] == 2
++    assert body["markdown"]["content"] == "**加粗**内容"
++
++
++async def test_markdown_detection_disabled_falls_back_to_plain_content():
++    conn, _ = _conn(markdown_enabled=lambda: False)
++    http = _bind_http(conn, [_ok_response()])
++
++    await conn.send_group_message_segments("g1", _group_text("**加粗**内容"))
++
++    body = http.requests[0][1]["json"]
++    # 关掉检测：无 Markdown 权限的机器人保底纯文本，不再切 msg_type=2。
++    assert body["content"] == "**加粗**内容"
++    assert "markdown" not in body
++    assert body.get("msg_type") != 2
++
++
++async def test_keyboard_payload_stays_markdown_when_detection_disabled():
++    conn, _ = _conn(markdown_enabled=lambda: False)
++    http = _bind_http(conn, [_ok_response()])
++
++    await conn.send_group_message_segments(
++        "g1", _group_text("选一个"), keyboard="甲 | 乙"
++    )
++
++    body = http.requests[0][1]["json"]
++    # 显式 keyboard 必须挂在 markdown 消息上（官方按钮只作用于富文本），
++    # 不随自动检测开关降级。
++    assert body["msg_type"] == 2
++    assert "keyboard" in body
++    assert body["markdown"]["content"] == "选一个"
++
++
++# ── 修复 4：keyboard label 截 10 字符 ────────────────────────────────
++
++
++async def test_keyboard_label_truncated_to_ten_chars():
++    conn, _ = _conn()
++    http = _bind_http(conn, [_ok_response()])
++
++    long_label = "一二三四五六七八九十一二"  # 12 字符 > 官方上限 10
++    await conn.send_group_message_segments(
++        "g1", _group_text("选"), keyboard=long_label
++    )
++
++    buttons = http.requests[0][1]["json"]["keyboard"]["content"]["rows"][0]["buttons"]
++    # label/visited_label 截到 10：超限整条拒收（40034029），截断优于发不出。
++    assert buttons[0]["render_data"]["label"] == long_label[:10]
++    assert buttons[0]["render_data"]["visited_label"] == long_label[:10]
++    # action.data 是点击后回传的指令原文，不截断。
++    assert buttons[0]["action"]["data"] == long_label
++
++
++async def test_keyboard_short_label_untouched():
++    conn, _ = _conn()
++    http = _bind_http(conn, [_ok_response()])
++
++    await conn.send_group_message_segments(
++        "g1", _group_text("选"), keyboard="查看状态 | 查看配置"
++    )
++
++    buttons = http.requests[0][1]["json"]["keyboard"]["content"]["rows"][0]["buttons"]
++    assert [b["render_data"]["label"] for b in buttons] == ["查看状态", "查看配置"]
++    assert [b["action"]["data"] for b in buttons] == ["查看状态", "查看配置"]
++
++
++# ── 修复 6：发送失败日志带错误码与差异化提示 ────────────────────────
++
++
++async def test_group_send_failure_logs_rate_limit_code_with_hint():
++    conn, logger = _conn()
++    _bind_http(conn, [
++        _FakeResponse(429, {"code": 40034100, "message": "too many messages"})
++    ])
++
++    ret = await conn.send_group_message_segments("g1", _group_text("hi"))
++
++    assert ret is None  # 失败仍返回 None：投递层按 None 判未投递
++    assert len(logger.warnings) == 1
++    line = logger.warnings[0]
++    assert "40034100" in line and "频控" in line
++    assert "HTTP 429" in line and "too many messages" in line
++
++
++async def test_group_send_failure_logs_dedup_code_with_hint():
++    conn, logger = _conn()
++    _bind_http(conn, [
++        _FakeResponse(400, {"code": 40054005, "message": "dup"})
++    ])
++
++    await conn.send_group_message_segments(
++        "g1", _group_text("hi", reply_id="m-1")
++    )
++
++    line = logger.warnings[0]
++    assert "40054005" in line and "去重" in line
++
++
++async def test_private_send_failure_logs_refusal_code_with_hint():
++    conn, logger = _conn()
++    _bind_http(conn, [
++        _FakeResponse(403, {"code": 40054013, "message": "refused"})
++    ])
++
++    ret = await conn.send_private_message_segments(
++        "user-1", [{"type": "text", "data": {"text": "hi"}}]
++    )
++
++    assert ret is None
++    line = logger.warnings[0]
++    assert "40054013" in line and "拒收" in line
++
++
++async def test_unknown_failure_code_logged_verbatim_without_hint():
++    conn, logger = _conn()
++    _bind_http(conn, [
++        _FakeResponse(500, {"code": 999999, "message": "mystery"})
++    ])
++
++    await conn.send_group_message_segments("g1", _group_text("hi"))
++
++    line = logger.warnings[0]
++    assert "code=999999" in line and "mystery" in line
++    # 未收录错误码不硬造提示。
++    assert "（" not in line
++
++
++async def test_broken_failure_body_still_logs_status():
++    conn, logger = _conn()
++    _bind_http(conn, [_FakeResponse(502, None, broken_json=True)])
++
++    ret = await conn.send_group_message_segments("g1", _group_text("hi"))
++
++    assert ret is None
++    assert "HTTP 502" in logger.warnings[0]
++
++
++# ── 修复 3：提示词不再鼓励 ark ──────────────────────────────────────
++
++
++def test_open_platform_prompt_no_longer_encourages_ark():
++    # 投递层无 ark 实现（按未投递记账），提示词继续鼓励 <ark> 只会让用户
++    # 看到 bot「想说卡片」却什么都收不到。注意不能断言 "ark" 子串缺席：
++    # "Markdown" 自带 "ark"。
++    assert "<ark" not in FORMAT_PROMPT_SECTION_OPEN_PLATFORM
++    assert "</ark" not in FORMAT_PROMPT_SECTION_OPEN_PLATFORM
++    # 其余输出能力未被误删。
++    assert "<keyboard>" in FORMAT_PROMPT_SECTION_OPEN_PLATFORM
++    assert "<sticker>" in FORMAT_PROMPT_SECTION_OPEN_PLATFORM
++    assert "<reply>" in FORMAT_PROMPT_SECTION_OPEN_PLATFORM
++    assert "{sticker_catalog}" in FORMAT_PROMPT_SECTION_OPEN_PLATFORM
++
++
++@pytest.mark.parametrize(
++    "code,hint",
++    [
++        (40034100, "频控"),
++        (40054005, "去重"),
++        (40054013, "拒收"),
++        (40054002, "禁言"),
++        (304036, "Markdown"),
++    ],
++)
++def test_send_error_hint_table_covers_the_switch_watchlist(code, hint):
++    # 调研报告迁移清单点名要盯的错误码必须各自有可辨识日志。
++    from plugin.plugins.qq_auto_reply.qq_open_plat import _OPEN_SEND_ERROR_HINTS
++
++    assert hint in _OPEN_SEND_ERROR_HINTS[code]
++
++
++# ── 修复 5（链路）：save_settings 三层显式签名不丢新键 ──────────────
++
++
++def test_save_settings_schema_declares_markdown_toggle():
++    # additionalProperties=False：schema 没声明的键会被 RPC 层直接拒收，
++    # 所以键必须在 entry 的 input_schema 里显式出现。
++    from plugin.plugins.qq_auto_reply import QQAutoReplyPlugin
++    from plugin.sdk.shared.core.decorators import EVENT_META_ATTR
++
++    schema = getattr(QQAutoReplyPlugin.save_settings, EVENT_META_ATTR).input_schema
++    assert schema["properties"]["qq_open_markdown_enabled"] == {"type": "boolean"}
++
++
++async def test_markdown_toggle_survives_dashboard_and_settings_layers(tmp_path):
++    """entry -> dashboard -> settings 三层各自有显式参数表，漏一层键就丢。
++
++    这里真实跑后两层（磁盘写桩掉），与 identity_scope 测试同一手法。
++    """
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock, MagicMock
++
++    from plugin.plugins.qq_auto_reply.config_store import QQAutoReplyConfigStore
++    from plugin.plugins.qq_auto_reply.dashboard_service import QQDashboardService
++    from plugin.plugins.qq_auto_reply.settings_service import QQSettingsService
++
++    store = QQAutoReplyConfigStore(tmp_path)
++    runtime_status = {
++        "napcat_managed": False,
++        "napcat_running": False,
++        "recent_pipeline_traces": [],
++    }
++
++    def _async_value(value):
++        async def _call():
++            return value
++
++        return _call
++
++    plugin = SimpleNamespace(
++        _qq_settings=store.default_config(),
++        _running=False,
++        _relay_backlog_items=[],
++        _mask_token=lambda token: "***",
++        _normal_relay_probability=0.1,
++        _truth_reply_probability=0.1,
++        _ensure_qq_client_initialized=MagicMock(),
++        _spawn_memory_sync_task=MagicMock(),
++        logger=MagicMock(),
++        _emit_log=MagicMock(),
++        config_store=store,
++        attention_service=None,
++        qq_client=None,
++        permission_mgr=None,
++        group_permission_mgr=None,
++        plugin_id="qq_auto_reply",
++        i18n=SimpleNamespace(t=lambda _key, default="": default),
++        napcat_service=SimpleNamespace(get_napcat_directory=lambda: tmp_path),
++        runtime_service=SimpleNamespace(
++            fetch_login_status_payload=_async_value({}),
++            build_runtime_status=lambda: dict(runtime_status),
++        ),
++    )
++    plugin.settings_service = QQSettingsService(plugin)
++    plugin.settings_service.persist_business_config = AsyncMock(return_value=True)
++    plugin.dashboard_service = QQDashboardService(plugin)
++
++    # 默认开（既有行为）。
++    assert plugin._qq_settings["qq_open_markdown_enabled"] is True
++
++    await plugin.dashboard_service.save_settings(qq_open_markdown_enabled=False)
++
++    assert plugin._qq_settings["qq_open_markdown_enabled"] is False
+-- 
+2.43.0
+
