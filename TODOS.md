@@ -45,3 +45,9 @@
 - /settle 在 recent.json UNREADABLE 时跳过 time_indexed（行为收严，docstring 明示）
 - 并发双压缩 in-flight Event 提前置位（读态仍一致，等待语义弱化）
 - fuse 丢弃无 id 的 hybrid 行；/new_dialog 持锁内 a-memorix HTTP（≤1s 有界）；同步 count_tokens 在事件循环；turn_uid 需写入端保证全局唯一（契约注记）
+
+## QQ 主备双轨（2026-09-20 用户裁决）
+- 主通道 NapCat（体验完整）；备胎 open_platform（凭证预配，一键切换）
+- 待用户：q.qq.com 注册机器人 → AppID/ClientSecret 填入插件「开放平台」配置页（不启动）→ 需要时顶栏一键切换
+- 待代码（切换前必修 3 项）：intents 去 1<<12（qq_open_plat.py:278）、msg_seq 递增（:522）、ark 提示词收敛或补投递；次要：keyboard label 截 10 字符、markdown 自动检测开关
+- 调研报告：/tmp/qq-open-platform-report.md（重要，建议归档进 docs/）
