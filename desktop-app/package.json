@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build:pet": "esbuild src/pet/pet-demo.ts src/pet/pet-mount.ts --bundle --format=iife --entry-names=[name]-bundle --outdir=../desktop-app-assets/vendor",
+    "build": "npm run build:pet && tsc --noEmit && vite build",
     "preview": "vite preview",
     "serve": "node src/server/standalone.ts",
     "typecheck": "tsc --noEmit",
@@ -19,6 +20,7 @@
     "pixi-live2d-display-advanced": "^1.1.0"
   },
   "devDependencies": {
+    "esbuild": "^0.21.5",
     "typescript": "^5.6.3",
     "vite": "^5.4.8",
     "vitest": "^2.1.1"

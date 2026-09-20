@@ -135,6 +135,16 @@
     </div>
   </main>
 
+  <!-- 桌宠：陪着她配钥匙（DESIGN 桌宠=Experience）——右下角 120px 小小的一只，
+       悬停 2 秒她也会抬眼看你。挂载方式与 pet-demo.html 同一套静态分发
+       （script 标签 vite 原样保留，与上面的 ESM 模块并行不冲突） -->
+  <div id="pet-mount" data-pet-height="120"></div>
+
   <script type="module" src="./main.ts"></script>
+  <script src="/vendor/pixi7.min.js"></script>
+  <script src="/vendor/pixi-sound.min.js"></script>
+  <script src="/vendor/live2d.min.js"></script>
+  <script src="/vendor/cubism2.min.js"></script>
+  <script src="/vendor/pet-mount-bundle.js"></script>
 </body>
 </html>

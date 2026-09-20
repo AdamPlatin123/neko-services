@@ -22,12 +22,13 @@
     </div>
 
     <!--
-      角色占位区。
-      T2 分支：pixi-live2d-display 在 #pet-mount 内挂载（替换占位猫的 innerHTML），
+      角色区：#pet-mount 挂载点（T1 预留，桌宠引擎已接入）。
+      内部墨猫 SVG 是「无 JS」时的静态降级——pet-mount-bundle.js 启动时整体移除，
+      由 Live2D 模型接管；引擎加载失败再降级为呼吸圆点（loader 内置）。
       挂载点尺寸/层级约定见 README「桌宠挂载点」。
     -->
     <div class="poster-cat" aria-hidden="true">
-      <div id="pet-mount">
+      <div id="pet-mount" data-pet-height="170">
         <svg viewBox="0 0 200 190" xmlns="http://www.w3.org/2000/svg" class="cat">
           <g class="breath">
             <ellipse cx="100" cy="176" rx="52" ry="7" fill="#000" opacity=".32"/>
@@ -56,5 +57,13 @@
     </div>
   </main>
   <script type="module" src="./main.ts"></script>
+
+  <!-- 桌宠渲染栈：与 pet-demo.html 同一套静态分发（script 标签 vite 原样保留，
+       与上面的 ESM 模块并行不冲突——loader 对全局 PIXI 幂等） -->
+  <script src="/vendor/pixi7.min.js"></script>
+  <script src="/vendor/pixi-sound.min.js"></script>
+  <script src="/vendor/live2d.min.js"></script>
+  <script src="/vendor/cubism2.min.js"></script>
+  <script src="/vendor/pet-mount-bundle.js"></script>
 </body>
 </html>
