@@ -13,10 +13,13 @@
 | 010 | `010-desktop-cross-injection.patch` | P1-1 #5（UC3 1a-4） | 桌面活跃会话每轮跨端增量注入：stream_text 组装 user content 前经 `on_cross_context_refresh` 回调取 `/recent_history` 增量拼「[跨端最近对话]」块（水位懒对齐防与 /new_dialog 双重注入，`_reset_cross_context_alignment` helper 覆盖全部三处会话取用：start_session 主路径/offline handoff 候选/热切换 pending 直连；文本轮+独立 ASR 语音轮全覆盖；失败 WARN 降级不阻塞） |
 | 011 | `011-amemorix-write-hook.patch` | P1-1 #9（UC1 转正） | settle 成功后批量写 a-memorix 索引（session end /process|/settle + renew 两接入点，`chat_history.clear()` 前快照）：turn 块切分 + external_id 五段规范（64 位内容哈希幂等；同批逐字重复 turn 坍缩为一条记为已知局限）+ `/a_memorix/v1/ingest_summary`（chat_summary 语义，P0-1b 约束）；`A_MEMORIX_URL` 未设=off；近实时 notify 评估后降级为 settle 批量（决策见 patch 内 docstring） |
 | 012 | `012-wechat-conversation-tier.patch` | P1-1 #11 | 微信主对话从 agent 档换 conversation 档（跨端同档、与桌面同模型同人格）；`max_completion_tokens=300` 保留（与桌面 textGuard 300 对齐的权衡）；50 字提示词保留（已登记偏差） |
+| 013 | `013-qq-open-platform-fixes.patch` | QQ 开放平台切换前修复（调研 §5.2/§6 清单） | 备胎启用前必修：Identify intents 去 `1<<12`（频道私信位，连接器不消费该事件，无权限机器人握手即被断连）；被动回复 per-msg_id msg_seq 递增（官方按 msg_id+msg_seq 去重且缺省=1，同 msg_id 第二条回复必被拒 40054005）；open_platform 提示词删 `<ark>` 段（投递层无实现却鼓励输出，用户什么都收不到）。次要：keyboard label 截 10 字符（超限整条拒收 40034029）、Markdown 自动检测开关 `qq_open_markdown_enabled`（默认开，无权限机器人可关保底纯文本，改完即生效不必重连）、发送失败日志带错误码差异化（40034100 频控/40054005 去重/40054013 拒收/40054002 禁言/304036 等 Markdown 权限；官方业务失败回 HTTP 4xx+JSON code，此前全部静默返回 None）。新增 `tests/unit/test_qq_open_plat_send_path.py` 22 例（mock WS/HTTP 断言 intents/msg_seq/开关/截断/错误码日志/save 链路透传）；qq_open 及受影响模块定向回归 925 passed / 2 skipped |
 
 > ⚠️ 在 001/002 落地前，`replay-patches.sh` 会因序号不连续（003 起始）拒绝整组重放——这是校验的预期行为。单独验证 003/004 可直接 `git am` 这两个文件到基线（P1-2 已在干净基线 worktree 上做过：双补丁干净应用 + 新增测试全绿 + OOC 回归 23/23）。
 >
 > 010-012 同理：在 001-009 落位前整组重放会被序号连续性校验拒绝。已验证的叠加顺序为 `001 → 002 → 010 → 011 → 012`（干净基线 worktree 上五个补丁依次 `git am` 全部成功，叠加态新增测试 54 passed；012 与 002 同改 `wechat_integration/__init__.py` 但区域不相交，无冲突）。
+>
+> 013 基于已 replay 012 的 main HEAD（10219880）开发并已验证：`git am` 干净应用 + 新增 22 例全绿 + 定向回归 925 passed / 2 skipped（见 manifest 013 行）。
 
 ## 命名规范
 
