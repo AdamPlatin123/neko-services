@@ -25,17 +25,19 @@ function setStatus(text: string, err = false): void {
   statusEl.classList.toggle("err", err);
 }
 
-/** 她的一行话：浮起 → 12s 后转弱墨 → 24s 后消散 */
-function herSay(text: string): void {
-  if (!text.trim()) return;
+/** 新建一行她的话（流式容器）：浮起 → 12s 弱墨 → 24s 消散 */
+function newLine(): HTMLElement {
   const line = document.createElement("div");
   line.className = "line";
-  line.textContent = text;
   linesEl.appendChild(line);
   while (linesEl.children.length > 4) linesEl.firstElementChild?.remove();
   setTimeout(() => line.classList.add("old"), 12_000);
   setTimeout(() => line.classList.add("gone"), 24_000);
-  // 桌宠同步手写（引擎可用时；说话不算交互，不打断她的状态机）
+  return line;
+}
+
+/** 桌宠同步手写（引擎可用时；说话不算交互，不打断她的状态机） */
+function petSay(text: string): void {
   const pet = (window as unknown as { __nekoPet?: { say: (t: string) => void } }).__nekoPet;
   try { pet?.say(text.slice(0, 40)); } catch { /* 引擎降级态无妨 */ }
 }
@@ -72,16 +74,25 @@ function connect(): void {
         } else if (detail) setStatus(detail, true);
         break;
       }
-      case "text": { // 她的话（最终文本；streaming 累积或整段）
-        const t = typeof m.data === "string" ? m.data : "";
-        if (t && t !== lastText) { lastText = t; pendingFinal = t; }
+      case "gemini_response": { // 她的话：分片流（isNewMessage 分段）——实测 wire 格式
+        const gm = m as unknown as { text?: string; isNewMessage?: boolean };
+        const chunk = gm.text ?? "";
+        if (!chunk) break;
+        if (gm.isNewMessage || !curLine) { curLine = newLine(); turnText = ""; }
+        curLine.textContent += chunk;
+        turnText += chunk;
+        curLine.scrollIntoView?.({ block: "nearest" });
         break;
       }
-      case "subtitle": break; // 流式字幕：轻页不做逐字镜像，最终 text 足够
+      case "text": case "subtitle": break; // 兼容其他构建的最终帧——gemini_response 已覆盖
       case "user_transcript": case "user_message": break;
       case "system": {
         const d = String(m.data ?? "");
-        if (d.includes("turn end")) { busy = false; if (pendingFinal) { herSay(pendingFinal); logLine("a", pendingFinal); pendingFinal = ""; lastText = ""; } }
+        if (d.includes("turn end")) {
+          busy = false;
+          if (turnText) { logLine("a", turnText); petSay(turnText); }
+          turnText = ""; curLine = null;
+        }
         else if (d.includes("session end") || d.includes("renew")) { sessionReady = false; }
         break;
       }
@@ -98,8 +109,8 @@ function connect(): void {
   ws.onerror = () => setStatus("连接出错（主进程在吗？）", true);
 }
 
-let lastText = "";        // 同一 turn 内 streaming 去重
-let pendingFinal = "";    // turn 结束时呈现
+let curLine: HTMLElement | null = null; // 当前流式行
+let turnText = "";        // 本 turn 她的完整话（日志/桌宠用）
 
 function speak(): void {
   const text = input.value.trim();
@@ -107,7 +118,6 @@ function speak(): void {
   busy = true;
   input.value = "";
   logLine("u", text);
-  herSay("…"); // 轻回应占位（她在想）——turn end 会被真实回复替换语义
   setStatus("她在听…");
   ws.send(JSON.stringify({ action: "stream_data", input_type: "text", data: text }));
 }
