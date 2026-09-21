@@ -61,7 +61,7 @@ function connect(): void {
     let m: { type?: string; data?: unknown; message?: unknown } = {};
     try { m = JSON.parse(ev.data as string); } catch { return; }
     switch (m.type) {
-      case "session_started": sessionReady = true; setStatus(`她在 · ${char}`); input.focus(); break;
+      case "session_started": sessionReady = true; setStatus(`她在 · ${char} · v2`); input.focus(); break;
       case "session_failed":
         setStatus(`会话未能开始：${String(m.message ?? "").slice(0, 60)}`, true); break;
       case "status": { // 状态码机（含 VOICE_INPUT_LEASE_REQUIRED / SERVER_ERROR 等）
