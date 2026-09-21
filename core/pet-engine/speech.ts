@@ -85,7 +85,7 @@ export class SpeechOverlay {
       belowOffsetPx: opts.belowOffsetPx, // 顶部越界翻转偏移（undefined 时 place() 用默认 48）
       posGetter: opts.posGetter, // 拖拽跟随的坐标源（可选）
       charDelayMs: opts.charDelayMs ?? 120, // 逐字浮现节奏（19 字约 2.3s 写完）
-      holdMsOverride: opts.holdMs, // 显式停留覆盖；不传走自适应（见 say()）
+      holdMs: opts.holdMs, // 显式停留覆盖；不传走自适应（65ms/字，见 say()）
       fadeMs: opts.fadeMs ?? 1600,
       color: opts.color ?? '#D8CDBA',
       maxChars: opts.maxChars ?? 132,
@@ -149,7 +149,7 @@ export class SpeechOverlay {
     const writeMs = line.length * this.opts.charDelayMs + 700;
     // 停留时长随句长伸缩（用户反馈：长句干涸太快没法读完）——
     // 阅读速度按 65ms/字估，下限 2.2s；显式传 holdMs 仍可钉死
-    const hold = this.opts.holdMsOverride ?? Math.max(2200, line.length * 65);
+    const hold = this.opts.holdMs ?? Math.max(2200, line.length * 65);
     // 墨迹干涸：写完 → 停留 → 消散
     this.timers.push(
       setTimeout(() => {
