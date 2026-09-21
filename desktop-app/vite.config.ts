@@ -15,6 +15,7 @@ export default defineConfig({
         index: "index.html",
         welcome: "src/pages/welcome/index.html",
         settings: "src/pages/settings/index.html",
+        companion: "src/pages/companion/index.html",
         pet: resolve(here, "pet-demo.html"),
       },
     },
@@ -28,6 +29,13 @@ export default defineConfig({
         target: "http://127.0.0.1:48912",
         changeOrigin: true,
       },
+      // companion 聊天页的 WS 会话代理（N.E.K.O 主进程 :48911）
+      "/neko-ws": {
+        target: "http://127.0.0.1:48911",
+        ws: true,
+        changeOrigin: true,
+        rewrite: (p: string) => p.replace(/^\/neko-ws/, ""),
+      },
     },
   },
   preview: {
@@ -39,6 +47,6 @@ export default defineConfig({
   publicDir: resolve(here, "../desktop-app-assets"),
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "../core/pet-engine/**/*.test.ts"],
   },
 });

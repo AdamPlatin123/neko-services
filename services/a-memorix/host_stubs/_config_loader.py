@@ -1,4 +1,4 @@
-"""服务自有配置装载：读取 a-memorix-service/config/a_memorix.toml。
+"""服务自有配置装载：读取本服务（services/a-memorix）config/a_memorix.toml。
 
 替代 MaiBot 宿主的 bot_config.toml / model_config（audit 第 4 节：
 `src.config.config` → 服务自有 toml 配置）。

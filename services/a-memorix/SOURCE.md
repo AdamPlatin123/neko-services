@@ -39,3 +39,6 @@ diff -r --exclude='__pycache__' --exclude='*.pyc' \
   因此 `config_path()` / `default_data_dir()` 默认解析到仓库根下的 `config/`、`data/`。
   独立部署语义修正（audit 文档第 5 节指出）通过内核构造参数 `plugin_root` / 纯 dict 配置注入解决，
   不修改 `paths.py`。
+
+> 2026-09-22 结构重构：本目录已迁至 `services/a-memorix/`（原 `a-memorix-service/`）。
+> 上文的旧路径为历史记录；vendoring 纪律不变。

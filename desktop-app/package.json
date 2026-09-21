@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build:pet": "esbuild src/pet/pet-demo.ts src/pet/pet-mount.ts --bundle --format=iife --entry-names=[name]-bundle --outdir=../desktop-app-assets/vendor",
+    "build:pet": "esbuild ../core/pet-engine/pet-demo.ts ../core/pet-engine/pet-mount.ts --bundle --format=iife --entry-names=[name]-bundle --outdir=../desktop-app-assets/vendor",
     "build": "npm run build:pet && tsc --noEmit && vite build",
     "preview": "vite preview",
     "serve": "node src/server/standalone.ts",

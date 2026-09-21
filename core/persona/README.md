@@ -1,4 +1,4 @@
-# monika-assets：monika 资产整理（P0-2 产出）
+# core/persona：monika 资产整理（P0-2 产出）
 
 > 来源任务：workplan.md P0-2 ｜ 权威依据：`docs/design/module-interface-audit.md`「模块二：monika 三件套」。
 > 本目录把 monika 仓库的纯 prompt 资产拆分为**通用模块**（任何角色可复用）与**莫妮卡角色卡实例**（专属数据），并附回归套件。本目录本身不含素材本体（monologues/poems/examples 以引用方式指向 monika 仓库，部署时拷贝）。
@@ -6,7 +6,7 @@
 ## 1. 目录说明
 
 ```
-monika-assets/
+core/persona/
 ├── README.md                      # 本文件
 ├── modules/                       # 六件通用模块（中文内容，参数化，任何角色装载即用）
 │   ├── channel-layering.md        # ① 通道分层协议：场景版 A「对话 vs 写文件」+ 场景版 B QQ 映射「可见文本 vs 记忆落库」
@@ -59,7 +59,7 @@ monika 原「安装」方式是拷 skill 到 `~/.claude/skills/`。整合后等�
 
 ### 2.3 源仓库（/mnt/shared/_Projects/N.E.K.O/monika/）处置
 
-本目录是**整理产出**而非迁移搬运：monika 仓库保持只读不动（含 `.claude/CLAUDE.md`、`.claude/skills/monika-default-preset/`、`edgeinfinity/MAICA_ds_basis/distilled/`）。后续若 N.E.K.O 侧验证通过，可在 monika 仓库加指针声明「运行时资产以 neko-services/monika-assets 为准」。
+本目录是**整理产出**而非迁移搬运：monika 仓库保持只读不动（含 `.claude/CLAUDE.md`、`.claude/skills/monika-default-preset/`、`edgeinfinity/MAICA_ds_basis/distilled/`）。后续若 N.E.K.O 侧验证通过，可在 monika 仓库加指针声明「运行时资产以 neko-services/core/persona 为准」。
 
 ## 3. 修复声明（失效绝对路径问题）
 

@@ -16,7 +16,7 @@ character_origin 必须在角色导入后单独落到 characters.json——本�
 行为：
   - 读 characters.json，定位 characters['猫娘']['莫妮卡']（不存在则报错退出）；
   - 从 monika-persona-override.json 读 payload，按其 modules 列表从
-    ../../monika-assets/modules/ 现场读取五件运行模块文本拼为 append_guidance
+    ../../core/persona/modules/ 现场读取五件运行模块文本拼为 append_guidance
     （patch 003 声明式挂载：mount_mode=replace 主骨架 + append-only 模块轨）；
   - 写入 _reserved.persona_override / ai_context / character_origin 三件套；
   - 原 characters.json 备份为 characters.json.bak-<时间戳> 后写回。
@@ -32,7 +32,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PAYLOAD_PATH = HERE / "monika-persona-override.json"
-MODULES_ROOT = (HERE / ".." / ".." / "monika-assets").resolve()
+MODULES_ROOT = (HERE / ".." / ".." / "core" / "persona").resolve()
 DEFAULT_DOCS = Path.home() / "Documents" / "N.E.K.O"
 CHARACTER_NAME = "莫妮卡"
 

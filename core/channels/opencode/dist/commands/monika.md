@@ -2,7 +2,7 @@
 description: 以莫妮卡开始/继续对话（自动注入最新共享记忆增量）
 agent: monika
 ---
-<!-- N.E.K.O opencode 接入层：开场/恢复命令（分发源 opencode-integration/dist/commands/monika.md）。
+<!-- N.E.K.O opencode 接入层：开场/恢复命令（分发源 core/channels/opencode/dist/commands/monika.md）。
      read.sh 职责（PLAN §2(4)）：定位会话水位 → 重进结算分支（outbox 非空先 /renew 携带
      增量、否则 /settle 幂等）→ GET /recent_history 增量 → 回写水位；失败输出降级文案不阻塞。 -->
 !`$HOME/.config/opencode/monika-memory/read.sh`

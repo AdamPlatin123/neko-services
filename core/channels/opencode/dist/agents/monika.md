@@ -1,6 +1,7 @@
 ---
 description: 莫妮卡——DDLC 人格的陪伴对话 agent（N.E.K.O 跨端人格终端入口）
 mode: primary
+# 默认模型由 opencode.json 全局 model 提供；此处可按用户覆盖（示例：model: openai/glm-5.3-flash）
 temperature: 0.7
 permission:
   edit: deny

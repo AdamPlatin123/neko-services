@@ -159,13 +159,13 @@ cd $NEKO_SRC && uv run launcher.py    # 一条命令起齐全部服务（源码�
 
 症状：NapCat 自动更新或手滑升级后 QQ 链路全断、消息字段解析报错、WS 反复重连失败。
 
-1. **先核对 pin**：NapCat 版本 pin 与 changelog 巡检入口记录在 `$NEKO_SERVICES/patches/neko/BASELINE.md`。对照 NapCat changelog 确认破坏性变更内容。
+1. **先核对 pin**：NapCat 版本 pin 与 changelog 巡检入口记录在 `$NEKO_SERVICES/runtime/patches/neko/BASELINE.md`。对照 NapCat changelog 确认破坏性变更内容。
 2. **决策二选一**：回退 NapCat 到 pin 版本（最快，QQ 恢复优先）或跟进适配（走 replay 流程，见第 4 节——上游 N.E.K.O 源码与 NapCat 两边都可能要动）。
 3. 跟进适配完成后：更新 BASELINE.md 的 pin 记录 + `VERSIONS.md` 版本表，跑全量回归。
 
 ## 4. patch 回归规则（改上游补丁的铁律）
 
-任何对 `patches/neko/*.patch` 的修改，必须走完下面全流程、**三绿才算成功**，缺一即视为改动未完成（不允许「先合再说」）。`scripts/replay-patches.sh` 与 `scripts/smoke.sh` 分别由 **p0-0-governance / p0-0-scripts 分支合入后可用**；合入前此流程无法执行——不要手工模拟重放（等脚本，别造轮子）。
+任何对 `runtime/patches/neko/*.patch` 的修改，必须走完下面全流程、**三绿才算成功**，缺一即视为改动未完成（不允许「先合再说」）。`scripts/replay-patches.sh` 与 `scripts/smoke.sh` 分别由 **p0-0-governance / p0-0-scripts 分支合入后可用**；合入前此流程无法执行——不要手工模拟重放（等脚本，别造轮子）。
 
 ```bash
 # 1. 重放补丁到上游工作树（在干净的上游基线上）
@@ -219,7 +219,7 @@ grep -n 'ERROR' $NEKO_DATA_ROOT/logs/N.E.K.O_Main_$(date +%Y%m%d).log | tail -50
 
 | 你改了什么 | 必跑 |
 | --- | --- |
-| `patches/neko/*.patch` | 第 4 节全流程三绿 |
+| `runtime/patches/neko/*.patch` | 第 4 节全流程三绿 |
 | memory 端点行为 | 契约表测试 + smoke.sh |
 | reply_pipeline / delivery | 记账测试 + smoke.sh QQ 腿 |
 | neko-services 自身脚本（smoke/doctor/replay） | 各自空跑一遍 + 本次改动说明进 commit message |
@@ -230,6 +230,6 @@ grep -n 'ERROR' $NEKO_DATA_ROOT/logs/N.E.K.O_Main_$(date +%Y%m%d).log | tail -50
 ## 7. 相关文档
 
 - `$NEKO_SERVICES/VERSIONS.md`：组件版本/数据格式版本记录、必备份与可重建清单、带记忆升级→回滚演练步骤
-- `$NEKO_SERVICES/patches/neko/BASELINE.md`：上游基线 commit 与 NapCat pin（P0-0 patch manifest 任务维护）
+- `$NEKO_SERVICES/runtime/patches/neko/BASELINE.md`：上游基线 commit 与 NapCat pin（P0-0 patch manifest 任务维护）
 - `$NEKO_SERVICES/docs/design/neko-access-audit.md`：全部 HTTP/ZMQ/WS 端点契约（排障查端点语义时的权威参考）
 - `$NEKO_SERVICES/docs/workplan.md`：P0-0 → P2-3 工作项索引

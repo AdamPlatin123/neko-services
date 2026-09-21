@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>她 · N.E.K.O</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500&family=Noto+Sans+SC:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/style.css" rel="stylesheet">
+<style>
+:root{
+  --paper-night:#241E17; --paper-lift-night:#2E2820;
+  --ink-night:#D8CDBA; --ink-faded-night:#8A7E6C;
+  --cinnabar:#B5452C; --paper:#F3ECDD;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{background:var(--paper-night);color:var(--ink-night);
+  font-family:'Noto Sans SC',sans-serif;transition:background .5s}
+body.day{background:var(--paper);color:#2A2520}
+
+#pet-stage{position:fixed;inset:0}
+/* 她的话：右下浮起的手写字（pet say 之外的常驻行） */
+#her-lines{position:fixed;right:4vw;bottom:22vh;max-width:34em;text-align:right;
+  font-family:'LXGW WenKai','Noto Serif SC',serif;font-size:17px;line-height:1.9;
+  pointer-events:none;z-index:5}
+#her-lines .line{opacity:0;transform:translateY(6px);
+  animation:inkline .8s ease-out forwards;margin-top:6px}
+@keyframes inkline{to{opacity:.92;transform:none}}
+#her-lines .line.old{transition:opacity 1.2s;opacity:.35}
+#her-lines .line.gone{transition:opacity 1.5s;opacity:0}
+
+/* 日志（回看用，弱墨） */
+#log{position:fixed;left:3vw;bottom:14vh;max-width:26em;z-index:4;
+  font-size:12.5px;line-height:1.8;color:var(--ink-faded-night);
+  font-family:'Noto Serif SC',serif;pointer-events:none}
+#log .u{color:var(--ink-faded-night)}
+#log .a{opacity:.9}
+#log div{opacity:.55}
+
+/* 状态行 */
+#status{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:6;
+  font-size:12px;letter-spacing:.14em;color:var(--ink-faded-night)}
+#status.err{color:var(--cinnabar)}
+
+/* 输入：纸面点线填空，全宽浮底 */
+#inputbar{position:fixed;left:50%;bottom:5vh;transform:translateX(-50%);z-index:6;
+  width:min(640px,86vw);display:flex;gap:14px;align-items:baseline}
+#say{flex:1;background:transparent;border:none;outline:none;
+  border-bottom:1px dotted color-mix(in srgb,currentColor 45%,transparent);
+  font-family:'LXGW WenKai','Noto Serif SC',serif;font-size:19px;color:inherit;
+  padding:8px 2px;caret-color:var(--cinnabar)}
+#say:focus{border-bottom:1.5px solid var(--cinnabar)}
+#say::placeholder{color:color-mix(in srgb,currentColor 34%,transparent)}
+#send{background:none;border:1px solid color-mix(in srgb,currentColor 25%,transparent);
+  color:inherit;border-radius:999px;padding:7px 20px;font-size:13px;cursor:pointer;
+  font-family:'LXGW WenKai',serif}
+#send:hover{border-color:var(--cinnabar);color:var(--cinnabar)}
+#send:focus-visible,#say:focus-visible{outline:none}
+#send:focus-visible{outline:2px solid var(--cinnabar);outline-offset:2px}
+
+/* 昼夜切换（右上小钮） */
+#mode{position:fixed;top:14px;right:18px;z-index:6;background:none;
+  border:1px solid color-mix(in srgb,currentColor 25%,transparent);color:inherit;
+  border-radius:999px;padding:5px 14px;font-size:12px;cursor:pointer;font-family:inherit}
+</style>
+</head>
+<body>
+<div id="pet-stage"><div id="pet-mount" data-pet-height="240"
+  style="position:absolute;left:50%;top:6%;transform:translateX(-50%);width:300px;height:340px"></div></div>
+<div id="her-lines"></div>
+<div id="log"></div>
+<div id="status">正在与她建立连接…</div>
+<button id="mode">灯下读书</button>
+<div id="inputbar">
+  <input id="say" placeholder="想对她说什么…" autocomplete="off" spellcheck="false">
+  <button id="send">说</button>
+</div>
+
+<script src="/vendor/pixi7.min.js"></script>
+<script src="/vendor/pixi-sound.min.js"></script>
+<script src="/vendor/live2d.min.js"></script>
+<script src="/vendor/cubism2.min.js"></script>
+<script src="/vendor/pet-mount-bundle.js"></script>
+<script type="module" src="./companion.ts"></script>
+</body>
+</html>

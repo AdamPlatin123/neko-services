@@ -20,7 +20,7 @@
 #   NEKO_CORE_CONFIG     N.E.K.O core_config.json 路径
 #                        （默认 $HOME/Documents/N.E.K.O/config/core_config.json）
 #   NEKO_AMEMORIX_CONFIG a-memorix 配置 toml 路径
-#                        （默认 <本仓库>/a-memorix-service/config/a_memorix.toml）
+#                        （默认 <本仓库>/services/a-memorix/config/a_memorix.toml）
 # =============================================================================
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091  # lib.sh 与本脚本同目录，运行期拼接路径无法静态跟踪
@@ -28,7 +28,7 @@ source "${SCRIPT_DIR}/lib.sh"
 
 : "${NEKO_CORE_CONFIG:=${HOME%/}/Documents/N.E.K.O/config/core_config.json}"
 : "${NEKO_SERVICES:=$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
-: "${NEKO_AMEMORIX_CONFIG:=${NEKO_SERVICES%/}/a-memorix-service/config/a_memorix.toml}"
+: "${NEKO_AMEMORIX_CONFIG:=${NEKO_SERVICES%/}/services/a-memorix/config/a_memorix.toml}"
 
 FAIL=0
 

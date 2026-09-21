@@ -20,7 +20,7 @@
  */
 
 import { PetApp } from './pet-app';
-import { initTheme } from '../lib/night';
+import { initTheme } from './lib-night';
 
 function mountPet(): void {
   const container = document.getElementById('pet-mount');

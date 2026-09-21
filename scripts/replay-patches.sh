@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# replay-patches.sh — 将 patches/neko/*.patch 整组重放到 N.E.K.O 子项目仓库。
+# replay-patches.sh — 将 runtime/patches/neko/*.patch 整组重放到 N.E.K.O 子项目仓库。
 #
-# 配套文档：patches/neko/README.md（patch manifest 使用说明）
-#           patches/neko/BASELINE.md（基线 commit 记录，本脚本校验其一致性）
+# 配套文档：runtime/patches/neko/README.md（patch manifest 使用说明）
+#           runtime/patches/neko/BASELINE.md（基线 commit 记录，本脚本校验其一致性）
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
 用法: replay-patches.sh [--dry-run] [--force]
 
-将本仓库 patches/neko/ 下的全部补丁按 NNN 序（文件名字典序）作为**一次
+将本仓库 runtime/patches/neko/ 下的全部补丁按 NNN 序（文件名字典序）作为**一次
 git am 调用**应用到目标 N.E.K.O 仓库——失败时 git am --abort 撤销的是
 整组补丁（回到重放前 HEAD），修复后重新运行本脚本从基线整体重放，
 不存在「部分残留」的中间态。
@@ -57,7 +57,7 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-patch_dir="$repo_root/patches/neko"
+patch_dir="$repo_root/runtime/patches/neko"
 baseline_file="$patch_dir/BASELINE.md"
 
 [ -f "$baseline_file" ] || die "找不到基线文件: $baseline_file"

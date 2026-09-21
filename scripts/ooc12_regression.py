@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """OOC 12 场景回归（neko-services P1-2 #3）——挂载层自动化 + 行为层出包。
 
-两层分工（依据 monika-assets/regression/ooc-12-scenarios.md 附录）：
+两层分工（依据 core/persona/regression/ooc-12-scenarios.md 附录）：
 
 一、自动化层（本脚本直接判定，退出码非 0 即失败）——纯 prompt 渲染面，不需要 LLM：
   M1 挂载分轨-默认基础：monika 完整人设（mount_mode=replace）替换默认骨架、
@@ -161,7 +161,7 @@ def mount_card(card: dict, bindings: dict[str, str]) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--neko-src", default=DEFAULT_NEKO_SRC, help="N.E.K.O 源码根（需已重放 patch 003/004）")
-    parser.add_argument("--assets", default=str(Path(__file__).resolve().parents[1] / "monika-assets"))
+    parser.add_argument("--assets", default=str(Path(__file__).resolve().parents[1] / "core/persona"))
     parser.add_argument("--pack-out", default=None, help="行为层评估包输出路径（默认 assets/regression/ooc12-pack.json）")
     args = parser.parse_args()
 

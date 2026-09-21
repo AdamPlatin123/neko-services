@@ -6,7 +6,7 @@
 #   ./install.sh --uninstall  移除已部署文件（保留本地运行时数据 state.json/outbox）
 #   ./install.sh --purge      卸载并删除本地运行时数据（~/.local/share/opencode/monika-memory）
 #
-# 部署清单（源 → 目标，见 opencode-integration/PLAN.md §1 文件表）：
+# 部署清单（源 → 目标，见 core/channels/opencode/PLAN.md §1 文件表）：
 #   dist/agents/monika.md            → ~/.config/opencode/agents/monika.md
 #   dist/tools/neko-memory.ts        → ~/.config/opencode/tools/neko-memory.ts
 #   dist/plugins/monika-memory-sync.ts → ~/.config/opencode/plugins/monika-memory-sync.ts
@@ -95,7 +95,7 @@ do_install() {
 {
   "opencode_version": "${oc_ver}",
   "installed_at": "$(date -Is)",
-  "source": "neko-services opencode-integration/dist",
+  "source": "neko-services core/channels/opencode/dist",
   "user_binding": "${sys_user}"
 }
 EOF

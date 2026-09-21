@@ -6,7 +6,7 @@
 #   - /health 指纹：app="neko-services"（区别于 N.E.K.O 本体签名，doctor.sh
 #     按 service=a-memorix + 该 app 值识别）
 # 首次部署：
-#   1. cd /mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service && uv sync
+#   1. cd /mnt/shared/_Projects/N.E.K.O/neko-services/services/a-memorix && uv sync
 #      （Python 3.12，生成 .venv，满足下方 ConditionPathExists）
 #   2. 编辑 config/a_memorix.toml 的 [model.*]（api_providers 的 base_url/api_key
 #      与 models/tasks）；未配置时服务仍可启动（WARN + 检索/写入降级）
@@ -21,12 +21,12 @@ After=neko-memory.service
 # stop/restart neko.target 时联动停本服务（Wants 只管启动不管停止）
 PartOf=neko.target
 # uv sync 后存在；未部署时 start 自动跳过（显示 skipped，非失败）
-ConditionPathExists=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python
+ConditionPathExists=/mnt/shared/_Projects/N.E.K.O/neko-services/services/a-memorix/.venv/bin/python
 
 [Service]
 Type=exec
-WorkingDirectory=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service
-ExecStart=/mnt/shared/_Projects/N.E.K.O/neko-services/a-memorix-service/.venv/bin/python -m a_memorix_service.service
+WorkingDirectory=/mnt/shared/_Projects/N.E.K.O/neko-services/services/a-memorix
+ExecStart=/mnt/shared/_Projects/N.E.K.O/neko-services/services/a-memorix/.venv/bin/python -m a_memorix_service.service
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
