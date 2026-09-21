@@ -20,23 +20,20 @@ body{background:var(--paper-night);color:var(--ink-night);
 body.day{background:var(--paper);color:#2A2520}
 
 #pet-stage{position:fixed;inset:0}
-/* 她的话：右下浮起的手写字（pet say 之外的常驻行） */
-#her-lines{position:fixed;right:4vw;bottom:22vh;max-width:34em;text-align:right;
-  font-family:'LXGW WenKai','Noto Serif SC',serif;font-size:17px;line-height:1.9;
-  pointer-events:none;z-index:5}
+/* 对话录：右侧整高纸边栏——她的话与你的一句话都不丢（干涸后仍可回看/滚动） */
+#her-lines{position:fixed;right:0;top:0;bottom:0;width:min(30em,34vw);
+  padding:14vh 2.2vw 12vh 1.4vw;display:flex;flex-direction:column;justify-content:flex-end;
+  gap:10px;overflow-y:auto;overscroll-behavior:contain;z-index:5;
+  font-family:'LXGW WenKai','Noto Serif SC',serif;font-size:15.5px;line-height:1.85;
+  scrollbar-width:thin;scrollbar-color:color-mix(in srgb,currentColor 18%,transparent) transparent;
+  mask-image:linear-gradient(to bottom,transparent 0,#000 9vh,#000 calc(100% - 7vh),transparent 100%)}
 #her-lines .line{opacity:0;transform:translateY(6px);
-  animation:inkline .8s ease-out forwards;margin-top:6px}
-@keyframes inkline{to{opacity:.92;transform:none}}
-#her-lines .line.old{transition:opacity 1.2s;opacity:.35}
-#her-lines .line.gone{transition:opacity 1.5s;opacity:0}
-
-/* 日志（回看用，弱墨） */
-#log{position:fixed;left:3vw;bottom:14vh;max-width:26em;z-index:4;
-  font-size:12.5px;line-height:1.8;color:var(--ink-faded-night);
-  font-family:'Noto Serif SC',serif;pointer-events:none}
-#log .u{color:var(--ink-faded-night)}
-#log .a{opacity:.9}
-#log div{opacity:.55}
+  animation:inkline .8s ease-out forwards;text-align:right}
+@keyframes inkline{to{opacity:.9;transform:none}}
+#her-lines .line.old{transition:opacity 1.2s;opacity:.62} /* 只降墨不消失——干涸≠没啦 */
+#her-lines .line.u{text-align:left;color:var(--ink-faded-night);font-size:14px;opacity:.7}
+#her-lines .line.u::before{content:"— "}
+#log{display:none} /* 旧左下日志并入对话录 */
 
 /* 状态行 */
 #status{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:6;pointer-events:none;

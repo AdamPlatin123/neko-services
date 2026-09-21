@@ -28,13 +28,14 @@ function setStatus(text: string, err = false): void {
 }
 
 /** 新建一行她的话（流式容器）：浮起 → 12s 弱墨 → 24s 消散 */
-function newLine(): HTMLElement {
+function newLine(kind: "a" | "u" = "a"): HTMLElement {
   const line = document.createElement("div");
-  line.className = "line";
+  line.className = `line${kind === "u" ? " u" : ""}`;
   linesEl.appendChild(line);
-  while (linesEl.children.length > 8) linesEl.firstElementChild?.remove();
-  setTimeout(() => line.classList.add("old"), 12_000);
-  setTimeout(() => line.classList.add("gone"), 24_000);
+  // 不删行：完整对话录滚动回看（上限 120 行防 DOM 无限膨胀，滚出视口即视觉隐藏）
+  while (linesEl.children.length > 120) linesEl.firstElementChild?.remove();
+  if (kind === "a") setTimeout(() => line.classList.add("old"), 12_000);
+  linesEl.scrollTop = linesEl.scrollHeight; // 跟随最新
   return line;
 }
 
@@ -44,12 +45,8 @@ function petSay(text: string): void {
   try { pet?.say(text.slice(0, 132)); } catch { /* 引擎降级态无妨 */ }
 }
 
-function logLine(kind: "u" | "a", text: string): void {
-  const d = document.createElement("div");
-  d.className = kind;
-  d.textContent = (kind === "u" ? "你：" : "她：") + text.slice(0, 60);
-  logEl.appendChild(d);
-  while (logEl.children.length > 12) logEl.firstElementChild?.remove();
+function logLine(_kind: "u" | "a", _text: string): void {
+  /* 旧左下日志已并入右侧对话录（#her-lines）——保留空实现防外部调用报错 */
 }
 
 function connect(): void {
@@ -81,7 +78,7 @@ function connect(): void {
         const gm = m as unknown as { text?: string; isNewMessage?: boolean };
         const chunk = gm.text ?? "";
         if (!chunk) break;
-        if (gm.isNewMessage || !curLine) { curLine = newLine(); turnText = ""; }
+        if (gm.isNewMessage || !curLine) { curLine = newLine("a"); turnText = ""; }
         curLine.textContent += chunk;
         turnText += chunk; // 流式高频 scrollIntoView 有 jank（审计 F10）——只在 newLine 时滚一次
         break;
@@ -93,7 +90,7 @@ function connect(): void {
         if (d.includes("turn end")) {
           busy = false;
           if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-          if (turnText) { logLine("a", turnText); petSay(turnText); }
+          if (turnText) { petSay(turnText); linesEl.scrollTop = linesEl.scrollHeight; }
           turnText = ""; curLine = null;
         }
         // 契约审计 #6："session end"/"renew session" 只进 monitor 平面不下发 app WS——删除死分支
@@ -135,7 +132,7 @@ function speak(): void {
     if (busy) { busy = false; setStatus("上一句她没接完——再说一次？", true); }
   }, 60_000);
   input.value = "";
-  logLine("u", text);
+  logLine("u", text); const ul = newLine("u"); ul.textContent = text;
   setStatus("她在听…");
   ws.send(JSON.stringify({ action: "stream_data", input_type: "text", data: text }));
 }
