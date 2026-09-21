@@ -41,7 +41,7 @@ function newLine(): HTMLElement {
 /** 桌宠同步手写（引擎可用时；说话不算交互，不打断她的状态机） */
 function petSay(text: string): void {
   const pet = (window as unknown as { __nekoPet?: { say: (t: string) => void } }).__nekoPet;
-  try { pet?.say(text.slice(0, 40)); } catch { /* 引擎降级态无妨 */ }
+  try { pet?.say(text.slice(0, 132)); } catch { /* 引擎降级态无妨 */ }
 }
 
 function logLine(kind: "u" | "a", text: string): void {

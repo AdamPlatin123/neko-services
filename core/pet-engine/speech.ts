@@ -17,7 +17,7 @@ export interface SpeechOptions {
   posGetter?: () => { x: number; y: number };
   /** 每字浮现间隔（ms） */
   charDelayMs?: number;
-  /** 从写完到开始消散的停留（ms） */
+  /** 写完到开始消散的停留（ms）——不传则按句长自适应（65ms/字，下限 2.2s） */
   holdMs?: number;
   /** 消散动画时长（ms） */
   fadeMs?: number;
@@ -35,7 +35,7 @@ const SPEECH_CSS = `
 .neko-speech {
   position: absolute;
   transform: translate(-50%, -100%);
-  max-width: 21em;
+  max-width: min(34em, 72vw); /* 宽幅：窄条读长句难受（用户反馈） */
   font-family: "LXGW WenKai", "LXGW WenKai Lite", "Noto Serif SC", serif;
   font-size: 17px;
   line-height: 1.9;
@@ -64,9 +64,9 @@ const SPEECH_CSS = `
 }
 `;
 
-/** 构造后已补默认值的选项形态（可选键保持可选，数值/颜色键必填） */
-type ResolvedSpeechOptions = Required<Omit<SpeechOptions, 'belowOffsetPx' | 'posGetter'>> &
-  Pick<SpeechOptions, 'belowOffsetPx' | 'posGetter'>;
+/** 构造后已补默认值的选项形态（可选键保持可选，数值/颜色键必填；holdMs 走覆盖语义） */
+type ResolvedSpeechOptions = Required<Omit<SpeechOptions, 'belowOffsetPx' | 'posGetter' | 'holdMs'>> &
+  Pick<SpeechOptions, 'belowOffsetPx' | 'posGetter' | 'holdMs'>;
 
 export class SpeechOverlay {
   private layer: HTMLElement;
@@ -85,10 +85,10 @@ export class SpeechOverlay {
       belowOffsetPx: opts.belowOffsetPx, // 顶部越界翻转偏移（undefined 时 place() 用默认 48）
       posGetter: opts.posGetter, // 拖拽跟随的坐标源（可选）
       charDelayMs: opts.charDelayMs ?? 120, // 逐字浮现节奏（19 字约 2.3s 写完）
-      holdMs: opts.holdMs ?? 2000, // 写完后的停留（任务规定「墨迹干涸 6s 后消散」≈ 总生命周期）
+      holdMsOverride: opts.holdMs, // 显式停留覆盖；不传走自适应（见 say()）
       fadeMs: opts.fadeMs ?? 1600,
       color: opts.color ?? '#D8CDBA',
-      maxChars: opts.maxChars ?? 42,
+      maxChars: opts.maxChars ?? 132,
     };
     if (!document.querySelector('style[data-neko-speech]')) {
       this.styleEl = document.createElement('style');
@@ -117,7 +117,11 @@ export class SpeechOverlay {
       const hostRect = this.host.getBoundingClientRect();
       let y = p.y - hostRect.top;
       if (y < 0) y = p.y + (this.opts.belowOffsetPx ?? 48) - hostRect.top; // 顶部越界→下方
-      el.style.left = `${p.x - hostRect.left}px`;
+      // 横向钳制：宽幅浮层贴屏幕边时收进视口（transform 是 -50% 居中，按半宽收）
+      const halfW = (el.offsetWidth || 320) / 2;
+      const vw = window.innerWidth || hostRect.width;
+      const x = Math.min(Math.max(p.x, halfW + 8), vw - halfW - 8);
+      el.style.left = `${x - hostRect.left}px`;
       el.style.top = `${y}px`;
     };
     place(at);
@@ -143,13 +147,16 @@ export class SpeechOverlay {
     this.current = el;
 
     const writeMs = line.length * this.opts.charDelayMs + 700;
+    // 停留时长随句长伸缩（用户反馈：长句干涸太快没法读完）——
+    // 阅读速度按 65ms/字估，下限 2.2s；显式传 holdMs 仍可钉死
+    const hold = this.opts.holdMsOverride ?? Math.max(2200, line.length * 65);
     // 墨迹干涸：写完 → 停留 → 消散
     this.timers.push(
       setTimeout(() => {
         el.style.setProperty('--neko-fade-ms', `${this.opts.fadeMs}ms`);
         el.classList.add('neko-speech-dry');
         this.timers.push(setTimeout(() => el.remove(), this.opts.fadeMs + 100));
-      }, writeMs + this.opts.holdMs),
+      }, writeMs + hold),
     );
   }
 
