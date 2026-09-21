@@ -130,9 +130,12 @@ async function readCoreConfig(): Promise<CoreConfigRead> {
 
 function pickLlm(full: Json): LlmConfig {
   return {
-    base_url: typeof full.agentModelUrl === "string" ? full.agentModelUrl : "",
-    model: typeof full.agentModelId === "string" ? full.agentModelId : "",
-    api_key: typeof full.agentModelApiKey === "string" ? full.agentModelApiKey : "",
+    base_url: typeof full.conversationModelUrl === "string" ? full.conversationModelUrl
+      : typeof full.agentModelUrl === "string" ? full.agentModelUrl : "",
+    model: typeof full.conversationModelId === "string" ? full.conversationModelId
+      : typeof full.agentModelId === "string" ? full.agentModelId : "",
+    api_key: typeof full.conversationModelApiKey === "string" ? full.conversationModelApiKey
+      : typeof full.agentModelApiKey === "string" ? full.agentModelApiKey : "",
   };
 }
 
@@ -150,7 +153,13 @@ async function writeLlmConfig(patch: Partial<LlmConfig>): Promise<LlmConfig> {
   if (typeof patch.model === "string") next.model = patch.model.trim();
   if (typeof patch.api_key === "string") next.api_key = patch.api_key.trim();
 
-  const merged: Json = { ...full, agentModelUrl: next.base_url, agentModelId: next.model, agentModelApiKey: next.api_key };
+  // 写双档（conversation=主对话 P2-2 确认；agent=opencode/wechat 通道）+ 12 档总开关
+  const merged: Json = {
+    ...full,
+    enableCustomApi: true,
+    conversationModelUrl: next.base_url, conversationModelId: next.model, conversationModelApiKey: next.api_key,
+    agentModelUrl: next.base_url, agentModelId: next.model, agentModelApiKey: next.api_key,
+  };
   await mkdir(dirname(coreConfigPath), { recursive: true });
   const tmp = join(dirname(coreConfigPath), `.core_config.${randomUUID()}.tmp`);
   await writeFile(tmp, JSON.stringify(merged, null, 2) + "\n", "utf-8");

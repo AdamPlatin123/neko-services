@@ -31,8 +31,10 @@ function platformHome(): string {
   if (platform === "darwin") {
     return join(homedir(), "Library", "Application Support", "N.E.K.O");
   }
-  const xdg = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  return join(xdg, "N.E.K.O");
+  // 照抄 N.E.K.O logger_config.py：Linux 用户数据在 XDG_DATA_HOME（默认 ~/.local/share），
+  // ConfigManager 的用户配置目录在其下 N.E.K.O/config/（服务日志 User config directory 实证）
+  const xdgData = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(xdgData, "N.E.K.O", "config");
 }
 
 export function readEnv(): NekoEnv {
