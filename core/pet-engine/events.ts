@@ -17,6 +17,13 @@
 
 import type { PetEvent } from './types';
 
+
+interface RecentHistoryResponse {
+  status?: string;
+  entries?: unknown[];
+  next_seq?: number;
+}
+
 export interface EventSourceOptions {
   memoryServer?: string;
   /** 记忆角色名（recent_history 端点路径段；默认 YUI） */
@@ -40,12 +47,6 @@ const INPUT_EVENTS: (keyof WindowEventMap)[] = [
   'touchstart',
 ];
 
-export interface RecentHistoryResponse {
-  next_seq?: number;
-  items?: unknown[];
-  [key: string]: unknown;
-}
-
 export class PetEventSources {
   private emit: (ev: PetEvent) => void;
   private opts: Required<Omit<EventSourceOptions, 'hourOverride' | 'manual'>> & {
@@ -57,6 +58,7 @@ export class PetEventSources {
   private visibilityListener: EventListener | null = null;
   private lastInputAt: number;
   private lastSeq: number | null = null;
+  private baselined = false; // 轮询基线已建立（首枪不触发）
   private stopped = false;
 
   constructor(emit: (ev: PetEvent) => void, opts: EventSourceOptions = {}) {
@@ -163,20 +165,16 @@ export class PetEventSources {
       const res = await this.opts.fetchImpl(url, { method: 'GET' });
       if (!res.ok) return;
       const data = (await res.json()) as RecentHistoryResponse;
+      // 契约审计 #19：next_seq 空尾也每轮 +1（since_seq=20 → next_seq=21，源码明证），
+      // 用它判新消息 = 每 15s 必误触发。**新消息信号 = entries 非空**；next_seq 仅作游标。
+      const hasNew = Array.isArray((data as { entries?: unknown[] }).entries)
+        && ((data as { entries: unknown[] }).entries.length > 0);
       const seq = typeof data.next_seq === 'number' ? data.next_seq : null;
-      if (seq === null) return;
-      if (this.lastSeq === null) {
-        // 首次只记基线
-        this.lastSeq = seq;
-        return;
-      }
-      if (seq > this.lastSeq) {
-        this.lastSeq = seq;
+      if (seq !== null) this.lastSeq = seq; // 游标无条件前移（含回退重置）
+      if (this.baselined && hasNew) {
         this.emit({ type: 'TERMINAL_MESSAGE', hour: this.currentHour() });
-      } else if (seq < this.lastSeq) {
-        // 服务端重启/回绕，重置基线
-        this.lastSeq = seq;
       }
+      this.baselined = true; // 首次只记基线不触发
     } catch {
       // 记忆服务未启动/CORS 失败：静默。桌宠不依赖它活着。
     }

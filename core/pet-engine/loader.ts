@@ -100,6 +100,7 @@ interface GlobalPIXI {
 
 /** PetStage.app 的最小形状（全局 PIXI.Application 实例）。 */
 interface PIXIApplication {
+  ticker: { add: (fn: (t: { deltaMS: number }) => void) => unknown };
   renderer: { width: number; height: number; resolution: number };
   view: HTMLCanvasElement;
   stage: { addChild: (m: unknown) => void };
@@ -202,25 +203,48 @@ export class PetStage {
         autoUpdate: true,
       })) as unknown as Cubism2Model;
 
-      if (this.destroyed) return;
+      if (this.destroyed) {
+        (model as unknown as { destroy?: () => void }).destroy?.(); // in-flight 泄漏（审计 F11）
+        return;
+      }
       // 全局 PIXI 上创建 Application（与模型同一实例——双实例即碎片根因）
       const cw = this.container.clientWidth || 320;
       const ch = this.container.clientHeight || 360;
       // 与 min-test-fork 完全一致：预先创建 canvas 传入 view（pixi 自建 canvas 在
       // fork+v7 组合下渲染不显示——2026-09-21 用户浏览器对照实锤）
       const viewEl = document.createElement('canvas');
+      // HiDPI：resolution=dpr + autoDensity 让 pixi 接管 canvas style（审计 F4/F6）——
+      // 手写 style 与 renderer.resize 不同步会造成缩窗变形
       this.app = new g.Application({
         view: viewEl,
-        backgroundAlpha: 0, // v7 透明写法（transparent 是 v6 API，v7 下被忽略成黑底——排障实锤）
+        backgroundAlpha: 0, // v7 透明写法（transparent 是 v6 API——排障实锤）
         width: cw,
         height: ch,
+        resolution: Math.min(2, window.devicePixelRatio || 1),
+        autoDensity: true,
       }) as PIXIApplication;
       const canvas = viewEl;
-      canvas.style.width = `${cw}px`;
-      canvas.style.height = `${ch}px`;
       canvas.style.touchAction = 'none';
       this.container.appendChild(canvas);
       this.bindPointerEvents(); // canvas 就绪，绑定指针（原在构造函数，app 尚未创建）
+
+      // 窗口/容器尺寸变化：画布跟随（全屏挂载场景必需——否则缩窗后模型出界消失）
+      const onResize = () => {
+        if (!this.app || this.destroyed) return;
+        const rw = this.container.clientWidth || 320;
+        const rh = this.container.clientHeight || 360;
+        (this.app.renderer as unknown as { resize: (w: number, h: number) => void }).resize(rw, rh);
+        this.clampModelIntoView();
+      };
+      window.addEventListener("resize", onResize);
+      this.cleanupFns.push(() => window.removeEventListener("resize", onResize));
+
+      // 后台不空转（审计 F7）：hidden 停 ticker；可见时限 30fps（呼吸动画足够）
+      const tk = (this.app as unknown as { ticker: { stop: () => void; start: () => void; maxFPS: number } }).ticker;
+      tk.maxFPS = 30;
+      const onVis = () => { document.hidden ? tk.stop() : tk.start(); };
+      document.addEventListener("visibilitychange", onVis);
+      this.cleanupFns.push(() => document.removeEventListener("visibilitychange", onVis));
 
       this.model = model;
       (this.app!.stage as unknown as { addChild: (m: unknown) => void }).addChild(model);
@@ -320,6 +344,7 @@ export class PetStage {
       this.dragState = null;
       if (wasDrag) {
         this.opts.onDragChange?.(false);
+        this.clampModelIntoView(); // 松手夹回视口（审计 F5）
         return;
       }
       if (this.pointOnModel(lx, ly) && Math.hypot(e.clientX - st.startX, e.clientY - st.startY) <= 4) {
@@ -357,21 +382,46 @@ export class PetStage {
 
   /** 模型头顶的页面坐标（speech overlay 定位用；占位模式下取容器顶部中心） */
   headScreenPos(): { x: number; y: number } {
+    // 占位模式（app 为 null，模型/vendor 加载失败）下用容器几何——
+    // 否则 TypeError 被 events 的 try/catch 静默吞掉，watching 因
+    // scheduleActionDone 被跳过而永久卡死（审计 F1）
+    if (!this.app || !this.model) {
+      const cr = this.container.getBoundingClientRect();
+      return { x: cr.left + cr.width / 2, y: cr.top + 24 };
+    }
     const r = this.app!.view.getBoundingClientRect();
     if (!this.model) return { x: r.left + r.width / 2, y: r.top + 24 };
     const h = this.model.height;
     return { x: r.left + this.model.x, y: r.top + this.model.y - h - 12 };
   }
 
-  /** 每帧参数覆盖钩子：包住 internalModel.update，在其后写入我们的参数（呼吸/眼/头向） */
-  onModelUpdate(cb: (coreModel: Cubism2Model['internalModel']['coreModel'], dt: number) => void): void {
+  /** 每帧参数写入钩子——挂 PIXI ticker 默认优先级：
+   * 在模型自身 update（fork 经 ticker 驱动）之后、Application render（LOW 优先级）
+   * 之前执行。这是写 BREATH/EYE_OPEN/ANGLE 参数的正统槽位——
+   * 不包 internal.update（monkey-patch 会断 fork 渲染管线，2026-09-21 实锤）。
+   * dt 单位 ms（ticker deltaMS）。 */
+  onTickerFrame(cb: (coreModel: Cubism2Model['internalModel']['coreModel'], dtMs: number) => void): void {
+    if (!this.model || !this.app) return;
+    const core = this.model.internalModel.coreModel;
+    // PIXI ticker 监听器签名是 (deltaTime 帧数)——deltaMS 要从 ticker 实例取
+    const ticker = (this.app as unknown as { ticker: { deltaMS: number; add: (fn: () => void) => unknown } }).ticker;
+    ticker.add(() => cb(core, ticker.deltaMS));
+  }
+
+  /** 模型位置夹回视口内（拖出屏幕找不回——审计 F5；resize 后也调用） */
+  clampModelIntoView(): void {
     if (!this.model) return;
-    const internal = this.model.internalModel;
-    const orig = internal.update.bind(internal);
-    internal.update = (dt: number) => {
-      orig(dt);
-      cb(internal.coreModel, dt);
-    };
+    const w = (this.app as unknown as { screen?: { width: number } })?.screen?.width
+      ?? this.container.clientWidth ?? 320;
+    const h = (this.app as unknown as { screen?: { height: number } })?.screen?.height
+      ?? this.container.clientHeight ?? 360;
+    const mw = this.model.width || 100;
+    const mh = this.model.height || 100;
+    // 至少留 20% 在视口内（anchor 底部中心）
+    const minX = -mw * 0.3, maxX = w + mw * 0.3;
+    const minY = mh * 0.3, maxY = h + mh * 0.3;
+    this.model.x = Math.min(maxX, Math.max(minX, this.model.x));
+    this.model.y = Math.min(maxY, Math.max(minY, this.model.y));
   }
 
   /** 当前是否正在被拖拽（慢眨眼协议的打断条件之一） */

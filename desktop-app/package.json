@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "fetch-model": "bash scripts/fetch-model.sh"
+    "fetch-model": "bash scripts/fetch-model.sh",
+    "postinstall": "npm run build:pet"
   },
   "dependencies": {
     "pixi.js": "^7.4.3",

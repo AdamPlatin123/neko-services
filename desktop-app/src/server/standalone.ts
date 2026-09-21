@@ -45,7 +45,7 @@ const server = createServer(async (req, res) => {
 
   // 静态文件：dist/ 下按路径取；/welcome、/settings 映射到多页入口
   let rel = url === "/" ? "index.html" : url.replace(/^\/+/, "");
-  if (rel === "welcome" || rel === "settings") rel = `src/pages/${rel}/index.html`;
+  if (rel === "welcome" || rel === "settings" || rel === "companion") rel = `src/pages/${rel}/index.html`;
   const target = join(distDir, rel);
   if (!target.startsWith(distDir)) {
     res.writeHead(403).end("Forbidden");

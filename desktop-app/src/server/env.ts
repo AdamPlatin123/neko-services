@@ -25,11 +25,13 @@ function platformHome(): string {
   if (process.env.NEKO_HOME) return process.env.NEKO_HOME;
   const platform = process.platform;
   if (platform === "win32") {
-    const appdata = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
-    return join(appdata, "N.E.K.O");
+    // 契约审计 #34：N.E.K.O 用 LOCALAPPDATA（storage_roots.py:355-358），非 Roaming
+    const local = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+    return join(local, "N.E.K.O", "config");
   }
   if (platform === "darwin") {
-    return join(homedir(), "Library", "Application Support", "N.E.K.O");
+    // 契约审计 #34：macOS 同样落在 .../N.E.K.O/config（漏了 /config 段）
+    return join(homedir(), "Library", "Application Support", "N.E.K.O", "config");
   }
   // 照抄 N.E.K.O logger_config.py：Linux 用户数据在 XDG_DATA_HOME（默认 ~/.local/share），
   // ConfigManager 的用户配置目录在其下 N.E.K.O/config/（服务日志 User config directory 实证）

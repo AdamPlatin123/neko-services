@@ -33,6 +33,7 @@ function mountPet(): void {
   const config = Number.isFinite(heightAttr) ? { height: heightAttr } : undefined;
   const night = initTheme() === 'night';
   // 角色名（跨端消息轮询的 recent_history 路径段）：data-pet-char > URL ?char= > YUI
+  // 注意：URL 驱动的整页（如 companion?char=X）不要设 data-pet-char——会静默压过 URL
   const charName =
     container.dataset.petChar ??
     new URLSearchParams(location.search).get('char') ??

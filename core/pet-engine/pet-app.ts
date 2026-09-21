@@ -126,7 +126,7 @@ export class PetApp {
       },
       onFallback: (reason) => this.log(`[loader] 模型加载失败，降级为呼吸圆点：${reason}`),
     });
-    this.speech = new SpeechOverlay(opts.container, { color: opts.speechColor });
+    this.speech = new SpeechOverlay(opts.container, { color: opts.speechColor, posGetter: () => this.stage.headScreenPos() });
     this.events = new PetEventSources(
       (ev) => this.dispatch(ev),
       {
@@ -145,9 +145,10 @@ export class PetApp {
       this.log(`[pet] 初始状态 ${this.fsm.state}（占位模式——行为状态机照常运行）`);
     } else {
       this.log(`[pet] 模型就绪，初始状态 ${this.fsm.state}`);
-      // 2026-09-21 排障：monkey-patch internal.update 在 fork v0.5 下疑似阻断渲染管线。
-      // 停用参数直写，改由 FSM 状态查询（视觉差异后续经 motion 组表达）。
-      // this.stage.onModelUpdate((core, dt) => this.frameDrive(core, dt));
+      // 参数动效恢复（2026-09-22）：改挂 ticker 正统槽位（update 后/render 前），
+      // 不再 monkey-patch internal.update（那会断 fork 渲染管线）。
+      this.stage.onTickerFrame((core, dt) => this.frameDrive(core, dt));
+      this.stage.playMotion('start'); // 契约审计 #29：登场动作（组存在，此前从未调用）
       this.applyStateEnter(this.fsm.state, null);
     }
     this.events.start();
@@ -470,7 +471,10 @@ function exposeNekoPet(app: PetApp): void {
       slowBlinkPhase: app.slowBlink.currentPhase,
       modelLoaded: !app.stage.usingFallback,
     }),
-    destroy: () => app.destroy(),
+    destroy: () => {
+      app.destroy();
+      delete (window as unknown as { __nekoPet?: NekoPetGlobalAPI }).__nekoPet; // 旧 API 不持死引用（审计 F11 尾巴）
+    },
   };
   (window as unknown as { __nekoPet?: NekoPetGlobalAPI }).__nekoPet = api;
 }

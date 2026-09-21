@@ -16,9 +16,11 @@ const char = new URLSearchParams(location.search).get("char") || "YUI";
 const rid = () => Math.random().toString(36).slice(2, 10);
 
 let ws: WebSocket | null = null;
+let everConnected = false; // 首连新会话；断线重连续接（保她的上下文连续）
 let sessionReady = false;
 let superseded = false; // 被更新窗口取代（停止重连，避免互踢战）
 let busy = false; // 一个 turn 进行中（等 "turn end"）
+let busyTimer: ReturnType<typeof setTimeout> | null = null; // turn-end 丢失兜底（turn end 到达必须清）
 
 function setStatus(text: string, err = false): void {
   statusEl.textContent = text;
@@ -55,15 +57,16 @@ function connect(): void {
   ws = new WebSocket(`${proto}://${location.host}/neko-ws/ws/${encodeURIComponent(char)}`);
   ws.onopen = () => {
     setStatus(`连接上了 · ${char}`);
-    ws!.send(JSON.stringify({ action: "start_session", input_type: "text", new_session: true, request_id: rid() }));
+    ws!.send(JSON.stringify({ action: "start_session", input_type: "text", new_session: !everConnected, request_id: rid() }));
+    everConnected = true;
   };
   ws.onmessage = (ev) => {
     let m: { type?: string; data?: unknown; message?: unknown } = {};
     try { m = JSON.parse(ev.data as string); } catch { return; }
     switch (m.type) {
       case "session_started": sessionReady = true; setStatus(`她在 · ${char} · v2`); input.focus(); break;
-      case "session_failed":
-        setStatus(`会话未能开始：${String(m.message ?? "").slice(0, 60)}`, true); break;
+      case "session_failed": // 契约审计 #3：此消息无 message 字段——固定文案，真实原因看 status 码
+        setStatus("会话启动失败（text 模式）", true); break;
       case "status": { // 状态码机（含 VOICE_INPUT_LEASE_REQUIRED / SERVER_ERROR 等）
         let detail = ""; try { detail = JSON.parse(String(m.message)).code ?? ""; } catch { /* 非 JSON */ }
         if (detail === "CHARACTER_SWITCHING_TERMINAL") {
@@ -80,8 +83,7 @@ function connect(): void {
         if (!chunk) break;
         if (gm.isNewMessage || !curLine) { curLine = newLine(); turnText = ""; }
         curLine.textContent += chunk;
-        turnText += chunk;
-        curLine.scrollIntoView?.({ block: "nearest" });
+        turnText += chunk; // 流式高频 scrollIntoView 有 jank（审计 F10）——只在 newLine 时滚一次
         break;
       }
       case "text": case "subtitle": break; // 兼容其他构建的最终帧——gemini_response 已覆盖
@@ -90,18 +92,29 @@ function connect(): void {
         const d = String(m.data ?? "");
         if (d.includes("turn end")) {
           busy = false;
+          if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
           if (turnText) { logLine("a", turnText); petSay(turnText); }
           turnText = ""; curLine = null;
         }
-        else if (d.includes("session end") || d.includes("renew")) { sessionReady = false; }
+        // 契约审计 #6："session end"/"renew session" 只进 monitor 平面不下发 app WS——删除死分支
         break;
       }
-      case "heartbeat": break;
+      case "session_ended_by_server": // 契约审计 #6：服务端收会话的真实通知通道
+        sessionReady = false; everConnected = false; break;
+      case "catgirl_switched": { // 契约审计 #11：角色不存在时服务端发此消息后 close——跟随新角色名重连，防 3s 死循环
+        const nm = (m as unknown as { new_catgirl?: string }).new_catgirl;
+        if (nm && nm !== char) { location.search = `?char=${encodeURIComponent(nm)}`; }
+        break;
+      }
+      // 契约审计 #7/#12：heartbeat/user_message 均非 app WS 消息——死 case 已删
       default: break;
     }
   };
   ws.onclose = () => {
     sessionReady = false;
+    // 断线清流式残留（审计 F3）：否则重连后首块续进已消散的旧行——整段不可见
+    curLine = null; turnText = "";
+    if (busy) { busy = false; if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; } setStatus("断了一下——再说一次？", true); }
     if (superseded) return; // 让位：不重连（重连=抢回=无限互踢）
     setStatus("连接断了 · 三秒后重试", true);
     setTimeout(connect, 3000);
@@ -116,6 +129,11 @@ function speak(): void {
   const text = input.value.trim();
   if (!text || !ws || ws.readyState !== WebSocket.OPEN || busy) return;
   busy = true;
+  // turn-end 丢失兜底（审计 F2：句柄可清，防 stale 定时器误杀下一个正常 turn）
+  if (busyTimer) clearTimeout(busyTimer);
+  busyTimer = setTimeout(() => {
+    if (busy) { busy = false; setStatus("上一句她没接完——再说一次？", true); }
+  }, 60_000);
   input.value = "";
   logLine("u", text);
   setStatus("她在听…");

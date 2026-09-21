@@ -139,6 +139,12 @@ function pickLlm(full: Json): LlmConfig {
   };
 }
 
+/** GET 响应视图：密钥打码（契约审计 #33）——仅展示边界用，写入路径必须拿原值 */
+function maskedLlm(full: Json): LlmConfig {
+  const raw = pickLlm(full);
+  return { ...raw, api_key: maskKey(raw.api_key) };
+}
+
 /** 原子合并写：只覆盖 agentModelUrl / agentModelId / agentModelApiKey。 */
 async function writeLlmConfig(patch: Partial<LlmConfig>): Promise<LlmConfig> {
   const { coreConfigPath } = readEnv();
@@ -153,10 +159,13 @@ async function writeLlmConfig(patch: Partial<LlmConfig>): Promise<LlmConfig> {
   if (typeof patch.model === "string") next.model = patch.model.trim();
   if (typeof patch.api_key === "string") next.api_key = patch.api_key.trim();
 
-  // 写双档（conversation=主对话 P2-2 确认；agent=opencode/wechat 通道）+ 12 档总开关
+  // 写双档（conversation=主对话；agent=通道）——契约审计 #33：
+  // enableCustomApi 仅在用户真填了任一字段时置真（无条件置真会把 12 槽整体
+  // 切进 custom 解析域）；空值回落既有配置（core_config 空串语义）。
+  const anyFilled = Boolean(next.base_url || next.model || next.api_key);
   const merged: Json = {
     ...full,
-    enableCustomApi: true,
+    ...(anyFilled ? { enableCustomApi: true } : {}),
     conversationModelUrl: next.base_url, conversationModelId: next.model, conversationModelApiKey: next.api_key,
     agentModelUrl: next.base_url, agentModelId: next.model, agentModelApiKey: next.api_key,
   };
@@ -335,7 +344,7 @@ export function createApiMiddleware() {
       if (method === "GET" && url === "/api/config") {
         const core = await readCoreConfig();
         if (core.kind === "ok") {
-          sendJson(res, 200, { ok: true, config: pickLlm(core.full), config_path: core.path });
+          sendJson(res, 200, { ok: true, config: maskedLlm(core.full), config_path: core.path });
         } else if (core.kind === "missing") {
           sendJson(res, 200, {
             ok: false,
@@ -407,4 +416,10 @@ export function createApiMiddleware() {
       sendJson(res, 500, { ok: false, message: e instanceof Error ? e.message : String(e) });
     }
   };
+}
+
+/** 密钥回显打码（契约审计 #33：上游 /core_api 已脱敏，我们的 GET 不应明文） */
+function maskKey(key: string): string {
+  if (!key) return "";
+  return key.length <= 8 ? "********" : `${key.slice(0, 6)}********`;
 }

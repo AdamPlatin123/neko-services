@@ -11,6 +11,10 @@
  */
 
 export interface SpeechOptions {
+  /** 顶部越界时翻到模型下方的偏移（px） */
+  belowOffsetPx?: number;
+  /** 头顶坐标实时取值（拖拽跟随时每帧调用；不传则固定 say 时的位置） */
+  posGetter?: () => { x: number; y: number };
   /** 每字浮现间隔（ms） */
   charDelayMs?: number;
   /** 从写完到开始消散的停留（ms） */
@@ -60,12 +64,17 @@ const SPEECH_CSS = `
 }
 `;
 
+/** 构造后已补默认值的选项形态（可选键保持可选，数值/颜色键必填） */
+type ResolvedSpeechOptions = Required<Omit<SpeechOptions, 'belowOffsetPx' | 'posGetter'>> &
+  Pick<SpeechOptions, 'belowOffsetPx' | 'posGetter'>;
+
 export class SpeechOverlay {
   private layer: HTMLElement;
   private host: HTMLElement;
   private current: HTMLElement | null = null;
+  private followRaf: number | null = null;
   private timers: ReturnType<typeof setTimeout>[] = [];
-  private opts: Required<SpeechOptions>;
+  private opts: ResolvedSpeechOptions;
   private styleEl: HTMLStyleElement;
   /** 最近一次说话的内容（演示页状态栏用） */
   lastLine = '';
@@ -73,6 +82,8 @@ export class SpeechOverlay {
   constructor(host: HTMLElement, opts: SpeechOptions = {}) {
     this.host = host;
     this.opts = {
+      belowOffsetPx: opts.belowOffsetPx, // 顶部越界翻转偏移（undefined 时 place() 用默认 48）
+      posGetter: opts.posGetter, // 拖拽跟随的坐标源（可选）
       charDelayMs: opts.charDelayMs ?? 120, // 逐字浮现节奏（19 字约 2.3s 写完）
       holdMs: opts.holdMs ?? 2000, // 写完后的停留（任务规定「墨迹干涸 6s 后消散」≈ 总生命周期）
       fadeMs: opts.fadeMs ?? 1600,
@@ -101,10 +112,22 @@ export class SpeechOverlay {
     const el = document.createElement('div');
     el.className = 'neko-speech';
     el.style.color = this.opts.color;
-    const hostRect = this.host.getBoundingClientRect();
-    // host 可能是 fixed 定位的舞台容器：换算成层内坐标
-    el.style.left = `${at.x - hostRect.left}px`;
-    el.style.top = `${at.y - hostRect.top}px`;
+    // 跟随定位（审计 F8）：模型被拖走时字跟人走；y 进入页顶时翻转到模型下方
+    const place = (p: { x: number; y: number }) => {
+      const hostRect = this.host.getBoundingClientRect();
+      let y = p.y - hostRect.top;
+      if (y < 0) y = p.y + (this.opts.belowOffsetPx ?? 48) - hostRect.top; // 顶部越界→下方
+      el.style.left = `${p.x - hostRect.left}px`;
+      el.style.top = `${y}px`;
+    };
+    place(at);
+    // 消散前持续跟随（headScreenPos 随拖拽变化）
+    const follow = () => {
+      if (this.current !== el) return; // 已被 clear/替换
+      place(this.opts.posGetter ? this.opts.posGetter() : at);
+      this.followRaf = requestAnimationFrame(follow);
+    };
+    this.followRaf = requestAnimationFrame(follow);
 
     let i = 0;
     for (const ch of line) {
@@ -134,6 +157,7 @@ export class SpeechOverlay {
   clear(instant = true): void {
     for (const t of this.timers) clearTimeout(t);
     this.timers = [];
+    if (this.followRaf !== null) { cancelAnimationFrame(this.followRaf); this.followRaf = null; }
     if (this.current) {
       const el = this.current;
       this.current = null;
