@@ -19,6 +19,8 @@ import type { PetEvent } from './types';
 
 export interface EventSourceOptions {
   memoryServer?: string;
+  /** 记忆角色名（recent_history 端点路径段；默认 YUI） */
+  characterName?: string;
   pollIntervalMs?: number; // 默认 15000
   clockIntervalMs?: number; // 默认 60000
   idleTickMs?: number; // 默认 5000
@@ -61,6 +63,7 @@ export class PetEventSources {
     this.emit = emit;
     this.opts = {
       memoryServer: opts.memoryServer ?? '/neko-memory',
+      characterName: opts.characterName ?? 'YUI',
       pollIntervalMs: opts.pollIntervalMs ?? 15000,
       clockIntervalMs: opts.clockIntervalMs ?? 60000,
       idleTickMs: opts.idleTickMs ?? 5000,
@@ -149,16 +152,15 @@ export class PetEventSources {
     this.emit({ type: 'USER_INPUT', hour: this.currentHour() });
   }
 
-  /** POST /recent_history，比对 next_seq（约定接口；memory_server 默认 48912 端口） */
+  /** GET /recent_history/{name}?since_seq=（真实契约：runtime 补丁 001 端点），
+   * 比对 next_seq 前进 → TERMINAL_MESSAGE。失败静默。 */
   private async pollMemory(): Promise<void> {
     if (this.stopped) return;
-    const url = `${this.opts.memoryServer.replace(/\/$/, '')}/recent_history`;
+    const name = encodeURIComponent(this.opts.characterName ?? 'YUI');
+    const since = this.lastSeq ?? 0;
+    const url = `${this.opts.memoryServer.replace(/\/$/, '')}/recent_history/${name}?since_seq=${since}&limit=8`;
     try {
-      const res = await this.opts.fetchImpl(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ limit: 8 }),
-      });
+      const res = await this.opts.fetchImpl(url, { method: 'GET' });
       if (!res.ok) return;
       const data = (await res.json()) as RecentHistoryResponse;
       const seq = typeof data.next_seq === 'number' ? data.next_seq : null;

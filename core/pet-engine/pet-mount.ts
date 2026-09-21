@@ -32,10 +32,16 @@ function mountPet(): void {
   const heightAttr = Number.parseInt(container.dataset.petHeight ?? '', 10);
   const config = Number.isFinite(heightAttr) ? { height: heightAttr } : undefined;
   const night = initTheme() === 'night';
+  // 角色名（跨端消息轮询的 recent_history 路径段）：data-pet-char > URL ?char= > YUI
+  const charName =
+    container.dataset.petChar ??
+    new URLSearchParams(location.search).get('char') ??
+    'YUI';
 
   const app = new PetApp({
     container,
     config,
+    characterName: charName,
     speechColor: night ? '#D8CDBA' : '#2A2520', // 夜=反转墨字；昼=墨字（MOUNTING.md）
   });
   void app.mount(); // 成功后 window.__nekoPet 可用（PetApp.mount 内暴露）

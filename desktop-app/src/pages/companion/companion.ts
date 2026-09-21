@@ -30,7 +30,7 @@ function newLine(): HTMLElement {
   const line = document.createElement("div");
   line.className = "line";
   linesEl.appendChild(line);
-  while (linesEl.children.length > 4) linesEl.firstElementChild?.remove();
+  while (linesEl.children.length > 8) linesEl.firstElementChild?.remove();
   setTimeout(() => line.classList.add("old"), 12_000);
   setTimeout(() => line.classList.add("gone"), 24_000);
   return line;
@@ -47,7 +47,7 @@ function logLine(kind: "u" | "a", text: string): void {
   d.className = kind;
   d.textContent = (kind === "u" ? "你：" : "她：") + text.slice(0, 60);
   logEl.appendChild(d);
-  while (logEl.children.length > 8) logEl.firstElementChild?.remove();
+  while (logEl.children.length > 12) logEl.firstElementChild?.remove();
 }
 
 function connect(): void {

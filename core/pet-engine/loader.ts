@@ -44,7 +44,11 @@ export interface PetStageOptions {
 /** 动态注入 <script>（幂等） */
 export function loadScript(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[data-neko-src="${src}"]`)) {
+    // 幂等：识别本函数注入过的（data-neko-src）与页面静态存在的（src 完全相等）
+    if (
+      document.querySelector(`script[data-neko-src="${src}"]`) ||
+      document.querySelector(`script[src="${src}"]`)
+    ) {
       resolve();
       return;
     }

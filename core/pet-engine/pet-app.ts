@@ -51,6 +51,8 @@ interface CoreModel {
 }
 
 export interface PetAppOptions {
+  /** 记忆角色名——事件轮询 recent_history 路径段（默认 YUI） */
+  characterName?: string;
   /** 舞台容器（会塞入透明 canvas 与手写字层；position 需非 static） */
   container: HTMLElement;
   config?: Partial<PetConfig>;
@@ -129,6 +131,7 @@ export class PetApp {
       (ev) => this.dispatch(ev),
       {
         memoryServer: this.config.memoryServer,
+        characterName: opts.characterName,
         manual: opts.manualEvents ?? false,
       },
     );
