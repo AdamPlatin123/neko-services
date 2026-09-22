@@ -22,11 +22,14 @@ body.day{background:var(--paper);color:#2A2520}
 #pet-stage{position:fixed;inset:0}
 /* 对话录：右侧整高纸边栏——她的话与你的一句话都不丢（干涸后仍可回看/滚动） */
 #her-lines{position:fixed;right:0;top:0;bottom:0;width:min(30em,34vw);
-  padding:14vh 2.2vw 12vh 1.4vw;display:flex;flex-direction:column;justify-content:flex-end;
-  gap:10px;overflow-y:auto;overscroll-behavior:contain;z-index:5;
+  padding:4vh 2.2vw 6vh 1.4vw;display:flex;flex-direction:column;justify-content:flex-start;
+  gap:12px;overflow-y:auto;overscroll-behavior:contain;z-index:5;
   font-family:'LXGW WenKai','Noto Serif SC',serif;font-size:15.5px;line-height:1.85;
   scrollbar-width:thin;scrollbar-color:color-mix(in srgb,currentColor 18%,transparent) transparent;
-  mask-image:linear-gradient(to bottom,transparent 0,#000 9vh,#000 calc(100% - 7vh),transparent 100%)}
+  /* 修双 bug：flex-end+overflow 会让超高端内容滚不到顶；顶部 mask 永久遮住首行——
+     改 flex-start + 去顶 mask（仅底缘淡出），js 滚动跟随最新 */
+  mask-image:linear-gradient(to bottom,#000 0,#000 calc(100% - 6vh),transparent 100%)}
+#her-lines .line{white-space:pre-wrap}
 #her-lines .line{opacity:0;transform:translateY(6px);
   animation:inkline .8s ease-out forwards;text-align:right}
 @keyframes inkline{to{opacity:.9;transform:none}}

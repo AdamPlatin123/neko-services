@@ -78,9 +78,12 @@ function connect(): void {
         const gm = m as unknown as { text?: string; isNewMessage?: boolean };
         const chunk = gm.text ?? "";
         if (!chunk) break;
-        if (gm.isNewMessage || !curLine) { curLine = newLine("a"); turnText = ""; }
+        if (gm.isNewMessage) {
+          if (turnFull) turnFull += "\n\n"; // 她分段发话：段间空行
+          curLine = newLine("a"); liveLines.push(curLine); turnText = "";
+        } else if (!curLine) { curLine = newLine("a"); liveLines.push(curLine); }
         curLine.textContent += chunk;
-        turnText += chunk; // 流式高频 scrollIntoView 有 jank（审计 F10）——只在 newLine 时滚一次
+        turnText += chunk; turnFull += chunk;
         break;
       }
       case "text": case "subtitle": break; // 兼容其他构建的最终帧——gemini_response 已覆盖
@@ -90,7 +93,14 @@ function connect(): void {
         if (d.includes("turn end")) {
           busy = false;
           if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; }
-          if (turnText) { petSay(turnText); linesEl.scrollTop = linesEl.scrollHeight; }
+          if (turnFull.trim()) {
+            for (const l of liveLines) l.remove(); // 临时流式行退场
+            liveLines = [];
+            const full = newLine("a");             // ← 对话录最终形态：AI 全部回复，一个不截
+            full.textContent = turnFull;
+            petSay(turnText); turnFull = "";
+          }
+          curLine = null; linesEl.scrollTop = linesEl.scrollHeight;
           turnText = ""; curLine = null;
         }
         // 契约审计 #6："session end"/"renew session" 只进 monitor 平面不下发 app WS——删除死分支
@@ -110,7 +120,8 @@ function connect(): void {
   ws.onclose = () => {
     sessionReady = false;
     // 断线清流式残留（审计 F3）：否则重连后首块续进已消散的旧行——整段不可见
-    curLine = null; turnText = "";
+    curLine = null; turnText = ""; turnFull = "";
+    for (const l of liveLines) l.remove(); liveLines = [];
     if (busy) { busy = false; if (busyTimer) { clearTimeout(busyTimer); busyTimer = null; } setStatus("断了一下——再说一次？", true); }
     if (superseded) return; // 让位：不重连（重连=抢回=无限互踢）
     setStatus("连接断了 · 三秒后重试", true);
@@ -119,8 +130,10 @@ function connect(): void {
   ws.onerror = () => setStatus("连接出错（主进程在吗？）", true);
 }
 
-let curLine: HTMLElement | null = null; // 当前流式行
-let turnText = "";        // 本 turn 她的完整话（日志/桌宠用）
+let curLine: HTMLElement | null = null; // 当前流式行（临时展示，turn end 被全文块替换）
+let turnText = "";        // 当前段文本（petSay 用）
+let turnFull = "";        // 本 turn 跨段全文（含分段换行）——对话录写入的就是它，绝不截断
+let liveLines: HTMLElement[] = []; // 本 turn 的临时流式行
 
 function speak(): void {
   const text = input.value.trim();
